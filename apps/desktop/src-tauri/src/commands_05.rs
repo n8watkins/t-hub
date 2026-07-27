@@ -176,13 +176,7 @@ pub async fn install_codex_hooks(
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
     let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::install(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-        consent,
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::install_runtime(&paths, consent).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -192,13 +186,7 @@ pub async fn repair_codex_hooks(
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
     let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::repair(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-        consent,
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::repair_runtime(&paths, consent).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -207,12 +195,7 @@ pub async fn uninstall_codex_hooks(
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
     let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::uninstall(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::uninstall_runtime(&paths).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -227,13 +210,8 @@ pub async fn codex_hooks_health(
         .map(crate::codex::hooks_install::host_project_path)
         .transpose()
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::health_at_with_project(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-        project_root.as_deref(),
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::health_runtime(&paths, project_root.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 // --- item-3 Pillar C: the BLOCKING PreToolUse gate - a DISTINCT opt-in (HIGH-1) ---

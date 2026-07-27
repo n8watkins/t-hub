@@ -121,15 +121,19 @@ pub struct RuntimePaths {
     pub codex_home: PathBuf,
     pub requirements_path: PathBuf,
     pub agent_bin: PathBuf,
+    pub hooks_state_path: String,
 }
 
 pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
     #[cfg(unix)]
     {
+        let codex_home = codex_home()?;
+        let hooks_state_path = codex_home.join("hooks.json").display().to_string();
         Ok(RuntimePaths {
-            codex_home: codex_home()?,
+            codex_home,
             requirements_path: requirements_path(),
             agent_bin: PathBuf::from(agent_bin),
+            hooks_state_path,
         })
     }
     #[cfg(windows)]
@@ -137,10 +141,12 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
         let _ = agent_bin;
         let distro = wsl_distro();
         let home = wsl_home(&distro)?;
+        let runtime_codex_home = format!("{home}/.codex");
         Ok(RuntimePaths {
-            codex_home: wsl_posix_to_unc(&distro, &format!("{home}/.codex"))?,
+            codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
             requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
             agent_bin: PathBuf::from(resolve_wsl_agent_bin(&distro)?),
+            hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
         })
     }
 }
@@ -345,10 +351,38 @@ impl Drop for ConfigLock {
     }
 }
 
+#[cfg(test)]
 pub fn install(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
+    consent: bool,
+) -> Result<InstallReport> {
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    install_with_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        &hooks_state_path,
+        consent,
+    )
+}
+
+pub fn install_runtime(paths: &RuntimePaths, consent: bool) -> Result<InstallReport> {
+    install_with_state_path(
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        &paths.hooks_state_path,
+        consent,
+    )
+}
+
+fn install_with_state_path(
+    codex_home: &Path,
+    requirements_path: &Path,
+    agent_bin: &Path,
+    hooks_state_path: &str,
     consent: bool,
 ) -> Result<InstallReport> {
     if !consent {
@@ -360,14 +394,26 @@ pub fn install(
     let existing = read_hooks(&hooks_path)?;
     // Parse every config surface before the first mutation.
     // A malformed user or policy file must never be partially "repaired".
-    let _ = health_at(codex_home, requirements_path, agent_bin)?;
+    let _ = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     let merged = merge_managed(&existing, agent_bin)?;
     let changed = merged != existing;
     let backed_up = changed && backup_once(&hooks_path)?;
     if changed {
         write_json_atomic(&hooks_path, &merged)?;
     }
-    let health = health_at(codex_home, requirements_path, agent_bin)?;
+    let health = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     Ok(InstallReport {
         hooks_path: hooks_path.display().to_string(),
         changed,
@@ -377,6 +423,7 @@ pub fn install(
     })
 }
 
+#[cfg(test)]
 pub fn repair(
     codex_home: &Path,
     requirements_path: &Path,
@@ -386,22 +433,58 @@ pub fn repair(
     install(codex_home, requirements_path, agent_bin, consent)
 }
 
+pub fn repair_runtime(paths: &RuntimePaths, consent: bool) -> Result<InstallReport> {
+    install_runtime(paths, consent)
+}
+
+#[cfg(test)]
 pub fn uninstall(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
 ) -> Result<InstallReport> {
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    uninstall_with_state_path(codex_home, requirements_path, agent_bin, &hooks_state_path)
+}
+
+pub fn uninstall_runtime(paths: &RuntimePaths) -> Result<InstallReport> {
+    uninstall_with_state_path(
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        &paths.hooks_state_path,
+    )
+}
+
+fn uninstall_with_state_path(
+    codex_home: &Path,
+    requirements_path: &Path,
+    agent_bin: &Path,
+    hooks_state_path: &str,
+) -> Result<InstallReport> {
     let hooks_path = codex_home.join("hooks.json");
     let _lock = ConfigLock::acquire(&hooks_path)?;
     let existing = read_hooks(&hooks_path)?;
-    let _ = health_at(codex_home, requirements_path, agent_bin)?;
+    let _ = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     let cleaned = remove_managed(&existing)?;
     let changed = cleaned != existing;
     let backed_up = changed && backup_once(&hooks_path)?;
     if changed {
         write_json_atomic(&hooks_path, &cleaned)?;
     }
-    let health = health_at(codex_home, requirements_path, agent_bin)?;
+    let health = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     Ok(InstallReport {
         hooks_path: hooks_path.display().to_string(),
         changed,
@@ -411,19 +494,55 @@ pub fn uninstall(
     })
 }
 
+#[cfg(test)]
 pub fn health_at(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
 ) -> Result<ProducerHealth> {
-    health_at_with_project(codex_home, requirements_path, agent_bin, None)
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        &hooks_state_path,
+    )
 }
 
+#[cfg(test)]
 pub fn health_at_with_project(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
     project_root: Option<&Path>,
+) -> Result<ProducerHealth> {
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        project_root,
+        &hooks_state_path,
+    )
+}
+
+pub fn health_runtime(paths: &RuntimePaths, project_root: Option<&Path>) -> Result<ProducerHealth> {
+    health_at_with_project_and_state_path(
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        project_root,
+        &paths.hooks_state_path,
+    )
+}
+
+fn health_at_with_project_and_state_path(
+    codex_home: &Path,
+    requirements_path: &Path,
+    agent_bin: &Path,
+    project_root: Option<&Path>,
+    hooks_state_path: &str,
 ) -> Result<ProducerHealth> {
     let hooks_path = codex_home.join("hooks.json");
     let config_path = codex_home.join("config.toml");
@@ -490,7 +609,7 @@ pub fn health_at_with_project(
                 managed_events.push(event.to_string());
                 let key = format!(
                     "{}:{}:{group_index}:{handler_index}",
-                    hooks_path.display(),
+                    hooks_state_path,
                     event_key(event)
                 );
                 let hook_state = state
@@ -504,7 +623,8 @@ pub fn health_at_with_project(
                     .and_then(|state| state.get("trusted_hash"))
                     .and_then(toml::Value::as_str)
                 {
-                    modified |= trusted_hash != expected_trust_hash(event, &command);
+                    modified |=
+                        trusted_hash != expected_trust_hash(event, &command, matcher.as_deref());
                 }
                 drifted |= command != managed_command(agent_bin, event)
                     || matcher.as_deref() != managed_matcher(event);
@@ -520,14 +640,14 @@ pub fn health_at_with_project(
         AgentCapabilityProbe::default()
     };
     let has_trust_for_all = managed_events.iter().all(|event| {
-        let Some((group_index, handler_index, command, _)) =
+        let Some((group_index, handler_index, command, matcher)) =
             find_managed_handler(&hooks, event).ok().flatten()
         else {
             return false;
         };
         let key = format!(
             "{}:{}:{group_index}:{handler_index}",
-            hooks_path.display(),
+            hooks_state_path,
             event_key(event)
         );
         state
@@ -535,7 +655,7 @@ pub fn health_at_with_project(
             .and_then(toml::Value::as_table)
             .and_then(|state| state.get("trusted_hash"))
             .and_then(toml::Value::as_str)
-            .is_some_and(|hash| hash == expected_trust_hash(event, &command))
+            .is_some_and(|hash| hash == expected_trust_hash(event, &command, matcher.as_deref()))
     });
     let status = if managed_events.is_empty() {
         ProducerStatus::NotInstalled
@@ -873,17 +993,26 @@ fn event_key(event: &str) -> &'static str {
     }
 }
 
-fn expected_trust_hash(event: &str, command: &str) -> String {
-    let identity = json!({
-        "event_name": event_key(event),
-        "hooks": [{
+fn expected_trust_hash(event: &str, command: &str, matcher: Option<&str>) -> String {
+    let mut identity = Map::from_iter([
+        (
+            "event_name".to_string(),
+            Value::String(event_key(event).to_string()),
+        ),
+        (
+            "hooks".to_string(),
+            json!([{
             "type": "command",
             "command": command,
             "timeout": if event == "SessionEnd" { 3 } else { 10 },
             "async": false,
-        }]
-    });
-    let bytes = serde_json::to_vec(&canonical_json(identity)).unwrap_or_default();
+            }]),
+        ),
+    ]);
+    if let Some(matcher) = matcher {
+        identity.insert("matcher".to_string(), Value::String(matcher.to_string()));
+    }
+    let bytes = serde_json::to_vec(&canonical_json(Value::Object(identity))).unwrap_or_default();
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
@@ -1249,27 +1378,36 @@ mod tests {
     }
 
     #[test]
-    fn trust_and_enablement_health_follow_codex_state_without_writing_it() {
+    fn trust_hash_matches_codex_0_145_normalized_identity() {
+        assert_eq!(
+            expected_trust_hash("PreToolUse", "hook-command", Some("^request_user_input$")),
+            "sha256:cb901ab35ff6ca62ad3d7dd6c32b0de4cc55b9614cd4eee1bb723ec3a4af0d41"
+        );
+        assert_eq!(
+            expected_trust_hash("Stop", "hook-command", None),
+            "sha256:d11af1de50a91de62c838f9019f55b3a9cef5aa3ebb434e944e2407557e10bf4"
+        );
+    }
+
+    #[test]
+    fn trust_health_uses_runtime_hook_path_without_writing_codex_state() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         std::fs::create_dir_all(&home).unwrap();
         let agent = executable(temp.path());
         let requirements = temp.path().join("requirements.toml");
+        let hooks_state_path = "/home/test/.codex/hooks.json";
         install(&home, &requirements, &agent, true).unwrap();
         let hooks = read_hooks(&home.join("hooks.json")).unwrap();
         let mut state = toml::map::Map::new();
         for event in OBSERVED_EVENTS {
-            let (group, handler, command, _) =
+            let (group, handler, command, matcher) =
                 find_managed_handler(&hooks, event).unwrap().unwrap();
-            let key = format!(
-                "{}:{}:{group}:{handler}",
-                home.join("hooks.json").display(),
-                event_key(event)
-            );
+            let key = format!("{hooks_state_path}:{}:{group}:{handler}", event_key(event),);
             let mut hook_state = toml::map::Map::new();
             hook_state.insert(
                 "trusted_hash".to_string(),
-                toml::Value::String(expected_trust_hash(event, &command)),
+                toml::Value::String(expected_trust_hash(event, &command, matcher.as_deref())),
             );
             state.insert(key, toml::Value::Table(hook_state));
         }
@@ -1282,7 +1420,15 @@ mod tests {
         )]));
         std::fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            health_at(&home, &requirements, &agent).unwrap().status,
+            health_at_with_project_and_state_path(
+                &home,
+                &requirements,
+                &agent,
+                None,
+                hooks_state_path,
+            )
+            .unwrap()
+            .status,
             ProducerStatus::Healthy
         );
 
@@ -1305,7 +1451,15 @@ mod tests {
             .insert("enabled".to_string(), toml::Value::Boolean(false));
         std::fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            health_at(&home, &requirements, &agent).unwrap().status,
+            health_at_with_project_and_state_path(
+                &home,
+                &requirements,
+                &agent,
+                None,
+                hooks_state_path,
+            )
+            .unwrap()
+            .status,
             ProducerStatus::Disabled
         );
         let hook_state = config
@@ -1322,7 +1476,15 @@ mod tests {
         );
         std::fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            health_at(&home, &requirements, &agent).unwrap().status,
+            health_at_with_project_and_state_path(
+                &home,
+                &requirements,
+                &agent,
+                None,
+                hooks_state_path,
+            )
+            .unwrap()
+            .status,
             ProducerStatus::Modified
         );
     }
@@ -1376,8 +1538,10 @@ mod tests {
         let requirements = wsl_posix_to_unc(distro, "/etc/codex/requirements.toml").unwrap();
         let agent = normalize_wsl_executable(b"/home/natkins/.local/bin/t-hub-agent\r\n").unwrap();
         let project = host_project_path_for_distro("/home/natkins/project", distro).unwrap();
+        let hooks_state_path = format!("{home}/.codex/hooks.json");
 
         assert_eq!(home, "/home/natkins");
+        assert_eq!(hooks_state_path, "/home/natkins/.codex/hooks.json");
         assert_eq!(
             codex_home.to_string_lossy(),
             r"\\wsl.localhost\Ubuntu-24.04\home\natkins\.codex"
