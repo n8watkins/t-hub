@@ -62,6 +62,7 @@ import { RecoveryReview } from "./RecoveryReview";
 import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
 // Claude hooks install/uninstall now lives in Settings (moved out of the sidebar).
 import { HookInstallPanel } from "./HookInstallPanel";
+import { CodexHookInstallPanel } from "./CodexHookInstallPanel";
 import { claudeHooksInstalled } from "../ipc/client05";
 // Hybrid keymap (WS-3): the interactive Keyboard section shows every command's
 // live direct/prefixed binding, opens the palette to rebind, and resets defaults.
@@ -901,12 +902,13 @@ function HotkeysSection() {
 }
 
 // ---------------------------------------------------------------------------
-// Hooks — Claude Code lifecycle hook install/uninstall (moved here from the
-// sidebar). The installed check runs when this section mounts (a deliberate
-// navigation), so there's no repeated "checking..." flash.
+// Hooks - provider-specific lifecycle hook management. Claude's installed check
+// runs when this section mounts. Codex owns its richer health check inside its
+// panel because trust and policy are separate from hook-file installation.
 // ---------------------------------------------------------------------------
 function HooksSection() {
   const [installed, setInstalled] = useState<boolean | null>(null);
+  const [provider, setProvider] = useState<"claude" | "codex">("claude");
   useEffect(() => {
     let alive = true;
     claudeHooksInstalled()
@@ -916,9 +918,52 @@ function HooksSection() {
       alive = false;
     };
   }, []);
-  // HookInstallPanel is self-contained (its own header/description/buttons), so
-  // it's rendered directly rather than wrapped in a Group.
-  return <HookInstallPanel agentBin="t-hub-agent" installed={installed} setInstalled={setInstalled} />;
+  return (
+    <div className="flex flex-col gap-3">
+      <div
+        className="inline-flex w-fit rounded border p-0.5"
+        style={{ borderColor: "var(--th-border)" }}
+        role="group"
+        aria-label="Hook provider"
+      >
+        {(["claude", "codex"] as const).map((value) => {
+          const selected = provider === value;
+          return (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => setProvider(value)}
+              className="rounded px-3 py-1 text-xs font-medium transition-colors"
+              style={{
+                color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
+                backgroundColor: selected ? "var(--th-tile-bg)" : "transparent",
+              }}
+            >
+              {value === "claude" ? "Claude" : "Codex"}
+            </button>
+          );
+        })}
+      </div>
+      {provider === "claude" ? (
+        <div
+          id="claude-hooks-panel"
+          className="rounded border p-3"
+          style={{ borderColor: "var(--th-border)" }}
+        >
+          <HookInstallPanel
+            agentBin="t-hub-agent"
+            installed={installed}
+            setInstalled={setInstalled}
+          />
+        </div>
+      ) : (
+        <div id="codex-hooks-panel">
+          <CodexHookInstallPanel agentBin="t-hub-agent" />
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------

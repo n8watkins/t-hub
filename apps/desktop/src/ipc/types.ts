@@ -153,6 +153,14 @@ export const Commands05 = {
   claudeHooksInstalled: "claude_hooks_installed",
   /** Which hook events T-Hub currently manages (for the install checklist). */
   claudeHooksManaged: "claude_hooks_managed",
+  /** Install T-Hub's user-level Codex lifecycle hooks (consent-gated). */
+  installCodexHooks: "install_codex_hooks",
+  /** Reconcile drifted T-Hub Codex lifecycle hooks (consent-gated). */
+  repairCodexHooks: "repair_codex_hooks",
+  /** Remove only T-Hub-managed Codex lifecycle hooks. */
+  uninstallCodexHooks: "uninstall_codex_hooks",
+  /** Inspect Codex hook installation, executable, policy, and trust health. */
+  codexHooksHealth: "codex_hooks_health",
 } as const;
 
 /**

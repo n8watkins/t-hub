@@ -8,6 +8,8 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { Commands05, Events05 } from "./types";
 import { controlRequest, onControlEvent } from "./controlClient";
 import type {
+  CodexHooksHealth,
+  CodexHooksInstallReport,
   InstallReport,
   SessionStatus,
   StatusSnapshot,
@@ -135,6 +137,37 @@ export function claudeHooksInstalled(): Promise<boolean> {
 /** Which hook events T-Hub currently manages (to pre-check the checklist). */
 export function claudeHooksManaged(): Promise<string[]> {
   return invoke(Commands05.claudeHooksManaged);
+}
+
+/** Install all T-Hub-managed Codex lifecycle hooks. */
+export function installCodexHooks(
+  agentBin: string,
+  consent: boolean,
+): Promise<CodexHooksInstallReport> {
+  return invoke(Commands05.installCodexHooks, { agentBin, consent });
+}
+
+/** Reconcile T-Hub's Codex hook file entries with the current executable. */
+export function repairCodexHooks(
+  agentBin: string,
+  consent: boolean,
+): Promise<CodexHooksInstallReport> {
+  return invoke(Commands05.repairCodexHooks, { agentBin, consent });
+}
+
+/** Remove only T-Hub-managed entries from the Codex hook file. */
+export function uninstallCodexHooks(
+  agentBin: string,
+): Promise<CodexHooksInstallReport> {
+  return invoke(Commands05.uninstallCodexHooks, { agentBin });
+}
+
+/** Inspect Codex hook installation, executable, policy, and trust health. */
+export function codexHooksHealth(
+  agentBin: string,
+  projectRoot: string | null = null,
+): Promise<CodexHooksHealth> {
+  return invoke(Commands05.codexHooksHealth, { agentBin, projectRoot });
 }
 
 // --- Events ----------------------------------------------------------------
