@@ -14,12 +14,14 @@
 //!
 //!  reader thread:
 //!    BufReader::lines → decode_agent → dispatch:
-//!      Ready       → store journal_head_seq, set state Live/Replaying
-//!      Response    → deliver AgentResponse to a per-request mpsc Sender
-//!      Journal     → call AgentBridge::consume_journal_entry (cloned handle)
-//!      ReplayComplete → set state Live
-//!      Pong        → update last_pong_nonce (best-effort; no blocking)
-//!      Error       → eprintln
+//!      Ready          → send the advertised protocol version and journal head
+//!      Response       → deliver AgentResponse to a per-request mpsc Sender
+//!      Journal        → buffer until handshake/replay verification, then ingest
+//!      ReplayBoundary → record the durable replay boundary
+//!      ReplayComplete → verify completion against that boundary
+//!      Pong           → reserved for future liveness tracking
+//!      Error          → eprintln
+//!    malformed frames terminate the reader and fail an active handshake/replay
 //! ```
 //!
 //! ## Correlation map
@@ -489,16 +491,17 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
 /// 1. Reads lines from `child_stdout` via a `BufReader`.
 /// 2. `decode_agent`s each line.
 /// 3. Dispatches each [`AgentToCore`] variant:
-///    - `Ready`          → stores `journal_head_seq`; the caller sets state.
+///    - `Ready`          → sends the advertised protocol version and journal head.
 ///    - `Response`       → pops the sender from `pending` and delivers the body.
-///    - `Journal`        → calls `bridge.consume_journal_entry(&entry)`.
-///    - `ReplayComplete` → notifies the ready_tx channel so connect() can set Live.
+///    - `Journal`        → buffers or ingests according to the verified replay state.
+///    - `ReplayBoundary` → records the durable replay boundary.
+///    - `ReplayComplete` → verifies completion and notifies `connect()`.
 ///    - `Pong`           → no-op (RTT measurement is future work).
 ///    - `Error`          → `eprintln!`.
 ///    - `Unknown`        → ignored (forward-compat).
 ///
-/// The thread exits when the agent's stdout is closed (EOF) or on any
-/// unrecoverable read error.
+/// The thread exits when the agent's stdout is closed (EOF), on an unrecoverable
+/// read error, or on a malformed frame.
 pub(crate) fn spawn_reader(
     child_stdout: std::process::ChildStdout,
     pending: Arc<CorrelationMap>,

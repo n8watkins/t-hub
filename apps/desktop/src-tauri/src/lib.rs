@@ -178,18 +178,18 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
             // this is the `wsl.exe -d <distro> --cd ~ -e bash -lc "exec
             // $HOME/.local/bin/t-hub-agent --stdio"` form. `-e` execs real bash,
             // not the default login shell; see agent::launch_argv. The
-            // T_HUB_AGENT_BIN override remains verbatim. On unix it is a direct spawn.
+            // Dev-build T_HUB_AGENT_BIN overrides remain verbatim. Packaged
+            // Windows builds ignore the override and require the verified helper.
+            // On unix it is a direct spawn.
             let argv = agent::launch_argv(&distro);
             eprintln!("t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}");
             if let Err(e) = bridge.connect(&distro) {
                 // A failure here never aborts startup: the bridge degrades to a
-                // Failed/Disconnected state the sidebar renders. The most common
-                // cause is the agent binary not being on the login-shell PATH
-                // (install it to ~/.local/bin) — surface that hint.
+                // Failed/Disconnected state the sidebar renders.
                 eprintln!(
                     "t-hub: agent bridge connect failed: {e} \
                      (is the verified helper executable at ~/.local/bin/t-hub-agent \
-                     inside the distro, or is T_HUB_AGENT_BIN set?)"
+                     inside the distro, or is a supported developer override set?)"
                 );
             }
         })

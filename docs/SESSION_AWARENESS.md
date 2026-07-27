@@ -44,7 +44,8 @@ The core launches the agent over stdio.
 Packaged **Windows** builds carry the exact x86-64 Linux helper built from the same source tree as the desktop executable.
 Before connecting, packaged startup validates that resource, atomically installs it as `~/.local/bin/t-hub-agent` in the configured WSL distro when needed, verifies the installed SHA-256 digest, and launches that exact path.
 If deployment or verification fails, the bridge stays disconnected instead of falling back to another `t-hub-agent` on `PATH`.
-The explicit **`T_HUB_AGENT_BIN`** developer override bypasses packaged deployment and is spawned verbatim with the agent arguments.
+The explicit **`T_HUB_AGENT_BIN`** developer override bypasses packaged deployment and is spawned verbatim with the agent arguments on unix and Windows dev builds.
+Packaged Windows builds ignore the override and always require the bundled, verified helper.
 On a **unix dev box**, the bridge spawns `t-hub-agent --stdio` directly unless that override is set.
 
 ### Packaged Windows build

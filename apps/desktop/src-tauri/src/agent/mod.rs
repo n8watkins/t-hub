@@ -10,17 +10,10 @@
 //!     the UI via the [`crate::events`] journal/agent channels;
 //!   - exposes WSL metrics / git / registry RPCs to the rest of the core.
 //!
-//! ## Status
-//! This file defines the **contract** for the bridge: the public types,
-//! [`AgentBridge`] handle, and method signatures the Tauri commands call. The
-//! transport internals (spawning the child, reader/writer threads, the priority
-//! scheduler that exploits [`t_hub_protocol::Channel`]/`Priority`, reconnect +
-//! replay) are implemented by SUBAGENT(agent-bridge). The stubs compile and
-//! return a clear "not yet connected" error so the command surface is wired and
-//! typecheckable today.
-//!
-//! Boundary: SUBAGENT(agent-bridge) owns this directory (`agent/`). It must not
-//! change `t-hub-protocol`, `model.rs`, or `supervision.rs` (it *calls* them).
+//! This file defines the public bridge contract and owns the serialized
+//! connection lifecycle, handshake, replay verification, request correlation,
+//! and journal ingestion.
+//! Child-process and reader-thread mechanics live in `connection.rs`.
 
 mod connection;
 pub mod emit;
@@ -431,9 +424,11 @@ impl AgentBridge {
     /// Spawns the child from [`launch_argv`] with piped stdin/stdout (stderr
     /// inherited). Starts a reader thread that dispatches incoming
     /// [`t_hub_protocol::AgentToCore`] frames. Sends `Hello`, waits for
-    /// `Ready`, and if the agent's `journal_head_seq` is ahead of our cursor,
-    /// sends `ReplayJournal` and waits for `ReplayComplete` before setting the
-    /// state to `Live`.
+    /// `Ready`, verifies the exact protocol version, and if the agent's
+    /// `journal_head_seq` is ahead of our cursor, sends `ReplayJournal`.
+    /// Replayed state remains buffered until a durable `ReplayBoundary` and
+    /// matching `ReplayComplete` reach the advertised head, after which the
+    /// buffered entries are committed and the state becomes `Live`.
     ///
     /// The `T_HUB_AGENT_BIN` developer escape hatch is limited to Windows dev
     /// builds and tests, and overrides the child program on unix (see
