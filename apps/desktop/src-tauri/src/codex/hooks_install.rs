@@ -83,6 +83,7 @@ pub struct ProducerHealth {
     pub executable_ok: bool,
     pub agent_capable: bool,
     pub agent_version: Option<String>,
+    pub hooks_enabled: bool,
     pub inline_user_hooks_present: bool,
     pub project_hooks_present: bool,
     pub plugin_config_present: bool,
@@ -436,6 +437,15 @@ pub fn health_at_with_project(
         .and_then(|value| value.get("allow_managed_hooks_only"))
         .and_then(toml::Value::as_bool)
         .unwrap_or(false);
+    // Requirements are enforced above ordinary configuration. Of the local
+    // requirement sources available here, legacy managed_config.toml has higher
+    // precedence than the system requirements file. User config then overrides
+    // the lower-precedence system default when no requirement pins the feature.
+    let hooks_enabled = hooks_feature_flag(legacy_managed_config.as_ref())
+        .or_else(|| hooks_feature_flag(requirements.as_ref()))
+        .or_else(|| hooks_feature_flag(config.as_ref()))
+        .or_else(|| hooks_feature_flag(system_config.as_ref()))
+        .unwrap_or(true);
     let inline_user_hooks_present = config
         .as_ref()
         .and_then(|value| value.get("hooks"))
@@ -533,7 +543,7 @@ pub fn health_at_with_project(
         ProducerStatus::BlockedByManagedPolicy
     } else if drifted || !missing_events.is_empty() || !executable_ok || !agent_probe.capable {
         ProducerStatus::Drifted
-    } else if disabled {
+    } else if disabled || !hooks_enabled {
         ProducerStatus::Disabled
     } else if modified {
         ProducerStatus::Modified
@@ -554,6 +564,7 @@ pub fn health_at_with_project(
         executable_ok,
         agent_capable: agent_probe.capable,
         agent_version: agent_probe.version,
+        hooks_enabled,
         inline_user_hooks_present,
         project_hooks_present,
         plugin_config_present,
@@ -561,6 +572,14 @@ pub fn health_at_with_project(
         managed_only_policy,
         capabilities: CapabilityReport::default(),
     })
+}
+
+fn hooks_feature_flag(value: Option<&toml::Value>) -> Option<bool> {
+    let features = value?.get("features").and_then(toml::Value::as_table)?;
+    features
+        .get("hooks")
+        .or_else(|| features.get("codex_hooks"))
+        .and_then(toml::Value::as_bool)
 }
 
 fn toml_has_hook_events(value: &toml::Value) -> bool {
@@ -1133,6 +1152,46 @@ mod tests {
             health.capabilities.failure,
             "structured_app_server_or_degraded"
         );
+    }
+
+    #[test]
+    fn health_respects_hook_feature_precedence_and_legacy_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = executable(temp.path());
+        let requirements = temp.path().join("requirements.toml");
+        install(&home, &requirements, &agent, true).unwrap();
+
+        std::fs::write(home.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Disabled);
+        assert!(!health.hooks_enabled);
+
+        std::fs::write(&requirements, "[features]\nhooks = true\n").unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::NeedsReview);
+        assert!(health.hooks_enabled);
+
+        std::fs::write(
+            home.join("config.toml"),
+            "[features]\nhooks = true\ncodex_hooks = false\n",
+        )
+        .unwrap();
+        std::fs::write(&requirements, "[features]\nhooks = false\n").unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Disabled);
+        assert!(!health.hooks_enabled);
+
+        std::fs::remove_file(&requirements).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[features]\ncodex_hooks = false\n",
+        )
+        .unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Disabled);
+        assert!(!health.hooks_enabled);
     }
 
     #[test]
