@@ -165,6 +165,7 @@ pub(super) fn create_worktree_authorized(
                 .into_owned(),
         )
     };
+    ctx.ensure_worktree_available(&worktree_path, "create_worktree")?;
 
     // Create the worktree on disk first (shares git_worktree_add's impl). A git
     // failure short-circuits here — no tab/terminal is spawned for a failed add.
@@ -674,6 +675,16 @@ pub(super) fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value
             .into_owned()
     };
     require_registered_git_capability(ctx, "list_worktrees", &cwd)?;
-    let list = git::worktree_list(&cwd)?;
+    let list = git::worktree_list(&cwd)?
+        .into_iter()
+        .map(|worktree| {
+            let reservation = ctx.worktrees.reservation_for(&worktree.path);
+            let mut value = serde_json::to_value(worktree)
+                .map_err(|error| format!("list_worktrees: serialization failed: {error}"))?;
+            value["retirementReservation"] = serde_json::to_value(reservation)
+                .map_err(|error| format!("list_worktrees: serialization failed: {error}"))?;
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(json!({ "worktrees": list }))
 }

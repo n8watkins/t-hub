@@ -2499,6 +2499,10 @@ pub struct ControlContext {
     /// Durable Ship Admin and Fleet Admin appointments.
     /// Control capability admission remains a separate outer gate.
     delegated_admin: Arc<crate::delegated_admin::DelegatedAdminStore>,
+    /// Durable Cargo-cleanup reservations.
+    /// Every worktree creation, terminal spawn, and agent start consults this
+    /// coordinator before it creates runtime or filesystem state.
+    worktrees: Arc<crate::worktree_coordinator::WorktreeCoordinator>,
 }
 
 impl ControlContext {
@@ -2566,6 +2570,14 @@ impl ControlContext {
             return Err(message.into());
         }
         Ok(admission)
+    }
+
+    pub(crate) fn ensure_worktree_available(
+        &self,
+        path: &str,
+        operation: &str,
+    ) -> Result<(), String> {
+        self.worktrees.ensure_available(path, operation)
     }
 }
 
@@ -3987,7 +3999,7 @@ fn required_tier(command: &str) -> CommandTier {
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
         // process/state-changing and control-gated + audited.
-        | "abort_session" | "plane_admin" => {
+        | "abort_session" | "plane_admin" | "cleanup_worktree_artifacts" => {
             CommandTier::ProcessChanging
         }
         "focus_session" | "history_focus" | "history_list" | "preview_select"
@@ -5402,7 +5414,7 @@ fn governor_gate<'a>(
                 }
             })
         }
-        "close_terminal" => {
+        "close_terminal" | "cleanup_worktree_artifacts" => {
             ctx.governor
                 .check_destructive(now)
                 .map(|()| GovernorAdmission::Destructive {
@@ -6628,6 +6640,9 @@ fn dispatch_with_caller(
             send_keys(args)
         }
         "close_terminal" => close_terminal_authorized(ctx, args, caller, trusted_internal),
+        "cleanup_worktree_artifacts" => {
+            cleanup_worktree_artifacts(ctx, args, caller, trusted_internal)
+        }
         // Comms-plane Phase 3: the ABORT/interrupt-subordinate primitive (§2.7 R-H3). A
         // preempt CONTROL signal (an Escape interrupt), NOT a queued input message, so it
         // cannot be typed over or corrupt a draft. Gated by `can_abort` (Cortana->captain,
@@ -6889,6 +6904,7 @@ fn enforce_delegated_admin_command(
             | "capture_pane"
             | "create_worktree"
             | "close_terminal"
+            | "cleanup_worktree_artifacts"
             | "execute_admin_operation"
             | "list_admin_grants"
     ) {
@@ -12011,6 +12027,7 @@ impl ControlContext {
             inbox: Arc::new(crate::inbox::Inbox::ephemeral()),
             authz: Arc::new(crate::authz::AuthzStore::ephemeral()),
             delegated_admin: Arc::new(crate::delegated_admin::DelegatedAdminStore::ephemeral()),
+            worktrees: Arc::new(crate::worktree_coordinator::WorktreeCoordinator::ephemeral()),
         }
     }
 
@@ -12176,6 +12193,14 @@ impl ControlContext {
         delegated_admin: Arc<crate::delegated_admin::DelegatedAdminStore>,
     ) -> Self {
         self.delegated_admin = delegated_admin;
+        self
+    }
+
+    pub fn with_worktree_coordinator(
+        mut self,
+        worktrees: Arc<crate::worktree_coordinator::WorktreeCoordinator>,
+    ) -> Self {
+        self.worktrees = worktrees;
         self
     }
 

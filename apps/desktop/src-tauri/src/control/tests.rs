@@ -22050,6 +22050,10 @@ fn command_tiers_are_classified() {
         required_tier("history_resume"),
         CommandTier::ProcessChanging
     );
+    assert_eq!(
+        required_tier("cleanup_worktree_artifacts"),
+        CommandTier::ProcessChanging
+    );
     for command in ["preview_start", "preview_stop", "preview_restart"] {
         assert_eq!(required_tier(command), CommandTier::ProcessChanging);
     }

@@ -476,6 +476,8 @@ pub struct WorktreeStatus {
     pub merged: Option<bool>,
     /// Live session id rooted at or under this worktree, if any.
     pub lease: Option<String>,
+    /// Active backend-owned Cargo-cleanup reservation, if any.
+    pub retirement_reservation: Option<Value>,
 }
 
 /// A full repo snapshot: the answer to `th worktree ls`.
@@ -545,7 +547,12 @@ fn default_branch(root: &str, main_branch: Option<&str>) -> String {
 /// means yes, exit 1 means no, anything else is unknown.
 fn branch_merged(root: &str, branch: &str, default: &str) -> Option<bool> {
     let b = format!("refs/heads/{branch}");
-    let d = format!("refs/heads/{default}");
+    let remote_default = format!("refs/remotes/origin/{default}");
+    let local_default = format!("refs/heads/{default}");
+    let d = match run_git(root, &["show-ref", "--verify", "--quiet", &remote_default]) {
+        Ok((Some(0), _, _)) => remote_default,
+        _ => local_default,
+    };
     match run_git(root, &["merge-base", "--is-ancestor", &b, &d]) {
         Ok((Some(0), _, _)) => Some(true),
         Ok((Some(1), _, _)) => Some(false),
@@ -563,10 +570,36 @@ fn dirty_count(path: &str) -> Option<u32> {
     }
 }
 
+fn gather_retirement_reservations(repo_root: &str) -> HashMap<String, Value> {
+    let Ok(endpoint) = control::resolve_endpoint() else {
+        return HashMap::new();
+    };
+    let Ok(result) = control::call(&endpoint, "list_worktrees", json!({ "cwd": repo_root })) else {
+        return HashMap::new();
+    };
+    result
+        .get("worktrees")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|worktree| {
+            let path = worktree.get("path")?.as_str()?.to_string();
+            let reservation = worktree.get("retirementReservation")?;
+            (!reservation.is_null()).then(|| (path, reservation.clone()))
+        })
+        .collect()
+}
+
 /// The commits that deleting `rev` would lose (not reachable from `default`),
 /// oldest last, capped for bounded output.
 pub fn commits_lost(root: &str, rev: &str, default: &str) -> Vec<String> {
-    let range = format!("refs/heads/{default}..{rev}");
+    let remote_default = format!("refs/remotes/origin/{default}");
+    let local_default = format!("refs/heads/{default}");
+    let default_ref = match run_git(root, &["show-ref", "--verify", "--quiet", &remote_default]) {
+        Ok((Some(0), _, _)) => remote_default,
+        _ => local_default,
+    };
+    let range = format!("{default_ref}..{rev}");
     match git_ok(root, &["log", "--oneline", "--max-count=20", &range]) {
         Ok(s) if !s.is_empty() => s.lines().map(str::to_string).collect(),
         _ => Vec::new(),
@@ -582,6 +615,7 @@ pub fn scan(dir: Option<&String>) -> Result<RepoScan, String> {
     let main_branch = entries.first().and_then(|e| e.branch.clone());
     let default = default_branch(&repo_root, main_branch.as_deref());
     let leases = gather_leases();
+    let reservations = gather_retirement_reservations(&repo_root);
     let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
 
     let worktrees = entries
@@ -608,6 +642,7 @@ pub fn scan(dir: Option<&String>) -> Result<RepoScan, String> {
                 },
                 merged,
                 lease: lease_for(&e.path, &paths, &leases.sessions),
+                retirement_reservation: reservations.get(&e.path).cloned(),
             }
         })
         .collect();
@@ -737,6 +772,7 @@ pub fn worktree_json(w: &WorktreeStatus, default_branch: &str) -> Value {
         "dirtyCount": w.dirty,
         "merged": w.merged,
         "leasedBy": w.lease,
+        "retirementReservation": w.retirement_reservation,
         "prunable": prunable,
         "reason": reason,
     })
@@ -771,6 +807,7 @@ mod tests {
             dirty: Some(0),
             merged: Some(true),
             lease: None,
+            retirement_reservation: None,
         }
     }
 
@@ -817,6 +854,21 @@ prunable gitdir file points to non-existent location
         assert!(entries[3].locked);
         assert!(entries[4].prunable);
         assert!(!entries[1].locked && !entries[1].prunable);
+    }
+
+    #[test]
+    fn json_always_publishes_nullable_retirement_reservation() {
+        let mut worktree = wt("/repo/worktrees/feature", Some("feature"));
+        assert!(worktree_json(&worktree, "main")["retirementReservation"].is_null());
+
+        worktree.retirement_reservation = Some(json!({
+            "operationId": "cleanup-1",
+            "state": "running",
+        }));
+        assert_eq!(
+            worktree_json(&worktree, "main")["retirementReservation"]["operationId"],
+            "cleanup-1"
+        );
     }
 
     #[test]

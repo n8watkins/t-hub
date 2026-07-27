@@ -867,6 +867,7 @@ pub(super) fn start_agent(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let checkout = validate_crew_checkout(&project, Some(directory))
         .map_err(|error| error.replacen("dispatch_crew", "start_agent", 1))?;
+    ctx.ensure_worktree_available(&checkout, "start_agent")?;
     let worktree = git::worktree_list(&files::posix_form(&project.repo_root))
         .map_err(|error| format!("start_agent: could not detect worktree: {error}"))?
         .into_iter()
@@ -1234,6 +1235,7 @@ pub(super) fn spawn_terminal_with_private_pane_command_and_id(
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let tmux_cwd = files::posix_form(&cwd_effective);
+    ctx.ensure_worktree_available(&tmux_cwd, "spawn_terminal")?;
     let public_pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
     let pane = private_pane_command.map(str::to_owned).or(public_pane);
     // Spawned terminals receive stable discovery plus a durable Crew identity.
