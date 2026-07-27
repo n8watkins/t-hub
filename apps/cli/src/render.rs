@@ -469,8 +469,8 @@ pub struct PruneRow {
     pub would_lose: Vec<String>,
 }
 
-/// `th worktree prune` - the plan (dry-run) or the executed report. Skips print
-/// their protecting reason; forced reaps print exactly what would be lost.
+/// `th worktree prune` - the reporting-only plan. Skips print their protecting
+/// reason; forced candidates print exactly what would be lost.
 pub fn prune_plan(
     repo_root: &str,
     default_branch: &str,
