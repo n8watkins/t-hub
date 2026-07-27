@@ -145,10 +145,17 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
         Ok(RuntimePaths {
             codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
             requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
-            agent_bin: PathBuf::from(resolve_wsl_agent_bin(&distro)?),
+            agent_bin: resolved_wsl_agent_bin(resolve_wsl_agent_bin(&distro)),
             hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
         })
     }
+}
+
+#[cfg(any(windows, test))]
+fn resolved_wsl_agent_bin(result: Result<String>) -> PathBuf {
+    result
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("t-hub-agent"))
 }
 
 #[cfg(windows)]
@@ -1559,6 +1566,19 @@ mod tests {
         assert!(command.starts_with("'/home/natkins/.local/bin/t-hub-agent' "));
         assert!(!command.contains(r"\\wsl"));
         assert!(!command.contains("C:\\"));
+    }
+
+    #[test]
+    fn windows_runtime_paths_do_not_require_the_agent_to_resolve() {
+        let resolved =
+            resolved_wsl_agent_bin(Ok("/home/natkins/.local/bin/t-hub-agent".to_string()));
+        let missing = resolved_wsl_agent_bin(Err(anyhow!("agent is missing")));
+
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/natkins/.local/bin/t-hub-agent")
+        );
+        assert_eq!(missing, PathBuf::from("t-hub-agent"));
     }
 
     #[test]
