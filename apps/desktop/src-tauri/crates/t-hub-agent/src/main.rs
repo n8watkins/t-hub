@@ -66,6 +66,8 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 /// - `--codex-hook <EVENT>` Native Codex hook ingest with an explicit provider
 ///                          boundary, including payloads such as `SessionEnd`
 ///                          that do not carry provider-distinguishing fields.
+/// - `--capabilities-json` Print a machine-readable compatibility contract for
+///                         launchers and hook installers, then exit.
 /// - `--codex-unobserved` Record one credential-safe degraded marker for an
 ///                        interactive Codex TUI in its exact owning tmux pane
 ///                        when structured telemetry is unavailable.
@@ -98,6 +100,9 @@ enum Mode {
     CodexHook {
         event: String,
     },
+    /// Machine-readable compatibility contract for callers that must verify
+    /// optional agent behavior before installing a command that depends on it.
+    Capabilities,
     /// Explicit degraded marker for an interactive Codex TUI without lifecycle
     /// telemetry, bound to its exact owning tmux pane.
     CodexUnobserved,
@@ -132,6 +137,7 @@ fn parse_args() -> Args {
                     std::process::exit(1);
                 }
             },
+            "--capabilities-json" => mode = Mode::Capabilities,
             "--codex-unobserved" => mode = Mode::CodexUnobserved,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
@@ -199,6 +205,25 @@ fn main() {
                 eprintln!("t-hub-agent --codex-hook {event}: unexpected error: {error:#}");
             }
             // Observation hooks must never block Codex.
+            std::process::exit(0);
+        }
+
+        // ------------------------------------------------------------------
+        // --capabilities-json: short-lived machine-readable compatibility
+        // contract. It must not touch the journal or depend on runtime state.
+        // ------------------------------------------------------------------
+        Mode::Capabilities => {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "schemaVersion": 1,
+                    "agentVersion": env!("CARGO_PKG_VERSION"),
+                    "capabilities": [
+                        "codex-native-hooks-v1",
+                    ],
+                }))
+                .expect("static capability contract is serializable")
+            );
             std::process::exit(0);
         }
 

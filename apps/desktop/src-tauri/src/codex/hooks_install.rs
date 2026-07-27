@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -26,6 +26,9 @@ pub const OBSERVED_EVENTS: [&str; 5] = [
 ];
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_CAPABILITY_SCHEMA: u32 = 1;
+const CODEX_HOOK_CAPABILITY: &str = "codex-native-hooks-v1";
+const AGENT_CAPABILITY_OUTPUT_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,12 +79,28 @@ pub struct ProducerHealth {
     pub missing_events: Vec<String>,
     pub executable_path: String,
     pub executable_ok: bool,
+    pub agent_capable: bool,
+    pub agent_version: Option<String>,
     pub inline_user_hooks_present: bool,
     pub project_hooks_present: bool,
     pub plugin_config_present: bool,
     pub managed_hooks_present: bool,
     pub managed_only_policy: bool,
     pub capabilities: CapabilityReport,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentCapabilities {
+    schema_version: u32,
+    agent_version: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct AgentCapabilityProbe {
+    capable: bool,
+    version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -482,6 +501,11 @@ pub fn health_at_with_project(
     }
 
     let executable_ok = executable_ok(agent_bin);
+    let agent_probe = if executable_ok {
+        probe_agent_capabilities(agent_bin)
+    } else {
+        AgentCapabilityProbe::default()
+    };
     let has_trust_for_all = managed_events.iter().all(|event| {
         let Some((group_index, handler_index, command)) =
             find_managed_handler(&hooks, event).ok().flatten()
@@ -504,7 +528,7 @@ pub fn health_at_with_project(
         ProducerStatus::NotInstalled
     } else if managed_only_policy {
         ProducerStatus::BlockedByManagedPolicy
-    } else if drifted || !missing_events.is_empty() || !executable_ok {
+    } else if drifted || !missing_events.is_empty() || !executable_ok || !agent_probe.capable {
         ProducerStatus::Drifted
     } else if disabled {
         ProducerStatus::Disabled
@@ -525,6 +549,8 @@ pub fn health_at_with_project(
         missing_events,
         executable_path: agent_bin.display().to_string(),
         executable_ok,
+        agent_capable: agent_probe.capable,
+        agent_version: agent_probe.version,
         inline_user_hooks_present,
         project_hooks_present,
         plugin_config_present,
@@ -556,7 +582,60 @@ fn validate_agent_bin(path: &Path) -> Result<()> {
     if !executable_ok(path) {
         bail!("Codex hook executable is missing or not executable");
     }
+    if !probe_agent_capabilities(path).capable {
+        bail!("Codex hook executable does not support native Codex hooks; update t-hub-agent");
+    }
     Ok(())
+}
+
+fn probe_agent_capabilities(path: &Path) -> AgentCapabilityProbe {
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = std::process::Command::new("wsl.exe");
+        command
+            .arg("-d")
+            .arg(wsl_distro())
+            .arg("--")
+            .arg(path)
+            .arg("--capabilities-json")
+            .creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(not(windows))]
+    let command = {
+        let mut command = std::process::Command::new(path);
+        command.arg("--capabilities-json");
+        command
+    };
+
+    let Ok(output) = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        AGENT_CAPABILITY_OUTPUT_LIMIT,
+    ) else {
+        return AgentCapabilityProbe::default();
+    };
+    if !output.status.success() || !output.stderr.is_empty() {
+        return AgentCapabilityProbe::default();
+    }
+    let Ok(report) = serde_json::from_slice::<AgentCapabilities>(&output.stdout) else {
+        return AgentCapabilityProbe::default();
+    };
+    let version_valid = !report.agent_version.is_empty()
+        && report.agent_version.len() <= 64
+        && !report.agent_version.chars().any(char::is_control);
+    if report.schema_version != AGENT_CAPABILITY_SCHEMA || !version_valid {
+        return AgentCapabilityProbe::default();
+    }
+    AgentCapabilityProbe {
+        capable: report
+            .capabilities
+            .iter()
+            .any(|capability| capability == CODEX_HOOK_CAPABILITY),
+        version: Some(report.agent_version),
+    }
 }
 
 fn executable_ok(path: &Path) -> bool {
@@ -888,13 +967,46 @@ mod tests {
     fn executable(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("bin").join("t-hub-agent");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"agent").unwrap();
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\n\
+              if [ \"$1\" = \"--capabilities-json\" ]; then\n\
+                printf '%s\\n' '{\"schemaVersion\":1,\"agentVersion\":\"test\",\"capabilities\":[\"codex-native-hooks-v1\"]}'\n\
+                exit 0\n\
+              fi\n\
+              exit 2\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn health_rejects_an_executable_without_codex_hook_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = temp.path().join("old-t-hub-agent");
+        std::fs::write(&agent, b"#!/bin/sh\nexit 2\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let requirements = temp.path().join("requirements.toml");
+        let hooks = merge_managed(&json!({}), &agent).unwrap();
+        write_json_atomic(&home.join("hooks.json"), &hooks).unwrap();
+
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Drifted);
+        assert!(health.executable_ok);
+        assert!(!health.agent_capable);
+        assert_eq!(health.agent_version, None);
+        assert!(install(&home, &requirements, &agent, true).is_err());
     }
 
     #[test]
