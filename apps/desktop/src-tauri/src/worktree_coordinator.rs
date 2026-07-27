@@ -400,6 +400,18 @@ impl WorktreeCoordinator {
         worktree_path: &str,
         request_path: &str,
     ) -> Result<WorktreeRetirement, WorktreeCoordinatorError> {
+        self.begin_retirement_if_idle(worktree_path, request_path, |_| Ok(Vec::new()))
+    }
+
+    pub fn begin_retirement_if_idle<F>(
+        &self,
+        worktree_path: &str,
+        request_path: &str,
+        inspect_activity: F,
+    ) -> Result<WorktreeRetirement, WorktreeCoordinatorError>
+    where
+        F: FnOnce(&str) -> Result<Vec<String>, String>,
+    {
         let worktree_path = normalize_path(worktree_path);
         if worktree_path.is_empty() {
             return Err(WorktreeCoordinatorError::Conflict(
@@ -429,6 +441,14 @@ impl WorktreeCoordinator {
         {
             return Err(WorktreeCoordinatorError::Conflict(format!(
                 "worktree '{worktree_path}' has activity being admitted"
+            )));
+        }
+        let live_activity =
+            inspect_activity(&worktree_path).map_err(WorktreeCoordinatorError::Conflict)?;
+        if !live_activity.is_empty() {
+            return Err(WorktreeCoordinatorError::Conflict(format!(
+                "worktree '{worktree_path}' has live sessions: {}",
+                live_activity.join(", ")
             )));
         }
         let previous = snapshot.clone();
@@ -768,15 +788,49 @@ fn bounded_last_error(error: &str) -> String {
 }
 
 fn normalize_path(path: &str) -> String {
-    let normalized = path.trim().replace('\\', "/");
-    if normalized == "/" {
-        normalized
+    let replaced = path.trim().replace('\\', "/");
+    let mut lexical = PathBuf::new();
+    for component in Path::new(&replaced).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            component => lexical.push(component.as_os_str()),
+        }
+    }
+    let normalized = canonicalize_existing_prefix(&lexical)
+        .unwrap_or(lexical)
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    if normalized.is_empty() && replaced.starts_with('/') {
+        "/".into()
     } else {
-        normalized.trim_end_matches('/').to_string()
+        normalized
     }
 }
 
-fn path_within(candidate: &str, root: &str) -> bool {
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(_) => {
+                suffix.push(ancestor.file_name()?.to_owned());
+                ancestor = ancestor.parent()?;
+            }
+        }
+    }
+}
+
+pub(crate) fn path_within(candidate: &str, root: &str) -> bool {
     let candidate = normalize_path(candidate);
     let root = normalize_path(root);
     candidate == root || candidate.starts_with(&format!("{root}/"))
@@ -1100,6 +1154,45 @@ mod tests {
         coordinator
             .begin_retirement("/repo/worktrees/clean", "/requests/after-admission.json")
             .unwrap();
+    }
+
+    #[test]
+    fn live_activity_check_blocks_retirement_before_reservation() {
+        let coordinator = WorktreeCoordinator::ephemeral();
+
+        let error = coordinator
+            .begin_retirement_if_idle("/repo/worktrees/clean", "/requests/while-live.json", |_| {
+                Ok(vec!["th_live".into()])
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, WorktreeCoordinatorError::Conflict(_)));
+        assert!(coordinator
+            .reservation_for("/repo/worktrees/clean")
+            .is_none());
+    }
+
+    #[test]
+    fn path_matching_collapses_repeated_separators() {
+        assert!(path_within(
+            "/repo//worktrees/clean/apps/cli",
+            "/repo/worktrees/clean"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_matching_resolves_symlinked_worktrees() {
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("worktree");
+        let alias = directory.path().join("worktree-link");
+        std::fs::create_dir(&worktree).unwrap();
+        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+
+        assert!(path_within(
+            alias.join("apps/cli").to_str().unwrap(),
+            worktree.to_str().unwrap()
+        ));
     }
 
     #[test]

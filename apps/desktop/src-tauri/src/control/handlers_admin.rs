@@ -955,13 +955,7 @@ pub(super) fn prepare_admin_retirement(
             let leased_sessions = tmux::pane_info()
                 .map_err(|error| format!("retirement lease inspection failed: {error}"))?
                 .into_iter()
-                .filter(|pane| {
-                    pane.cwd == *path
-                        || pane
-                            .cwd
-                            .strip_prefix(path)
-                            .is_some_and(|suffix| suffix.starts_with('/'))
-                })
+                .filter(|pane| crate::worktree_coordinator::path_within(&pane.cwd, path))
                 .map(|pane| pane.session)
                 .collect::<Vec<_>>();
             if !leased_sessions.is_empty() {
@@ -1126,13 +1120,7 @@ pub(super) fn cleanup_worktree_artifacts(
     let leased_sessions = tmux::pane_info()
         .map_err(|error| format!("cleanup_worktree_artifacts lease inspection failed: {error}"))?
         .into_iter()
-        .filter(|pane| {
-            pane.cwd == path
-                || pane
-                    .cwd
-                    .strip_prefix(&path)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
+        .filter(|pane| crate::worktree_coordinator::path_within(&pane.cwd, &path))
         .map(|pane| pane.session)
         .collect::<Vec<_>>();
     if !leased_sessions.is_empty() {
@@ -1198,7 +1186,21 @@ pub(super) fn cleanup_worktree_artifacts(
     let target_count = capture.targets.len();
     let record = ctx
         .worktrees
-        .begin_retirement(&path, &request_path)
+        .begin_retirement_if_idle(&path, &request_path, |canonical_path| {
+            tmux::pane_info()
+                .map_err(|error| {
+                    format!("cleanup_worktree_artifacts lease inspection failed: {error}")
+                })
+                .map(|panes| {
+                    panes
+                        .into_iter()
+                        .filter(|pane| {
+                            crate::worktree_coordinator::path_within(&pane.cwd, canonical_path)
+                        })
+                        .map(|pane| pane.session)
+                        .collect()
+                })
+        })
         .map_err(|error| error.to_string())?;
     let result: Result<Value, String> = (|| {
         ctx.worktrees
