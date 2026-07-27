@@ -6024,6 +6024,9 @@ fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
     let path = captains_tmp("startup-workspace-tile-prune");
     let registry = CaptainsRegistry::load(path.clone());
     registry
+        .claim_test("gone-captain", Some("startup-failure-ship"), vec![])
+        .unwrap();
+    registry
         .adopt_unowned_workspace_projection(&[
             TabRecord {
                 id: "work-a".into(),
@@ -6038,13 +6041,23 @@ fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
         ])
         .unwrap();
 
-    let before = serde_json::to_value(registry.snapshot()).unwrap();
     registry.fail_next_persist("startup workspace prune persistence failure");
     let error = registry
         .prune_gone_workspace_tiles(|tile| tile == "live-a")
         .unwrap_err();
     assert!(error.contains("startup workspace prune persistence failure"));
-    assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+    let rolled_back_snapshot = registry.snapshot();
+    let captain = rolled_back_snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.ship_slug == "startup-failure-ship")
+        .unwrap();
+    assert!(captain.terminal_id.is_none());
+    assert!(matches!(captain.state, ClaimState::Orphaned { .. }));
+    assert!(rolled_back_snapshot
+        .workspaces
+        .iter()
+        .all(|workspace| !workspace.tile_ids.contains(&"gone-captain".to_string())));
     let rolled_back_projection = registry.workspace_projection();
     assert_eq!(
         rolled_back_projection
