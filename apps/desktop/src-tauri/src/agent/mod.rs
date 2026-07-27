@@ -1834,6 +1834,89 @@ while IFS= read -r _; do :; done
         std::fs::remove_dir_all(temp_dir).ok();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_reconnect_discards_the_replacement_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-failed-reconnect-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("replacement-agent");
+        let attempts_file = temp_dir.join("attempts");
+        let pid_file = temp_dir.join("pids");
+        let incompatible_version = PROTOCOL_VERSION.saturating_add(1);
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$$" >> "$T_HUB_TEST_PID_FILE"
+attempts=0
+if [ -f "$T_HUB_TEST_ATTEMPTS_FILE" ]; then
+  attempts=$(cat "$T_HUB_TEST_ATTEMPTS_FILE")
+fi
+attempts=$((attempts + 1))
+printf '%s' "$attempts" > "$T_HUB_TEST_ATTEMPTS_FILE"
+IFS= read -r _
+if [ "$attempts" -eq 1 ]; then
+  printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+else
+  printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{incompatible_version},"agent_version":"test","journal_head_seq":0}}'
+fi
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let attempts_file_env =
+            TestEnvVar::set("T_HUB_TEST_ATTEMPTS_FILE", &attempts_file);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(bridge.state(), ConnectionState::Live);
+
+        let error = bridge.reconnect("ignored").unwrap_err();
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        drop(attempts_file_env);
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pids = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(error.contains("agent protocol version mismatch"));
+        assert_eq!(pids.len(), 2, "expected original and replacement helpers");
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        assert!(
+            pids.iter()
+                .all(|pid| !std::path::Path::new("/proc").join(pid).exists()),
+            "a helper survived the failed replacement: {pids:?}"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
     #[test]
     fn git_info_response_reports_unsupported_agent_capability() {
         let error = super::map_git_info_response(AgentResponse::Error {
