@@ -958,7 +958,6 @@ function startTabReporter(): void {
   let bootstrapping = true;
   const startupLocal = workspaceRegistrySnapshot();
   const acknowledgedStartup = loadAcknowledgedWorkspaceSnapshot();
-  let startupBaselineValidated = false;
   const startupDeltas: StartupWorkspaceDelta[] = [
     {
       baselineTabs: acknowledgedStartup?.tabs ?? startupLocal.tabs,
@@ -1048,15 +1047,9 @@ function startTabReporter(): void {
   // after that same workspace boundary, so a persisted pin cannot validate
   // itself against a stale local tab during a race.
   const reconcile = (): void => {
-    void bootstrapWorkspaceTabs((tabs, seq) => {
-      if (!startupBaselineValidated) {
-        if (acknowledgedStartup && acknowledgedStartup.seq > seq) {
-          startupDeltas[0].baselineTabs = startupLocal.tabs;
-        }
-        startupBaselineValidated = true;
-      }
-      return rebaseStartupWorkspaceDeltas(tabs, startupDeltas);
-    }).then((authoritative) => {
+    void bootstrapWorkspaceTabs((tabs) =>
+      rebaseStartupWorkspaceDeltas(tabs, startupDeltas),
+    ).then((authoritative) => {
       if (!authoritative) {
         window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
         return;

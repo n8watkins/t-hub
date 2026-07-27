@@ -132,6 +132,7 @@ fn prepare_packaged_agent(
 /// reconnect behavior internally.
 fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBuf>) {
     let bridge = state.agent.clone();
+    bridge.set_bundled_agent_path(bundled_agent.clone());
     let distro = default_distro();
     std::thread::Builder::new()
         .name("t-hub-agent-connect".into())

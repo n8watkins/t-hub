@@ -152,6 +152,21 @@ impl ReaderJournalFlow {
         }
     }
 
+    pub(crate) fn fail_protocol(&self, error: String) {
+        let mut state = self.state.lock();
+        match &mut *state {
+            ReaderJournalState::Replaying { protocol_error, .. } => {
+                if protocol_error.is_none() {
+                    *protocol_error = Some(error);
+                }
+            }
+            ReaderJournalState::Buffering(_) => {
+                *state = ReaderJournalState::Cancelled;
+            }
+            ReaderJournalState::Live | ReaderJournalState::Cancelled => {}
+        }
+    }
+
     pub(crate) fn ingest(
         &self,
         bridge: &AgentBridge,
@@ -431,7 +446,7 @@ pub(crate) fn spawn_reader(
     bridge: AgentBridge,
     journal_flow: Arc<ReaderJournalFlow>,
     // Sent once when Ready arrives.
-    ready_tx: Sender<Ready>,
+    ready_tx: Sender<Result<Ready, String>>,
     // Sent once when ReplayComplete arrives.
     replay_done_tx: Sender<Result<u64, String>>,
 ) {
@@ -453,8 +468,12 @@ pub(crate) fn spawn_reader(
                 let frame = match decode_agent(&line) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("agent-bridge: skipping malformed frame: {e} (line={line:?})");
-                        continue;
+                        let error = format!("malformed agent frame: {e} (line={line:?})");
+                        eprintln!("agent-bridge: {error}");
+                        journal_flow.fail_protocol(error.clone());
+                        let _ = ready_tx.send(Err(error.clone()));
+                        let _ = replay_done_tx.send(Err(error));
+                        break;
                     }
                 };
 
@@ -464,7 +483,7 @@ pub(crate) fn spawn_reader(
                             "agent-bridge: agent ready (version={}, journal_head={})",
                             ready.agent_version, ready.journal_head_seq
                         );
-                        let _ = ready_tx.send(ready);
+                        let _ = ready_tx.send(Ok(ready));
                     }
 
                     AgentToCore::Response { id, body } => {

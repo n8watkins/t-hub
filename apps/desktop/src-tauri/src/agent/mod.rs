@@ -191,6 +191,7 @@ struct BridgeInner {
     /// Serializes connection lifecycle changes so superseded attempts cannot
     /// publish state for a newer transport.
     lifecycle: Mutex<()>,
+    bundled_agent: Mutex<Option<std::path::PathBuf>>,
     /// The supervision reducer, fed by incoming journal events. Shared so the
     /// supervision Tauri commands can read snapshots without a round-trip.
     supervisor: Mutex<Supervisor>,
@@ -301,6 +302,7 @@ impl Default for AgentBridge {
         let bridge = Self {
             inner: Arc::new(BridgeInner {
                 lifecycle: Mutex::new(()),
+                bundled_agent: Mutex::new(None),
                 supervisor: Mutex::new(Supervisor::new()),
                 state: Mutex::new(ConnectionState::Disconnected),
                 journal_cursor: Mutex::new(0),
@@ -319,6 +321,10 @@ impl Default for AgentBridge {
 impl AgentBridge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_bundled_agent_path(&self, path: Option<std::path::PathBuf>) {
+        *self.inner.bundled_agent.lock() = path;
     }
 
     /// Current connection state (for the UI health area / diagnostics).
@@ -439,6 +445,40 @@ impl AgentBridge {
             return Err("agent bridge already connected".to_string());
         }
 
+        #[cfg(windows)]
+        if !std::env::var_os("T_HUB_AGENT_BIN").is_some_and(|value| !value.is_empty()) {
+            let resource = self
+                .inner
+                .bundled_agent
+                .lock()
+                .clone()
+                .ok_or_else(|| {
+                    self.set_state(ConnectionState::Failed);
+                    "bundled WSL helper resource path is unavailable".to_string()
+                })?;
+            match deploy_bundled_agent(distro, &resource) {
+                Ok(DeployOutcome::AlreadyCurrent) => {
+                    eprintln!(
+                        "t-hub: bundled WSL helper verified ({})",
+                        resource.display()
+                    );
+                }
+                Ok(DeployOutcome::Installed) => {
+                    eprintln!(
+                        "t-hub: installed and verified bundled WSL helper ({})",
+                        resource.display()
+                    );
+                }
+                Err(error) => {
+                    self.set_state(ConnectionState::Failed);
+                    return Err(format!(
+                        "bundled WSL helper deployment failed; refusing to connect with an \
+                         unverified helper: {error:#}"
+                    ));
+                }
+            }
+        }
+
         // Build argv and spawn child.
         let argv = launch_argv(distro);
         let mut child = match spawn_child(argv) {
@@ -529,7 +569,14 @@ impl AgentBridge {
         // Wait for Ready (10 s timeout). On failure, mark Failed (and emit) so
         // the UI shows the dead connection rather than a stuck "handshaking".
         let ready = match ready_rx.recv_timeout(ready_timeout) {
-            Ok(ready) => ready,
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("agent handshake failed: {error}"),
+                ));
+            }
             Err(_) => {
                 return Err(self.fail_connection(
                     &handles,
@@ -1914,6 +1961,58 @@ while IFS= read -r _; do :; done
                 .all(|pid| !std::path::Path::new("/proc").join(pid).exists()),
             "a helper survived the failed replacement: {pids:?}"
         );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_frame_fails_an_active_journal_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-malformed-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("malformed-replay-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
+IFS= read -r _
+printf '%s\n' '{{malformed'
+printf '%s\n' '{{"channel":"control","type":"replay_boundary","last_seq":1}}'
+printf '%s\n' '{{"channel":"control","type":"replay_complete","last_seq":1}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        let error = bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        assert!(error.contains("incomplete journal replay: malformed agent frame"));
+        assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert!(bridge.inner.transport.lock().is_none());
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

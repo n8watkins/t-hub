@@ -412,7 +412,7 @@ describe("workspace registry bootstrap", () => {
     });
   });
 
-  it("rebases a persisted unacknowledged layout from its acknowledged snapshot", () => {
+  it("keeps the acknowledged merge base across a lower registry sequence namespace", () => {
     const acknowledged = [
       {
         id: "work-1",
