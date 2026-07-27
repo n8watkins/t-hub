@@ -17,10 +17,12 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const MANAGED_MARKER: &str = "__t_hub_codex_managed__";
-pub const OBSERVED_EVENTS: [&str; 5] = [
+pub const OBSERVED_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
     "PermissionRequest",
+    "PreToolUse",
+    "PostToolUse",
     "Stop",
     "SessionEnd",
 ];
@@ -62,7 +64,7 @@ impl Default for CapabilityReport {
             permission: "native_hook",
             completion: "native_hook",
             session_end: "native_hook",
-            question: "structured_app_server_or_degraded",
+            question: "native_hook",
             failure: "structured_app_server_or_degraded",
         }
     }
@@ -474,7 +476,7 @@ pub fn health_at_with_project(
 
     for event in OBSERVED_EVENTS {
         match find_managed_handler(&hooks, event)? {
-            Some((group_index, handler_index, command)) => {
+            Some((group_index, handler_index, command, matcher)) => {
                 managed_events.push(event.to_string());
                 let key = format!(
                     "{}:{}:{group_index}:{handler_index}",
@@ -494,7 +496,8 @@ pub fn health_at_with_project(
                 {
                     modified |= trusted_hash != expected_trust_hash(event, &command);
                 }
-                drifted |= command != managed_command(agent_bin, event);
+                drifted |= command != managed_command(agent_bin, event)
+                    || matcher.as_deref() != managed_matcher(event);
             }
             None => missing_events.push(event.to_string()),
         }
@@ -507,7 +510,7 @@ pub fn health_at_with_project(
         AgentCapabilityProbe::default()
     };
     let has_trust_for_all = managed_events.iter().all(|event| {
-        let Some((group_index, handler_index, command)) =
+        let Some((group_index, handler_index, command, _)) =
             find_managed_handler(&hooks, event).ok().flatten()
         else {
             return false;
@@ -725,13 +728,17 @@ fn merge_managed(existing: &Value, agent_bin: &Path) -> Result<Value> {
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| anyhow!("{event} hooks must be an array"))?;
-        groups.push(json!({
+        let mut group = json!({
             "hooks": [{
                 "type": "command",
                 "command": managed_command(agent_bin, event),
                 "timeout": if event == "SessionEnd" { 3 } else { 10 },
             }]
-        }));
+        });
+        if let Some(matcher) = managed_matcher(event) {
+            group["matcher"] = Value::String(matcher.to_string());
+        }
+        groups.push(group);
     }
     Ok(merged)
 }
@@ -771,7 +778,10 @@ fn remove_managed(existing: &Value) -> Result<Value> {
     Ok(cleaned)
 }
 
-fn find_managed_handler(value: &Value, event: &str) -> Result<Option<(usize, usize, String)>> {
+fn find_managed_handler(
+    value: &Value,
+    event: &str,
+) -> Result<Option<(usize, usize, String, Option<String>)>> {
     let Some(groups_value) = value.get("hooks").and_then(|hooks| hooks.get(event)) else {
         return Ok(None);
     };
@@ -788,7 +798,16 @@ fn find_managed_handler(value: &Value, event: &str) -> Result<Option<(usize, usi
                     .split_whitespace()
                     .any(|word| word == MANAGED_MARKER)
                 {
-                    return Ok(Some((group_index, handler_index, command.to_string())));
+                    let matcher = group
+                        .get("matcher")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    return Ok(Some((
+                        group_index,
+                        handler_index,
+                        command.to_string(),
+                        matcher,
+                    )));
                 }
             }
         }
@@ -814,6 +833,10 @@ fn managed_command(agent_bin: &Path, event: &str) -> String {
     )
 }
 
+fn managed_matcher(event: &str) -> Option<&'static str> {
+    matches!(event, "PreToolUse" | "PostToolUse").then_some("^request_user_input$")
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -823,6 +846,8 @@ fn event_key(event: &str) -> &'static str {
         "SessionStart" => "session_start",
         "UserPromptSubmit" => "user_prompt_submit",
         "PermissionRequest" => "permission_request",
+        "PreToolUse" => "pre_tool_use",
+        "PostToolUse" => "post_tool_use",
         "Stop" => "stop",
         "SessionEnd" => "session_end",
         _ => unreachable!("managed event set is closed"),
@@ -1135,6 +1160,36 @@ mod tests {
     }
 
     #[test]
+    fn health_and_repair_detect_a_broadened_question_matcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = executable(temp.path());
+        let requirements = temp.path().join("requirements.toml");
+        install(&home, &requirements, &agent, true).unwrap();
+
+        let mut hooks = read_hooks(&home.join("hooks.json")).unwrap();
+        hooks["hooks"]["PreToolUse"][0]["matcher"] = Value::String("^.*$".to_string());
+        write_json_atomic(&home.join("hooks.json"), &hooks).unwrap();
+        assert_eq!(
+            health_at(&home, &requirements, &agent).unwrap().status,
+            ProducerStatus::Drifted
+        );
+
+        let repaired = repair(&home, &requirements, &agent, true).unwrap();
+        assert!(repaired.changed);
+        let hooks = read_hooks(&home.join("hooks.json")).unwrap();
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["matcher"],
+            "^request_user_input$"
+        );
+        assert_eq!(
+            hooks["hooks"]["PostToolUse"][0]["matcher"],
+            "^request_user_input$"
+        );
+    }
+
+    #[test]
     fn trust_and_enablement_health_follow_codex_state_without_writing_it() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
@@ -1145,7 +1200,8 @@ mod tests {
         let hooks = read_hooks(&home.join("hooks.json")).unwrap();
         let mut state = toml::map::Map::new();
         for event in OBSERVED_EVENTS {
-            let (group, handler, command) = find_managed_handler(&hooks, event).unwrap().unwrap();
+            let (group, handler, command, _) =
+                find_managed_handler(&hooks, event).unwrap().unwrap();
             let key = format!(
                 "{}:{}:{group}:{handler}",
                 home.join("hooks.json").display(),

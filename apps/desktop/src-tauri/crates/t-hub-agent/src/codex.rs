@@ -666,6 +666,15 @@ fn assign_codex_event_identity(entry: &mut EventJournalEntry, state: &TapState) 
                 ("turn_id", turn_id),
             ],
         ),
+        Some("question_resolved") if question_id.is_some() => crate::event_identity::derive(
+            "codex",
+            "question_resolved",
+            &[
+                ("request_id", question_id),
+                ("session_id", session_id),
+                ("turn_id", turn_id),
+            ],
+        ),
         _ => None,
     };
     entry.event_id = identity;
@@ -761,6 +770,30 @@ fn entry_from_native_hook(
             envelope["params"]["toolName"] = Value::String(bounded_str(tool_name, MAX_ID_BYTES));
             permission_entry(method, &envelope, &state, &binding)
         }
+        "PreToolUse"
+            if raw.get("tool_name").and_then(Value::as_str) == Some("request_user_input") =>
+        {
+            let request_id = exact_string(
+                raw.get("tool_use_id").or_else(|| raw.get("item_id")),
+                MAX_ID_BYTES,
+            )
+            .unwrap_or_else(opaque_hook_request_id);
+            let tool_input = raw.get("tool_input").unwrap_or(&Value::Null);
+            let envelope = json!({
+                "id": request_id,
+                "params": {
+                    "threadId": state.session_id,
+                    "turnId": state.turn_id,
+                    "itemId": bounded_string(
+                        raw.get("item_id").or_else(|| raw.get("tool_use_id")),
+                        MAX_ID_BYTES
+                    ),
+                    "questions": tool_input.get("questions"),
+                    "autoResolutionMs": tool_input.get("autoResolutionMs"),
+                }
+            });
+            question_entry(&envelope, &state, &binding)
+        }
         "PostToolUse" => {
             let request_id = exact_string(
                 raw.get("approval_id")
@@ -768,13 +801,24 @@ fn entry_from_native_hook(
                     .or_else(|| raw.get("item_id")),
                 MAX_ID_BYTES,
             )?;
+            let is_question =
+                raw.get("tool_name").and_then(Value::as_str) == Some("request_user_input");
             let mut entry = lifecycle_entry(
                 &state,
                 &binding,
                 JournalEventType::CoreAction,
-                "permission_resolved",
+                if is_question {
+                    "question_resolved"
+                } else {
+                    "permission_resolved"
+                },
             )?;
-            entry.payload["permission_request_id"] = Value::String(request_id);
+            let request_key = if is_question {
+                "question_request_id"
+            } else {
+                "permission_request_id"
+            };
+            entry.payload[request_key] = Value::String(request_id);
             assign_codex_event_identity(&mut entry, &state);
             Some(entry)
         }
@@ -1217,6 +1261,50 @@ mod tests {
         assert_eq!(first.event_id, retry.event_id);
         assert_ne!(first.event_id, distinct.event_id);
         assert_eq!(first.payload["permission_request_id"], "request-1");
+    }
+
+    #[test]
+    fn native_question_hooks_sanitize_content_and_resolve_with_stable_identity() {
+        let raw = serde_json::json!({
+            "model": "gpt-5",
+            "permission_mode": "plan",
+            "session_id": "thread-1",
+            "turn_id": "turn-1",
+            "tool_name": "request_user_input",
+            "tool_use_id": "question-1",
+            "tool_input": {
+                "questions": [{
+                    "header": "Credential-bearing header",
+                    "question": "Credential-bearing question",
+                    "options": [{"label": "Credential-bearing option"}]
+                }],
+                "autoResolutionMs": 60000
+            }
+        });
+
+        let requested = entry_from_hook("PreToolUse", &raw, None, None).unwrap();
+        assert_eq!(requested.event_type, JournalEventType::Elicitation);
+        assert_eq!(requested.payload["lifecycle"], "question_requested");
+        assert_eq!(
+            requested.payload["question_request"]["provider_request_id"],
+            "question-1"
+        );
+        assert_eq!(requested.payload["question_request"]["question_count"], 1);
+        assert_eq!(requested.payload["question_request"]["has_options"], true);
+        assert_eq!(
+            requested.payload["question_request"]["auto_resolution_configured"],
+            true
+        );
+        assert!(requested.event_id.is_some());
+        let serialized = serde_json::to_string(&requested).unwrap();
+        assert!(!serialized.contains("Credential-bearing"));
+
+        let resolved = entry_from_hook("PostToolUse", &raw, None, None).unwrap();
+        assert_eq!(resolved.event_type, JournalEventType::CoreAction);
+        assert_eq!(resolved.payload["lifecycle"], "question_resolved");
+        assert_eq!(resolved.payload["question_request_id"], "question-1");
+        assert!(resolved.event_id.is_some());
+        assert_ne!(requested.event_id, resolved.event_id);
     }
 
     #[test]
