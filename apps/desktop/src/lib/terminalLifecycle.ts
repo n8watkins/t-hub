@@ -1,19 +1,17 @@
 import type { TerminalTemperature } from "./terminalResources";
 
-// How long a terminal stays WARM (mounted + attached to tmux, output flushed on
-// the throttled background path) after it leaves the foreground before it goes
-// COLD (xterm disposed, detached from tmux). Returning to a WARM terminal is
-// instant; returning to a COLD one remounts and replays the tmux capture — a
-// visible reload/flash.
+// How long a terminal stays WARM (xterm mounted, with its PTY stream parked
+// separately by Terminal.tsx) after it leaves the foreground before it goes
+// COLD (xterm disposed). Returning to a WARM terminal preserves its renderer and
+// reattaches from authoritative tmux state; returning to a COLD one remounts it.
 //
 // This was 30s, which made routine tab-switching feel like the terminals were
 // "constantly refreshing": revisit any tab more than 30s after you last looked
-// at it and it reloaded. A terminal held warm is cheap (an idle tmux attach +
-// a background-throttled renderer), so we keep it warm generously and only cold
-// out the genuinely-abandoned ones. 5 minutes comfortably covers real
+// at it and it reloaded. A warm xterm renderer with its output stream parked is
+// cheap, so we keep it warm generously and only cold out the genuinely-abandoned
+// ones. 5 minutes comfortably covers real
 // switching cadence while still eventually freeing terminals you've walked away
-// from. (If the warm set ever needs a hard memory ceiling for users with many
-// tabs, bound it by count on top of this timer rather than shortening it.)
+// from. Warm renderers do not keep background PTY output flowing.
 export const TERMINAL_COLD_AFTER_MS = 300_000;
 export const TERMINAL_MAX_WARM = 12;
 

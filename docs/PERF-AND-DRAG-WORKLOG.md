@@ -39,6 +39,8 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
   The earlier A1 sample ruled out output marshaling for one isolated ~327ms stall, but it did not cover a sustained firehose.
   Remote PTY readers now share a process-wide 100ms output-event schedule, naturally backpressuring continuous output before it can starve the Windows host event loop.
   Live Windows verification showed that the earlier 20ms schedule still allowed two 50-event-per-second stalls during a multi-terminal attach.
+  A second Windows verification showed that even serialized 10-event-per-second output could starve the window while six parked terminals remained attached.
+  Parked terminals now keep their xterm renderer warm but detach the PTY output stream after a two-second switch grace, then reattach from authoritative tmux state when foregrounded.
   The first event after an idle period is still emitted immediately.
 - ✅ **v0.3.24 canvas stale-frame heal SHIPPED (`cc604bd`)** — `forceFullRedraw` = throttled
   `clearTextureAtlas` + refresh at 6 geometry-heal points + foreground-only broadcast (also
@@ -252,6 +254,7 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       Each `app.emit` from a reader thread posts its own tao user-event through an unbounded queue with no release-path backpressure.
       Per-terminal coalescing alone still allowed a continuous multi-terminal firehose to saturate the Windows host event loop.
       Remote PTY readers now reserve process-wide output-event slots 100ms apart, which bounds sustained dispatch volume while preserving immediate output after idle.
+      Background terminals stop contributing to that volume after their two-second warm-switch grace because their PTY streams are detached without killing tmux.
       Control-event serialization and reconnect behavior remain separate from this terminal-output limit.
   - **SHIPPED (v0.3.15): hang detector** (`lib/hangDetector.ts`, mounted from
     `main.tsx`) — a 500ms heartbeat (logs `blockedMs` when a tick is late ≥500ms,

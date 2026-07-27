@@ -107,11 +107,12 @@ async function openExternal(url: string): Promise<void> {
 }
 
 // Output scheduling. Foreground terminals flush on rAF for low-latency typing.
-// Parked/inactive terminals keep their xterm buffers current, but flush less
-// often so inactive workspace tabs, covered panels, minimized windows, and
-// maximize/restore transitions do not spend a frame per terminal doing DOM work.
+// Parked/inactive terminals keep their xterm buffers current during a short
+// switch grace period, then detach only their PTY stream while keeping xterm
+// mounted. Returning to them reattaches from authoritative tmux state.
 const BACKGROUND_OUTPUT_FLUSH_MS = 250;
 const HIDDEN_DOCUMENT_OUTPUT_FLUSH_MS = 1000;
+const BACKGROUND_PTY_DETACH_MS = 2000;
 const MAX_BACKGROUND_PENDING_BYTES = 512 * 1024;
 // Hard CAP on a parked terminal's pending[] queue (memory). The byte threshold
 // above only speeds up the flush; it never bounds the queue, so a hidden tab
@@ -276,7 +277,8 @@ export interface TerminalViewProps {
   visible: boolean;
   /**
    * True when this terminal is actually on the active workspace/panel surface.
-   * Background terminals stay attached, but output flushing is throttled.
+   * Background terminals keep xterm warm but detach their output stream after a
+   * short grace period.
    */
   foreground?: boolean;
 }
@@ -368,6 +370,7 @@ export function TerminalView({
     // safely discard them because the next tmux attach redraws authoritative state.
     let discardPending: (() => void) | null = null;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let backgroundDetachTimer: ReturnType<typeof setTimeout> | null = null;
     // The reattach loop's pending backoff timer, held at effect scope so cleanup
     // can cancel it — a cleared timer never resolves its sleep, which (with the
     // `disposed` checks) abandons any in-flight reconnect on unmount.
@@ -905,6 +908,45 @@ export function TerminalView({
             let needsReattach = false;
             let initialAttachSettled = false;
 
+            const clearBackgroundDetach = (): void => {
+              if (!backgroundDetachTimer) return;
+              clearTimeout(backgroundDetachTimer);
+              backgroundDetachTimer = null;
+            };
+            const shouldKeepOutputAttached = (): boolean =>
+              foregroundRef.current && !documentHidden();
+            const scheduleBackgroundDetach = (): void => {
+              clearBackgroundDetach();
+              if (
+                disposed ||
+                shouldKeepOutputAttached() ||
+                !ptyAttachedRef.current
+              ) {
+                return;
+              }
+              backgroundDetachTimer = setTimeout(() => {
+                backgroundDetachTimer = null;
+                if (
+                  disposed ||
+                  shouldKeepOutputAttached() ||
+                  !ptyAttachedRef.current
+                ) {
+                  return;
+                }
+                ptyAttachedRef.current = false;
+                needsReattach = true;
+                void beginTerminalDetach(terminalId, () =>
+                  closeTerminal(terminalId),
+                )
+                  .then(() => {
+                    if (!disposed) {
+                      updateTerminalResources(terminalId, { pty: false });
+                    }
+                  })
+                  .catch(() => undefined);
+              }, BACKGROUND_PTY_DETACH_MS);
+            };
+
             const reconnectSleep = (ms: number): Promise<void> =>
               new Promise((resolve) => {
                 reconnectTimer = setTimeout(() => {
@@ -957,7 +999,7 @@ export function TerminalView({
                   return;
                 }
                 // Backgrounded: park the retry; onForegroundChanged resumes it.
-                if (!foregroundRef.current) {
+                if (!shouldKeepOutputAttached()) {
                   reconnecting = false;
                   needsReattach = true;
                   return;
@@ -1052,10 +1094,13 @@ export function TerminalView({
               const detail = (event as CustomEvent<TerminalForegroundDetail>).detail;
               if (detail?.id !== terminalId) return;
               if (detail.foreground) {
+                clearBackgroundDetach();
                 scheduleFlush();
                 // A drop noticed while parked resumes its reattach here, the
                 // moment the tile is foregrounded again.
-                if (needsReattach) void reattachLoop();
+                if (!documentHidden() && needsReattach) void reattachLoop();
+              } else {
+                scheduleBackgroundDetach();
               }
             };
             const onVisibilityChanged = (): void => {
@@ -1065,8 +1110,11 @@ export function TerminalView({
                   flushRaf = 0;
                 }
                 scheduleFlush();
+                scheduleBackgroundDetach();
               } else {
+                clearBackgroundDetach();
                 scheduleFlush();
+                if (foregroundRef.current && needsReattach) void reattachLoop();
               }
             };
             window.addEventListener(TERMINAL_FOREGROUND_EVENT, onForegroundChanged);
@@ -1161,6 +1209,7 @@ export function TerminalView({
             }
 
             initialAttachSettled = true;
+            scheduleBackgroundDetach();
           } catch (err) {
             // Initial attach failed. Previously this left the tile rendered but
             // INERT forever — the "tile never attached" signature (seen with
@@ -1382,6 +1431,10 @@ export function TerminalView({
       if (flushTimer) {
         clearTimeout(flushTimer);
         flushTimer = null;
+      }
+      if (backgroundDetachTimer) {
+        clearTimeout(backgroundDetachTimer);
+        backgroundDetachTimer = null;
       }
       if (resizeTimer) clearTimeout(resizeTimer);
       if (copyTimer) clearTimeout(copyTimer);
