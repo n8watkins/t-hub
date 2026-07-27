@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::sync::{mpsc::SyncSender, Arc, Condvar, Mutex as StdMutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,7 @@ struct ProbeChannel {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GenerationState {
     Pending,
+    Activating,
     Current,
     Retired,
 }
@@ -129,7 +130,16 @@ impl GenerationAuthority {
         }
     }
 
+    #[cfg(test)]
     fn activate_if_open(&self, on_activated: impl FnOnce()) -> bool {
+        if !self.begin_activation(on_activated) {
+            return false;
+        }
+        self.finish_activation();
+        true
+    }
+
+    fn begin_activation(&self, on_activated: impl FnOnce()) -> bool {
         let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         if progress.closed || progress.state != GenerationState::Pending {
             progress.state = GenerationState::Retired;
@@ -138,14 +148,32 @@ impl GenerationAuthority {
             self.changed.notify_all();
             return false;
         }
-        progress.state = GenerationState::Current;
+        progress.state = GenerationState::Activating;
         on_activated();
-        for event in progress.pending.drain(..) {
-            (self.sink)(event);
-        }
-        progress.pending_bytes = 0;
-        self.changed.notify_all();
         true
+    }
+
+    fn finish_activation(&self) {
+        loop {
+            let pending = {
+                let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+                if progress.state != GenerationState::Activating {
+                    return;
+                }
+                if progress.pending.is_empty() {
+                    progress.state = GenerationState::Current;
+                    self.changed.notify_all();
+                    return;
+                }
+                progress.pending_bytes = 0;
+                let pending = std::mem::take(&mut progress.pending);
+                self.changed.notify_all();
+                pending
+            };
+            for event in pending {
+                (self.sink)(event);
+            }
+        }
     }
 
     fn retire(&self) {
@@ -175,8 +203,10 @@ impl GenerationAuthority {
     fn dispatch(&self, event: ReaderEvent) {
         let event_bytes = event.byte_len();
         let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
-        while progress.state == GenerationState::Pending
-            && progress.pending_bytes.saturating_add(event_bytes) > MAX_PENDING_AUTHORITY_BYTES
+        while matches!(
+            progress.state,
+            GenerationState::Pending | GenerationState::Activating
+        ) && progress.pending_bytes.saturating_add(event_bytes) > MAX_PENDING_AUTHORITY_BYTES
         {
             progress = self
                 .changed
@@ -184,14 +214,37 @@ impl GenerationAuthority {
                 .unwrap_or_else(|e| e.into_inner());
         }
         match progress.state {
-            GenerationState::Pending => {
+            GenerationState::Pending | GenerationState::Activating => {
                 progress.pending_bytes = progress.pending_bytes.saturating_add(event_bytes);
                 progress.pending.push(event);
                 self.changed.notify_all();
             }
-            GenerationState::Current => (self.sink)(event),
+            GenerationState::Current => {
+                drop(progress);
+                (self.sink)(event);
+            }
             GenerationState::Retired => {}
         }
+    }
+
+    fn dispatch_if_authoritative(&self, dispatch: impl FnOnce()) -> bool {
+        let progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(
+            progress.state,
+            GenerationState::Activating | GenerationState::Current
+        ) {
+            return false;
+        }
+        dispatch();
+        true
+    }
+
+    fn is_authoritative(&self) -> bool {
+        let progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            progress.state,
+            GenerationState::Activating | GenerationState::Current
+        )
     }
 
     #[cfg(test)]
@@ -347,9 +400,18 @@ impl RemotePty {
         let probe_for_thread = probe_channel.clone();
         let event_app = app.clone();
         let event_id = id.to_string();
-        let event_sink: Arc<dyn Fn(ReaderEvent) + Send + Sync> =
-            Arc::new(move |event| emit_reader_event(&event_app, &event_id, event));
-        let generation = Arc::new(GenerationAuthority::new(event_sink));
+        let generation = Arc::new_cyclic(|generation| {
+            let generation = generation.clone();
+            let event_sink: Arc<dyn Fn(ReaderEvent) + Send + Sync> = Arc::new(move |event| {
+                queue_reader_event(
+                    event_app.clone(),
+                    event_id.clone(),
+                    generation.clone(),
+                    event,
+                )
+            });
+            GenerationAuthority::new(event_sink)
+        });
         let generation_for_thread = generation.clone();
         let handle = std::thread::Builder::new()
             .name(format!("t-hub-remote-pty-{id}"))
@@ -547,6 +609,37 @@ const MAX_BATCH_BYTES: usize = 256 * 1024;
 const OUTPUT_EMIT_PERIOD: Duration = Duration::from_millis(100);
 static NEXT_OUTPUT_EMIT: std::sync::LazyLock<StdMutex<Instant>> =
     std::sync::LazyLock::new(|| StdMutex::new(Instant::now()));
+const OUTPUT_DISPATCH_CAPACITY: usize = 4;
+static OUTPUT_DISPATCHER: std::sync::LazyLock<SyncSender<QueuedReaderEvent>> =
+    std::sync::LazyLock::new(|| {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<QueuedReaderEvent>(OUTPUT_DISPATCH_CAPACITY);
+        std::thread::Builder::new()
+            .name("t-hub-output-dispatch".to_string())
+            .spawn(move || {
+                while let Ok(queued) = receiver.recv() {
+                    let Some(generation) = queued.generation.upgrade() else {
+                        continue;
+                    };
+                    if !generation.is_authoritative() {
+                        continue;
+                    }
+                    let QueuedReaderEvent { app, id, event, .. } = queued;
+                    match event {
+                        event @ ReaderEvent::Output(_) => throttle_output_emit(|| {
+                            generation
+                                .dispatch_if_authoritative(|| emit_reader_event(&app, &id, event));
+                        }),
+                        event @ ReaderEvent::StreamEnd(_) => {
+                            generation
+                                .dispatch_if_authoritative(|| emit_reader_event(&app, &id, event));
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn terminal output dispatcher");
+        sender
+    });
 /// Raw socket read size. A single read can carry several NDJSON frames, which the
 /// loop parses out of its own accumulation buffer.
 const RECV_BUF: usize = 16 * 1024;
@@ -577,6 +670,13 @@ enum PreparedStreamEnd {
 enum ReaderEvent {
     Output(Vec<u8>),
     StreamEnd(PreparedStreamEnd),
+}
+
+struct QueuedReaderEvent {
+    app: AppHandle,
+    id: String,
+    generation: Weak<GenerationAuthority>,
+    event: ReaderEvent,
 }
 
 impl ReaderEvent {
@@ -639,6 +739,20 @@ fn throttle_output_emit() {
     if !delay.is_zero() {
         std::thread::sleep(delay);
     }
+}
+
+fn queue_reader_event(
+    app: AppHandle,
+    id: String,
+    generation: Weak<GenerationAuthority>,
+    event: ReaderEvent,
+) {
+    let _ = OUTPUT_DISPATCHER.send(QueuedReaderEvent {
+        app,
+        id,
+        generation,
+        event,
+    });
 }
 
 /// The attach stream ended — an explicit `{"exit"}` frame, or EOF/error on the
@@ -858,7 +972,10 @@ impl RemotePtyManager {
                 let key = entry.key().clone();
                 let connection = Arc::new(Mutex::new(connection));
                 entry.insert(connection.clone());
-                if connection.lock().generation.activate_if_open(on_installed) {
+                let generation = connection.lock().generation.clone();
+                if generation.begin_activation(on_installed) {
+                    drop(conns);
+                    generation.finish_activation();
                     Ok(connection)
                 } else {
                     let removed = conns.remove(&key).expect("just-inserted generation");
@@ -1454,6 +1571,72 @@ mod tests {
         loser.dispatch(ReaderEvent::Output(b"loser".to_vec()));
         loser.retire();
         assert!(loser_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authority_delivers_callbacks_after_releasing_its_lock() {
+        let lock_was_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = lock_was_available.clone();
+        let authority = Arc::new_cyclic(|authority: &Weak<GenerationAuthority>| {
+            let authority = authority.clone();
+            GenerationAuthority::new(Arc::new(move |_| {
+                observed.store(
+                    authority
+                        .upgrade()
+                        .expect("authority")
+                        .progress
+                        .try_lock()
+                        .is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }))
+        });
+        authority.dispatch(ReaderEvent::Output(b"pending".to_vec()));
+        assert!(authority.activate_if_open(|| {}));
+        assert!(lock_was_available.load(std::sync::atomic::Ordering::SeqCst));
+
+        lock_was_available.store(false, std::sync::atomic::Ordering::SeqCst);
+        authority.dispatch(ReaderEvent::Output(b"current".to_vec()));
+        assert!(lock_was_available.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn installation_flushes_pending_events_after_releasing_manager_lock() {
+        let manager = Arc::new(RemotePtyManager::default());
+        let manager_for_sink = manager.clone();
+        let manager_lock_was_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = manager_lock_was_available.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let reader_stream = writer.try_clone().unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut reader = reader_stream;
+            let mut tail = Vec::new();
+            let _ = reader.read_to_end(&mut tail);
+        });
+        let remote = test_remote_with_sink(
+            writer,
+            reader,
+            Arc::new(ProbeChannel::default()),
+            Arc::new(move |_| {
+                observed.store(
+                    manager_for_sink.conns.try_lock().is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }),
+        );
+        remote
+            .generation
+            .dispatch(ReaderEvent::Output(b"pending".to_vec()));
+
+        let installed_remote = installed(manager.install_if_absent("term".into(), remote, || {}));
+        assert!(manager_lock_was_available.load(std::sync::atomic::Ordering::SeqCst));
+
+        manager.remove("term");
+        installed_remote.lock().detach();
+        drop(server);
     }
 
     #[test]
