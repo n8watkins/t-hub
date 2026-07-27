@@ -8,7 +8,7 @@
 
 **Updated:** 2026-07-26.
 **Plan source:** implementation through `2da9915` on `fix/startup-reconciliation`.
-**Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `39140` when this plan was refreshed.
+**Historical installed build:** At the prior July 20 refresh, T-Hub `0.3.103` from exact detached source `8654986` was running on the canonical profile as Windows PID `39140`.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
