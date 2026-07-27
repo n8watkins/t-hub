@@ -316,7 +316,8 @@ fn managed_helper_failure(
     TmuxError {
         op,
         code,
-        io_kind: matches!(code, Some(83 | 84)).then_some(std::io::ErrorKind::WouldBlock),
+        io_kind: matches!(code, Some(80 | 82 | 83 | 84 | 90 | 92))
+            .then_some(std::io::ErrorKind::WouldBlock),
         message: message.into(),
     }
 }
@@ -1884,7 +1885,7 @@ def observe(tools, unit, nonce, pid):
         for control in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
             control_details = os.stat(control, dir_fd=descriptor, follow_symlinks=False)
             if not stat.S_ISREG(control_details.st_mode):
-                refuse(90)
+                refuse(130)
         os.close(descriptor)
     except (FileNotFoundError, PermissionError, OSError):
         refuse(90)
@@ -3621,45 +3622,36 @@ while True:
     }
 
     #[test]
-    fn managed_retirement_preserves_only_inconclusive_helper_failures() {
-        for code in [83, 84] {
+    fn cortana_retryable_managed_evidence_classifies_only_inconclusive_helpers() {
+        for code in [80, 82, 83, 84, 90, 92] {
             for op in [
                 "managed-runtime-preflight",
                 "observe-managed-runtime-owner",
                 "retire-prepared-managed-runtime",
                 "retire-managed-runtime",
             ] {
-                let error =
-                    managed_helper_failure(op, Some(code), "unreadable helper evidence");
+                let error = managed_helper_failure(op, Some(code), "unreadable helper evidence");
                 assert!(error.is_retryable_observation(), "{op} helper exit {code}");
             }
         }
 
-        for code in [76, 78, 79, 120] {
+        for code in [76, 78, 79, 81, 89, 91, 93, 120, 130] {
             for op in [
                 "managed-runtime-preflight",
                 "observe-managed-runtime-owner",
                 "retire-prepared-managed-runtime",
                 "retire-managed-runtime",
             ] {
-                let error =
-                    managed_helper_failure(op, Some(code), "definitive ownership failure");
-                assert!(
-                    !error.is_retryable_observation(),
-                    "{op} helper exit {code}"
-                );
+                let error = managed_helper_failure(op, Some(code), "definitive ownership failure");
+                assert!(!error.is_retryable_observation(), "{op} helper exit {code}");
             }
         }
     }
 
     #[test]
     fn managed_retirement_unknown_completion_is_retryable_but_alive_is_not() {
-        assert!(
-            incomplete_managed_retirement(SessionLiveness::Unknown).is_retryable_observation()
-        );
-        assert!(
-            !incomplete_managed_retirement(SessionLiveness::Alive).is_retryable_observation()
-        );
+        assert!(incomplete_managed_retirement(SessionLiveness::Unknown).is_retryable_observation());
+        assert!(!incomplete_managed_retirement(SessionLiveness::Alive).is_retryable_observation());
     }
 
     #[cfg(unix)]

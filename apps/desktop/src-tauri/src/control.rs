@@ -9316,14 +9316,14 @@ fn cleanup_cortana_managed_launch(
     owner: Option<&tmux::ManagedRuntimeOwnerToken>,
 ) -> Result<(), String> {
     match owner {
-        Some(owner) => tmux::retire_managed_runtime(&launch.tmux_target, owner)
-            .map_err(|error| {
+        Some(owner) => {
+            tmux::retire_managed_runtime(&launch.tmux_target, owner).map_err(|error| {
                 cortana_tmux_observation_error("exact observed owner cleanup failed", error)
-            })?,
-        None => tmux::retire_prepared_managed_runtime(&tmux_cortana_launch(launch))
-            .map_err(|error| {
-                cortana_tmux_observation_error("exact prepared owner cleanup failed", error)
-            })?,
+            })?
+        }
+        None => tmux::retire_prepared_managed_runtime(&tmux_cortana_launch(launch)).map_err(
+            |error| cortana_tmux_observation_error("exact prepared owner cleanup failed", error),
+        )?,
     }
     ctx.captains.clear_prepared_cortana_managed_launch(launch)?;
     Ok(())
@@ -10055,10 +10055,7 @@ fn revalidate_unresolved_cortana_attestation(
     )?;
     let bearer = tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV)
         .map_err(|error| {
-            cortana_tmux_observation_error(
-                "unresolved Cortana bearer inspection failed",
-                error,
-            )
+            cortana_tmux_observation_error("unresolved Cortana bearer inspection failed", error)
         })?
         .filter(|bearer| !bearer.is_empty())
         .ok_or("unresolved Cortana runtime has no retained session bearer")?;
@@ -11022,8 +11019,9 @@ fn reconcile_cortana_inner(
                     &tmux_cortana_launch(&launch),
                 )
                 .map_err(|error| {
-                    format!(
-                        "reconcile_cortana: prepared launch effect is alive but ownership is unverifiable: {error}"
+                    cortana_tmux_observation_error(
+                        "reconcile_cortana: prepared launch effect is alive but ownership is unverifiable",
+                        error,
                     )
                 })?;
                 durable = ctx.captains.record_cortana_runtime_owner(
@@ -11882,8 +11880,9 @@ fn reconcile_cortana_inner(
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
-            return Err(format!(
-                "reconcile_cortana: terminal startup failed with durable prepared cleanup pending: {error}"
+            return Err(cortana_tmux_observation_error(
+                "reconcile_cortana: terminal startup failed with durable prepared cleanup pending",
+                error,
             ));
         }
     };

@@ -1440,7 +1440,7 @@ fn low1_retryable_errors_carry_a_structured_flag_not_prose() {
 }
 
 #[test]
-fn cortana_inconclusive_observations_never_enter_quarantine_branch() {
+fn cortana_retryable_managed_evidence_never_enters_quarantine_branch() {
     let timeout = crate::tmux::TmuxError {
         op: "trusted-python",
         code: None,
@@ -1470,15 +1470,15 @@ fn cortana_inconclusive_observations_never_enter_quarantine_branch() {
     );
     assert!(is_retryable_error(&indeterminate_error));
 
-    for code in [83, 84] {
+    for code in [80, 82, 83, 84, 90, 92] {
         let retirement_evidence = crate::tmux::TmuxError {
-            op: "retire-prepared-managed-runtime",
+            op: "observe-managed-runtime-owner",
             code: Some(code),
             io_kind: Some(std::io::ErrorKind::WouldBlock),
-            message: "prepared managed unit was unverifiable".into(),
+            message: "managed runtime evidence was unreadable".into(),
         };
         let retirement_error = cortana_tmux_observation_error(
-            "exact prepared owner cleanup failed",
+            "prepared launch effect ownership is unverifiable",
             retirement_evidence,
         );
         assert!(ControlResponse::err(retirement_error).retryable);
