@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const SCHEMA_VERSION: u32 = 1;
+const MAX_TARGETS_PER_OPERATION: usize = 3;
 const PROVIDER_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const INSPECTION_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -668,8 +669,15 @@ pub fn inspect_cleanup_candidate(worktree_path: &str) -> Result<RetirementCleanu
             stderr.trim()
         ));
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Cargo cleanup inspection returned invalid JSON: {error}"))
+    let capture: RetirementCleanupCapture = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Cargo cleanup inspection returned invalid JSON: {error}"))?;
+    if capture.targets.len() > MAX_TARGETS_PER_OPERATION {
+        return Err(format!(
+            "Cargo cleanup found {} targets, exceeding the bounded batch limit of {MAX_TARGETS_PER_OPERATION}",
+            capture.targets.len()
+        ));
+    }
+    Ok(capture)
 }
 
 #[cfg(not(windows))]
@@ -1033,5 +1041,57 @@ mod tests {
         assert_eq!(request["project"], "t-hub");
         assert_eq!(request["allowUnmerged"], false);
         assert_eq!(request["inventoryComplete"], true);
+    }
+
+    #[test]
+    fn inspection_refuses_more_than_three_targets_in_one_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktree = directory.path().join("linked");
+        std::fs::create_dir_all(repository.join("apps/cli")).unwrap();
+        std::fs::create_dir_all(repository.join("apps/desktop/src-tauri")).unwrap();
+        std::fs::write(repository.join(".gitignore"), b"target\ntarget-*\n").unwrap();
+        std::fs::write(repository.join("apps/cli/Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::write(
+            repository.join("apps/desktop/src-tauri/Cargo.toml"),
+            b"[workspace]\n",
+        )
+        .unwrap();
+        git(directory.path(), &["init", "-b", "main", "repository"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "Test User"]);
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "initial"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repository,
+            &[
+                "update-ref",
+                "refs/remotes/origin/main",
+                "refs/heads/feature",
+            ],
+        );
+        for path in [
+            "apps/cli/target",
+            "apps/cli/target-windows",
+            "apps/desktop/src-tauri/target",
+            "apps/desktop/src-tauri/target-windows",
+        ] {
+            std::fs::create_dir_all(worktree.join(path)).unwrap();
+        }
+
+        assert_eq!(
+            inspect_cleanup_candidate(worktree.to_str().unwrap()).unwrap_err(),
+            "Cargo cleanup found 4 targets, exceeding the bounded batch limit of 3"
+        );
     }
 }
