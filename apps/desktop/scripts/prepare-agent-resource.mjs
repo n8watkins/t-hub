@@ -104,6 +104,10 @@ function buildOnLinux() {
     {
       env: {
         ...process.env,
+        // A WSL checkout under /mnt/c can discover the Windows user's
+        // ancestor .cargo/config.toml and its Windows-only sccache path.
+        RUSTC_WRAPPER: "",
+        CARGO_BUILD_RUSTC_WRAPPER: "",
         CARGO_TARGET_DIR: targetDir,
       },
     },
