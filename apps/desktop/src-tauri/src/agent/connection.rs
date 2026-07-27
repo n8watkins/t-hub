@@ -57,7 +57,7 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use t_hub_protocol::{
-    decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame, EventJournalEntry,
+    decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame, EventJournalEntry, Ready,
 };
 
 // Re-export AgentBridge so the reader thread can call consume_journal_entry
@@ -320,8 +320,8 @@ pub(crate) fn spawn_reader(
     pending: Arc<CorrelationMap>,
     bridge: AgentBridge,
     journal_flow: Arc<ReaderJournalFlow>,
-    // Sent once when Ready arrives: carries the agent's journal_head_seq.
-    ready_tx: Sender<u64>,
+    // Sent once when Ready arrives.
+    ready_tx: Sender<Ready>,
     // Sent once when ReplayComplete arrives.
     replay_done_tx: Sender<u64>,
 ) {
@@ -354,9 +354,7 @@ pub(crate) fn spawn_reader(
                             "agent-bridge: agent ready (version={}, journal_head={})",
                             ready.agent_version, ready.journal_head_seq
                         );
-                        // Signal connect() with the journal head seq so it can
-                        // decide whether to request a replay.
-                        let _ = ready_tx.send(ready.journal_head_seq);
+                        let _ = ready_tx.send(ready);
                     }
 
                     AgentToCore::Response { id, body } => {
@@ -388,7 +386,6 @@ pub(crate) fn spawn_reader(
 
                     AgentToCore::ReplayComplete { last_seq } => {
                         eprintln!("agent-bridge: replay complete (last_seq={last_seq})");
-                        journal_flow.complete_replay(&bridge);
                         let _ = replay_done_tx.send(last_seq);
                     }
 
