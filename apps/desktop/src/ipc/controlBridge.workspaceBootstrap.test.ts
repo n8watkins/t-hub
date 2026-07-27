@@ -262,11 +262,19 @@ describe("workspace registry bootstrap", () => {
       activeTabId: CAPTAINS_TAB_ID,
       tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
     });
-    invoke.mockResolvedValue({
-      seq: 8,
-      stale: true,
-      error: "Workspace report rejected",
-      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_terminals") {
+        return Promise.resolve([]);
+      }
+      if (command === "report_workspace_tabs") {
+        return Promise.resolve({
+          seq: 8,
+          stale: true,
+          error: "Workspace report rejected",
+          tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+        });
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${command}`));
     });
 
     await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
