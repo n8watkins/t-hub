@@ -3536,7 +3536,7 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn replace_cortana_runtime_owner_for_test(
         &self,
         expected: &crate::cortana_reconcile::CortanaManagedOwnerToken,

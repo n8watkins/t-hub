@@ -1252,6 +1252,8 @@ fn mcp_control_helper() {
 }
 
 fn protect_fixture_file(path: &Path) {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

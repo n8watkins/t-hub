@@ -897,7 +897,7 @@ pub fn new_session_with_env(
 /// Create a detached pane whose first user process is already inside a unique
 /// transient user-systemd scope, then publish ownership only after every kernel,
 /// systemd, nonce, process, and tmux identity agrees.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(any(not(test), windows), allow(dead_code))]
 pub(crate) fn new_managed_session_with_env(
     name: &str,
     cwd: &str,
@@ -2435,13 +2435,13 @@ pub(crate) fn set_before_exact_effect_hook(target: &str, hook: ExactEffectHook) 
     *BEFORE_EXACT_EFFECT_HOOK.lock().unwrap() = Some((target.to_string(), hook));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_after_final_scan_seam(target: &str, path: &std::path::Path) {
     *AFTER_FINAL_SCAN_SEAM.lock().unwrap() =
         Some((target.to_string(), path.to_string_lossy().into_owned()));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_managed_retire_crash(target: &str, stage: &'static str, marker: &std::path::Path) {
     assert!(matches!(stage, "freeze" | "kill"));
     *MANAGED_RETIRE_CRASH.lock().unwrap() = Some((

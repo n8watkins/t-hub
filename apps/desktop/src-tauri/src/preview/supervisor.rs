@@ -1029,6 +1029,7 @@ raise SystemExit(71)"#;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::io::BufRead;
 
     #[cfg(target_os = "linux")]

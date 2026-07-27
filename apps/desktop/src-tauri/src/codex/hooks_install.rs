@@ -853,7 +853,7 @@ fn executable_ok(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let expected = path.to_string_lossy();
-        return verify_wsl_agent_bin(&wsl_distro(), &expected).is_ok();
+        verify_wsl_agent_bin(&wsl_distro(), &expected).is_ok()
     }
     #[cfg(not(windows))]
     let Ok(metadata) = std::fs::metadata(path) else {

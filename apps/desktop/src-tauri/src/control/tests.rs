@@ -40,6 +40,7 @@ use std::thread;
 
 // Real tmux fixture progress can be delayed substantially by the parallel
 // workspace suite, while thirty seconds remains a bounded failure signal.
+#[cfg(unix)]
 const TEST_ASYNC_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
@@ -621,16 +622,19 @@ impl ProcessAttestationTmuxGuard {
     }
 }
 
+#[cfg(unix)]
 struct ManagedCortanaTestCleanup {
     ctx: Arc<ControlContext>,
 }
 
+#[cfg(unix)]
 impl ManagedCortanaTestCleanup {
     fn new(ctx: Arc<ControlContext>) -> Self {
         Self { ctx }
     }
 }
 
+#[cfg(unix)]
 impl Drop for ManagedCortanaTestCleanup {
     fn drop(&mut self) {
         let durable = self.ctx.captains.cortana_identity();

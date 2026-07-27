@@ -1801,19 +1801,16 @@ fn validate_runtime_identity(
         return Err(format!("{scope} providerSessionId requires a provider"));
     }
     match provider {
-        Some("claude") => {
+        Some("claude")
             if (strict || provider_session_id.is_some() && claude_uuid.is_some())
-                && provider_session_id != claude_uuid
-            {
-                return Err(format!(
-                    "{scope} Claude providerSessionId and claudeUuid must match"
-                ));
-            }
+                && provider_session_id != claude_uuid =>
+        {
+            return Err(format!(
+                "{scope} Claude providerSessionId and claudeUuid must match"
+            ));
         }
-        Some("codex") => {
-            if claude_uuid.is_some() {
-                return Err(format!("{scope} Codex identity must not carry claudeUuid"));
-            }
+        Some("codex") if claude_uuid.is_some() => {
+            return Err(format!("{scope} Codex identity must not carry claudeUuid"));
         }
         None if strict && claude_uuid.is_some() => {
             return Err(format!("{scope} claudeUuid requires the Claude provider"));
@@ -9896,7 +9893,7 @@ fn resolve_cortana_expected_harness_launch(
     Ok(expected)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn attest_cortana_managed_harness(
     ctx: &ControlContext,
     durable: &crate::cortana_reconcile::CortanaDurableIdentity,

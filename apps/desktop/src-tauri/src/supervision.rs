@@ -519,11 +519,11 @@ impl Supervisor {
                 if payload
                     .and_then(|value| value.get("lifecycle"))
                     .and_then(Value::as_str)
-                    == Some("question_resolved") =>
+                    == Some("question_resolved")
+                    && entry.status == SessionStatus::NeedsQuestion
+                    && !entry.main_stopped =>
             {
-                if entry.status == SessionStatus::NeedsQuestion && !entry.main_stopped {
-                    entry.status = SessionStatus::Working;
-                }
+                entry.status = SessionStatus::Working;
             }
 
             JournalEventType::Notification => match notification_type {
