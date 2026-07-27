@@ -295,6 +295,7 @@ pub struct RemotePty {
     writer: TcpStream,
     /// The reader thread, joined on detach/Drop so it never outlives us.
     reader: Option<JoinHandle<()>>,
+    reader_cancelled: Arc<std::sync::atomic::AtomicBool>,
     probe_channel: Arc<ProbeChannel>,
     generation: Arc<GenerationAuthority>,
     #[cfg(test)]
@@ -413,12 +414,15 @@ impl RemotePty {
             GenerationAuthority::new(event_sink)
         });
         let generation_for_thread = generation.clone();
+        let reader_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_for_thread = reader_cancelled.clone();
         let handle = std::thread::Builder::new()
             .name(format!("t-hub-remote-pty-{id}"))
             .spawn(move || {
                 reader_loop(
                     id_for_thread,
                     reader,
+                    cancelled_for_thread,
                     probe_for_thread,
                     generation_for_thread,
                 )
@@ -430,6 +434,7 @@ impl RemotePty {
                 id: id.to_string(),
                 writer,
                 reader: Some(handle),
+                reader_cancelled,
                 probe_channel,
                 generation,
                 #[cfg(test)]
@@ -563,6 +568,8 @@ impl RemotePty {
         // Wake a Pending reader that is backpressured on the bounded pre-install
         // event buffer, and suppress any later event from this generation.
         self.generation.retire();
+        self.reader_cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
         // Best-effort: the peer may already be gone (the attach client exited and
         // the server closed the connection), in which case shutdown errors harmlessly.
         let _ = self.writer.shutdown(Shutdown::Both);
@@ -592,6 +599,10 @@ impl Drop for RemotePty {
 /// blocking read (no busy-poll), and it is well under the frontend's ~16 ms rAF
 /// flush so the added echo latency is imperceptible.
 const COALESCE_WINDOW: Duration = Duration::from_millis(8);
+/// Windows does not reliably wake a blocking read on one cloned socket handle
+/// when another clone is shut down. Poll cancellation at a low idle cadence so
+/// detach remains bounded without making the reader busy-spin.
+const READER_CANCEL_POLL: Duration = Duration::from_millis(50);
 /// Flush a pending batch the moment it reaches this many DECODED bytes, so a
 /// firehose stays responsive (and memory bounded) even within one window.
 const MAX_BATCH_BYTES: usize = 256 * 1024;
@@ -843,6 +854,7 @@ fn emit_reader_event(app: &AppHandle, id: &str, event: ReaderEvent) {
 fn reader_loop(
     id: String,
     reader: BufReader<TcpStream>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     probe_channel: Arc<ProbeChannel>,
     generation: Arc<GenerationAuthority>,
 ) {
@@ -885,12 +897,20 @@ fn reader_loop(
         // promptly. A raw `read` into our own buffer means a timeout consumes
         // nothing (no partial-line corruption) — unlike a timed `read_line`.
         let pending = !batch.is_empty();
-        let _ = stream.set_read_timeout(if pending { Some(COALESCE_WINDOW) } else { None });
+        let timeout = if pending {
+            COALESCE_WINDOW
+        } else {
+            READER_CANCEL_POLL
+        };
+        let _ = stream.set_read_timeout(Some(timeout));
         match (&stream).read(&mut buf) {
             Ok(0) => break, // EOF: server detached / connection dropped.
             Ok(n) => acc.extend_from_slice(&buf[..n]),
             // The coalesce window elapsed with a batch pending → flush it.
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 emit_batch(&generation, &mut batch);
             }
             Err(_) => break, // a torn-down connection (shutdown) surfaces here.
@@ -905,6 +925,9 @@ fn reader_loop(
     // Live after this reader has already published Detached/Exited.
     probe_channel.close();
     generation.mark_closed();
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let stream_end = prepare_stream_end(&id, exit_code.unwrap_or(None));
     generation.dispatch(ReaderEvent::StreamEnd(stream_end));
 }
@@ -1020,6 +1043,7 @@ mod tests {
             id: "test".into(),
             writer,
             reader: Some(reader),
+            reader_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             probe_channel,
             generation: Arc::new(GenerationAuthority::new(sink)),
             after_probe_write: None,
@@ -1040,10 +1064,13 @@ mod tests {
         let reader_probe_channel = probe_channel.clone();
         let reader_generation = generation.clone();
         let reader_id = id.to_string();
+        let reader_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_for_thread = reader_cancelled.clone();
         let reader = std::thread::spawn(move || {
             reader_loop(
                 reader_id,
                 BufReader::new(reader_stream),
+                cancelled_for_thread,
                 reader_probe_channel,
                 reader_generation,
             )
@@ -1053,6 +1080,7 @@ mod tests {
                 id: id.into(),
                 writer,
                 reader: Some(reader),
+                reader_cancelled,
                 probe_channel,
                 generation: generation.clone(),
                 after_probe_write: None,
@@ -1611,15 +1639,10 @@ mod tests {
         let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let reader_stream = writer.try_clone().unwrap();
         let (server, _) = listener.accept().unwrap();
-        let reader = std::thread::spawn(move || {
-            let mut reader = reader_stream;
-            let mut tail = Vec::new();
-            let _ = reader.read_to_end(&mut tail);
-        });
-        let remote = test_remote_with_sink(
+        let (remote, generation) = socket_backed_remote(
+            "test",
             writer,
-            reader,
-            Arc::new(ProbeChannel::default()),
+            reader_stream,
             Arc::new(move |_| {
                 observed.store(
                     manager_for_sink.conns.try_lock().is_some(),
@@ -1627,9 +1650,7 @@ mod tests {
                 );
             }),
         );
-        remote
-            .generation
-            .dispatch(ReaderEvent::Output(b"pending".to_vec()));
+        generation.dispatch(ReaderEvent::Output(b"pending".to_vec()));
 
         let installed_remote = installed(manager.install_if_absent("term".into(), remote, || {}));
         assert!(manager_lock_was_available.load(std::sync::atomic::Ordering::SeqCst));
@@ -1892,6 +1913,7 @@ mod tests {
             id: "pending".into(),
             writer,
             reader: Some(blocked_reader),
+            reader_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             probe_channel: Arc::new(ProbeChannel::default()),
             generation: authority,
             after_probe_write: None,
