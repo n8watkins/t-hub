@@ -2183,12 +2183,11 @@ fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<()
     if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
-        Err(TmuxError {
-            op: "managed-runtime-preflight",
-            code: output.status.code(),
-            io_kind: None,
-            message: "user systemd with delegated cgroup-v2 freeze and kill is unavailable".into(),
-        })
+        Err(managed_helper_failure(
+            "managed-runtime-preflight",
+            output.status.code(),
+            "user systemd with delegated cgroup-v2 freeze and kill is unavailable",
+        ))
     }
 }
 
@@ -2234,12 +2233,11 @@ fn observe_managed_runtime_owner(
                 message: format!("managed runtime ownership inspection failed: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(TmuxError {
-            op: "observe-managed-runtime-owner",
-            code: output.status.code(),
-            io_kind: None,
-            message: "systemd, cgroup, process, nonce, and tmux ownership did not agree".into(),
-        });
+        return Err(managed_helper_failure(
+            "observe-managed-runtime-owner",
+            output.status.code(),
+            "systemd, cgroup, process, nonce, and tmux ownership did not agree",
+        ));
     }
     let observed: ManagedRuntimeObservation =
         serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
@@ -3625,21 +3623,32 @@ while True:
     #[test]
     fn managed_retirement_preserves_only_inconclusive_helper_failures() {
         for code in [83, 84] {
-            let error = managed_helper_failure(
+            for op in [
+                "managed-runtime-preflight",
+                "observe-managed-runtime-owner",
                 "retire-prepared-managed-runtime",
-                Some(code),
-                "unreadable helper evidence",
-            );
-            assert!(error.is_retryable_observation(), "helper exit {code}");
+                "retire-managed-runtime",
+            ] {
+                let error =
+                    managed_helper_failure(op, Some(code), "unreadable helper evidence");
+                assert!(error.is_retryable_observation(), "{op} helper exit {code}");
+            }
         }
 
         for code in [76, 78, 79, 120] {
-            let error = managed_helper_failure(
+            for op in [
+                "managed-runtime-preflight",
+                "observe-managed-runtime-owner",
+                "retire-prepared-managed-runtime",
                 "retire-managed-runtime",
-                Some(code),
-                "definitive ownership failure",
-            );
-            assert!(!error.is_retryable_observation(), "helper exit {code}");
+            ] {
+                let error =
+                    managed_helper_failure(op, Some(code), "definitive ownership failure");
+                assert!(
+                    !error.is_retryable_observation(),
+                    "{op} helper exit {code}"
+                );
+            }
         }
     }
 
