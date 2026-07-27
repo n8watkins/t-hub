@@ -6,8 +6,8 @@
 > [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md).
 > Powder boards, cards, claims, runs, and Crew dispatch below are historical compatibility evidence unless a section explicitly identifies a current agent-session contract.
 
-**Updated:** 2026-07-20.
-**Plan source:** implementation through `d777bf3` on `main` plus the supervisory-model activation recorded by this change.
+**Updated:** 2026-07-26.
+**Plan source:** implementation through `2da9915` on `fix/startup-reconciliation`.
 **Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `39140` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
@@ -377,13 +377,14 @@ It is not yet a complete Captain and Crew communication product.
 Agent-to-agent send is not exposed through the normal CLI or MCP catalogs.
 Generic delivery, receive, acknowledgement, message history, and frontend visibility remain incomplete.
 
-Claude currently has the strongest T-Hub integration through fifteen lifecycle hooks and a structured status-line bridge.
-Codex has a current lifecycle-hook framework, but T-Hub has not integrated it.
-Interactive Codex therefore lacks dependable context, supervision, attention, voice, and History parity.
+Claude currently has the broadest T-Hub integration through fifteen lifecycle hooks and a structured status-line bridge.
+T-Hub now installs and repairs supported Codex native lifecycle hooks for session, prompt, permission, question, completion, and session-end events.
+The current source contract and remaining packaged-acceptance gap are owned by [UX-RELIABILITY-AND-PERFORMANCE-ITINERARY.md](./UX-RELIABILITY-AND-PERFORMANCE-ITINERARY.md).
+Interactive Codex still lacks complete context, exact failure, subagent, and provider-limit parity.
 
 The Windows and WSL TTS endpoints are healthy on ports `7477` and `7478`.
 Voice settings are enabled with Kokoro selected and attention announcements enabled.
-Automatic spoken announcements currently depend on needs-input status transitions, which interactive Codex does not reliably produce.
+Source-level automatic announcements now accept normalized Codex permission and question transitions, while installed audible playback remains a packaged-acceptance gap.
 
 The installed `th` CLI reports version `0.2.0`.
 Source commit `07e74f4` upgrades the control protocol and recovers from a stale inherited endpoint after application port rotation while preserving the caller's token capability.
@@ -619,7 +620,7 @@ Adapters should map provider events into:
 ### Work
 
 1. Move Claude-specific supervision assumptions behind the adapter boundary.
-2. Integrate current Codex lifecycle hooks with `t-hub-agent`.
+2. Keep the current `t-hub-agent` Codex lifecycle-hook integration capability-versioned, trust-aware, and credential-safe.
 3. Add structured telemetry for interactive Codex sessions rather than relying on output activity.
 4. Bind Codex thread IDs and Claude session IDs to durable T-Hub identities.
 5. Add Codex context telemetry for the outer tile, sidebar, Cortana health, and reset recommendations.
@@ -1359,11 +1360,11 @@ The matrix describes current T-Hub support, not the provider's theoretical capab
 | --- | --- | --- | --- |
 | Interactive launch | Supported | Supported | Apply explicit unrestricted defaults and identity labels to both |
 | Interactive unrestricted permissions | Inherited or flag-dependent | Inherited or flag-dependent | Apply and display the effective bypass mode consistently |
-| Provider session identity | Strong through `SessionStart` hooks | Partial for interactive sessions | Bind both to durable T-Hub identities |
-| Turn lifecycle | Strong hook coverage | Headless tap plus weak interactive inference | Normalize structured interactive events |
-| Needs-question detection | `Elicitation` and filtered notifications | No complete T-Hub bridge | Derive from Codex hooks or app-server events |
-| Permission-request detection | Hooked | Provider hook exists but is not integrated | Feed both into one attention path |
-| Completion detection | `Stop` hook | Provider `Stop` hook exists but is not integrated | Feed both into one reducer |
+| Provider session identity | Strong through `SessionStart` hooks | Native `SessionStart` hook; durable binding remains partial | Bind both to durable T-Hub identities |
+| Turn lifecycle | Strong hook coverage | Native prompt and completion hooks plus the headless structured tap; exact interactive failure remains degraded | Normalize structured interactive events |
+| Needs-question detection | `Elicitation` and filtered notifications | Native `request_user_input` pre- and post-tool hooks | Feed both into one attention path |
+| Permission-request detection | Hooked | Native `PermissionRequest` hook | Feed both into one attention path |
+| Completion detection | `Stop` hook | Native `Stop` hook | Feed both into one reducer |
 | Failure detection | `StopFailure` and session-end evidence | No exact `StopFailure` hook | Derive from turn events, process result, and structured errors |
 | Context telemetry | Structured status-line bridge | Native footer only for the user | Add structured Codex context telemetry |
 | Provider limits | Supported through status line and fallback | Account usage strip exists | Normalize global quota display |
@@ -1373,13 +1374,13 @@ The matrix describes current T-Hub support, not the provider's theoretical capab
 | Directory changes | Claude `CwdChanged` hook | No direct equivalent confirmed | Use terminal or T-Hub process evidence where necessary |
 | Compaction lifecycle | Not currently integrated by T-Hub | Codex has pre and post compact hooks | Add normalized context compaction events where available |
 | Tool lifecycle | Not currently part of T-Hub supervision | Codex has pre and post tool hooks | Keep optional and avoid noisy default UI |
-| History and resume | Claude-only Recent implementation | No unified History | Build adapter-backed History for both |
+| History and resume | Provider-neutral catalog and resume | Provider-neutral catalog and resume | Keep adapter-backed History semantics aligned |
 | Context meter in tiles | Claude-only | Missing | Make provider-independent |
 | Auto-continue after provider limit | Implemented through the Claude-specific flow | Missing | Build durable exact-thread Codex scheduling, cancellation, deduplication, and recovery |
-| Voice attention announcements | Works when Claude status transitions arrive | Usually absent because interactive status is weak | Drive voice from normalized events |
-| Chimes and OS notifications | Stronger through Claude events | Degraded | Drive both from normalized events |
-| Hook installation UI | Claude-only | Missing | Replace with Agent integrations |
-| Hook trust model | Claude settings merge | Codex requires explicit hook review and hash trust | Surface provider-specific trust without hiding it |
+| Voice attention announcements | Works when Claude status transitions arrive | Supported native permission and question events feed the normalized attention path | Drive voice from normalized events |
+| Chimes and OS notifications | Stronger through Claude events | Supported native hooks feed the normalized event path | Drive both from normalized events |
+| Hook installation UI | Available in Settings | Available in Settings with install, repair, health, and uninstall actions | Keep provider-specific health visible |
+| Hook trust model | Claude settings merge | Settings reports Codex trust state and directs approval through Codex's own `/hooks` review | Preserve provider-specific trust without hiding it |
 | Native agent voice input | Enabled in the current Claude configuration | No equivalent T-Hub-managed Codex setting | Prefer provider-agnostic Scribe input rather than require native parity |
 | Provider-native notifications | Claude notification hooks feed T-Hub | Codex TUI notifications exist outside T-Hub | Normalize important events inside T-Hub and leave native notifications optional |
 | Provider plugins and marketplaces | Claude plugins and marketplaces are configured separately | Codex plugins use a different configuration system | Show integration health without trying to force one provider's plugin model onto another |

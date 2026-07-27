@@ -2473,17 +2473,16 @@ pub(crate) fn home_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-2 / PR-C deferred capability shape (doc-stub, per the audit's full
-// 7-capability adapter). These are intentionally NOT live trait methods in
-// PR-A:
-//   - `list_resumable()` -> the continuity catalog rows. Its return type couples
-//     to the D6 `recent.rs::RecentSession` (which gains a `provider` field in
-//     PR-C); declaring it here would force PR-A to edit D6-owned files. It lands
-//     with D6/PR-C alongside `codex_recent()`.
-//   - `install_producer()` -> Claude hooks install / Codex `[hooks]` producer
-//     (Phase 2; the Codex `[hooks]` path is additionally gated by Codex's new
-//     hook-trust regime, which is why Phase 1 uses the trust-free `exec --json`
-//     producer instead).
+// Provider-neutral capability shape retained from the adapter audit. These are
+// intentionally NOT live trait methods:
+//   - `list_resumable()` -> the current provider-specific catalog services own
+//     continuity rows. Lifting the operation into this adapter still requires a
+//     provider-neutral return type.
+//   - `install_producer()` -> provider-neutral producer management. Concrete
+//     Claude settings and Codex `hooks.json` management already live behind
+//     their provider-specific services; lifting them into this adapter remains
+//     deferred. Codex trust approval stays exclusively in Codex's `/hooks`
+//     review flow.
 //   - `migrate_argv(id)` -> crew-migration resume-by-id. Phase 1 encodes this as
 //     doctrine (Codex crews migrate with `codex resume '<uuid>'`, mirror of the
 //     `claude --resume <uuid>` directive) rather than a code path.
