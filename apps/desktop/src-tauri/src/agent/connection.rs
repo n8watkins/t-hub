@@ -243,11 +243,7 @@ impl ReaderJournalFlow {
         }
     }
 
-    fn ingest_replayed(
-        state: &mut ReaderJournalState,
-        seq: u64,
-        entry: EventJournalEntry,
-    ) {
+    fn ingest_replayed(state: &mut ReaderJournalState, seq: u64, entry: EventJournalEntry) {
         let ReaderJournalState::Replaying {
             replay_entries,
             verified_seq,
