@@ -1471,6 +1471,50 @@ fn owned_empty_tab_rollback_preserves_shared_tabs() {
 }
 
 #[test]
+fn control_dispatch_waits_for_startup_workspace_reconciliation() {
+    let tabs = Arc::new(TabRegistry::new_reconciling());
+    let ctx = Arc::new(test_ctx("startup-tabs").with_tab_registry(tabs.clone()));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let dispatch_ctx = ctx.clone();
+    let dispatch_thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx
+            .send(dispatch(&dispatch_ctx, "list_tabs", &json!({})))
+            .unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    tabs.replace(vec![TabRecord {
+        id: "live-workspace".into(),
+        name: "Live Workspace".into(),
+        tile_ids: vec!["live-terminal".into()],
+    }]);
+    tabs.finish_startup();
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("list_tabs did not resume after startup reconciliation")
+        .unwrap();
+    assert_eq!(result["tabs"][0]["tileIds"], json!(["live-terminal"]));
+    dispatch_thread.join().unwrap();
+}
+
+#[test]
+fn history_loading_does_not_wait_for_workspace_reconciliation() {
+    let tabs = Arc::new(TabRegistry::new_reconciling());
+    let ctx = test_ctx("startup-history").with_tab_registry(tabs);
+
+    let result = dispatch(&ctx, "history_list", &json!({"limit": 10}));
+
+    assert!(
+        result.is_ok(),
+        "history list was blocked or failed: {result:?}"
+    );
+}
+
+#[test]
 fn owned_create_state_rollback_removes_worktree_and_new_tab() {
     let (base, repo, worktree) = scratch_repo_with_worktree();
     let ctx = test_ctx("t");
@@ -5980,6 +6024,9 @@ fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
     let path = captains_tmp("startup-workspace-tile-prune");
     let registry = CaptainsRegistry::load(path.clone());
     registry
+        .claim_test("gone-captain", Some("startup-failure-ship"), vec![])
+        .unwrap();
+    registry
         .adopt_unowned_workspace_projection(&[
             TabRecord {
                 id: "work-a".into(),
@@ -5994,13 +6041,23 @@ fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
         ])
         .unwrap();
 
-    let before = serde_json::to_value(registry.snapshot()).unwrap();
     registry.fail_next_persist("startup workspace prune persistence failure");
     let error = registry
         .prune_gone_workspace_tiles(|tile| tile == "live-a")
         .unwrap_err();
     assert!(error.contains("startup workspace prune persistence failure"));
-    assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+    let rolled_back_snapshot = registry.snapshot();
+    let captain = rolled_back_snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.ship_slug == "startup-failure-ship")
+        .unwrap();
+    assert!(captain.terminal_id.is_none());
+    assert!(matches!(captain.state, ClaimState::Orphaned { .. }));
+    assert!(rolled_back_snapshot
+        .workspaces
+        .iter()
+        .all(|workspace| !workspace.tile_ids.contains(&"gone-captain".to_string())));
     let rolled_back_projection = registry.workspace_projection();
     assert_eq!(
         rolled_back_projection

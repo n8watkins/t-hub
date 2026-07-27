@@ -79,7 +79,7 @@ function surfaceLayoutSyncFailure(error: unknown): void {
   notify(
     "error",
     "Workspace sync failed",
-    "Your local layout is still available. Restart T-Hub to retry synchronization.",
+    "Your local layout is still available. T-Hub will retry synchronization automatically.",
   );
 }
 
@@ -140,7 +140,7 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
  * This also lets setTerminals() surface pre-existing sessions while the first
  * control request is still in flight.
  */
-export async function bootstrapWorkspaceTabs(): Promise<void> {
+export async function bootstrapWorkspaceTabs(): Promise<boolean> {
   try {
     const res = (await controlRequest("list_tabs")) as {
       seq?: unknown;
@@ -154,7 +154,7 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
       !Array.isArray(res.tabs) ||
       res.tabs.length === 0
     ) {
-      return;
+      return false;
     }
 
     const serverTabs = res.tabs as TabReport[];
@@ -182,9 +182,14 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
         useWorkspace.getState().addTab();
         repairedLocal = useWorkspace.getState();
       }
-      const { reportWorkspaceTabs } = await import("./client");
+      const { listTerminals, reportWorkspaceTabs } = await import("./client");
+      const liveIds = new Set((await listTerminals()).map((terminal) => terminal.id));
+      const repairedTabs = tabReports(repairedLocal.tabs).map((tab) => ({
+        ...tab,
+        tileIds: tab.tileIds.filter((id) => liveIds.has(id)),
+      }));
       const repaired = await reportWorkspaceTabs(
-        tabReports(repairedLocal.tabs),
+        repairedTabs,
         repairedLocal.activeTabId,
         res.seq,
       );
@@ -192,17 +197,37 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
         surfaceLayoutSyncFailure((repaired as { error: string }).error);
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
-      if (!repaired.error && repaired.stale && Array.isArray(repaired.tabs)) {
-        adoptAuthoritativeTabs(repaired.tabs);
+      if (!repaired.error) {
+        const authoritativeTabs =
+          repaired.stale && Array.isArray(repaired.tabs)
+            ? repaired.tabs
+            : repairedTabs;
+        adoptAuthoritativeTabs(authoritativeTabs);
+        return true;
       }
-      return;
+      return false;
     }
 
-    adoptAuthoritativeTabs(serverTabs);
+    return adoptAuthoritativeTabs(serverTabs);
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
     surfaceLayoutSyncFailure(error);
+    return false;
   }
+}
+
+const WORKSPACE_BOOTSTRAP_RETRY_MAX_MS = 30_000;
+
+export async function bootstrapWorkspaceTabsUntilReady(
+  wait: (milliseconds: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => window.setTimeout(resolve, milliseconds)),
+): Promise<true> {
+  let retryDelay = 1_000;
+  while (!(await bootstrapWorkspaceTabs())) {
+    await wait(retryDelay);
+    retryDelay = Math.min(retryDelay * 2, WORKSPACE_BOOTSTRAP_RETRY_MAX_MS);
+  }
+  return true;
 }
 
 // The last captains-registry revision this window adopted. Guards against a
@@ -524,8 +549,7 @@ export function startControlBridge(): void {
     // `listen` rejects when not running under Tauri — safe to ignore.
   });
 
-  startTabReporter();
-  startCaptainsBootstrap();
+  startCaptainsBootstrap(startTabReporter());
 }
 
 /**
@@ -584,8 +608,15 @@ export async function bootstrapCaptains(): Promise<void> {
   }
 }
 
-function startCaptainsBootstrap(): void {
-  void bootstrapCaptains();
+export async function bootstrapCaptainsAfterWorkspace(
+  workspaceBootstrap: Promise<boolean>,
+): Promise<void> {
+  if (!(await workspaceBootstrap)) return;
+  await bootstrapCaptains();
+}
+
+function startCaptainsBootstrap(workspaceBootstrap: Promise<boolean>): void {
+  void bootstrapCaptainsAfterWorkspace(workspaceBootstrap);
 }
 
 /** Test-only: reset the captains reconciliation singletons between cases (this
@@ -609,7 +640,7 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
  * returned authoritative snapshot is adopted - the rare concurrent local change
  * loses to the server, by design. Failures (e.g. not under Tauri) are swallowed.
  */
-function startTabReporter(): void {
+function startTabReporter(): Promise<boolean> {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
@@ -664,10 +695,12 @@ function startTabReporter(): void {
   });
   // Read the authoritative registry before the first report so a cold webview
   // cannot overwrite server-side workspaces with its boot-time local snapshot.
-  void bootstrapWorkspaceTabs().finally(() => {
+  const workspaceBootstrap = bootstrapWorkspaceTabsUntilReady();
+  void workspaceBootstrap.then(() => {
     bootstrapping = false;
     report();
   });
+  return workspaceBootstrap;
 }
 
 // Run the subscription on import (side-effect module, mirroring themeBootstrap).
