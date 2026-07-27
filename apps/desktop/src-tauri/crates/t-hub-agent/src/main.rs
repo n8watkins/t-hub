@@ -2,11 +2,13 @@
 
 //! `t-hub-agent` — the WSL-side control agent (PLAN.md Workstream A).
 //!
-//! Launched by the T-Hub core as:
+//! Packaged Windows builds deploy and verify this exact helper at
+//! `~/.local/bin/t-hub-agent` in the configured WSL distro, then launch it as:
 //! ```text
-//! wsl.exe -d <distro> -- t-hub-agent --stdio
+//! wsl.exe -d <distro> --cd ~ -e bash -lc \
+//!     "exec $HOME/.local/bin/t-hub-agent --stdio"
 //! ```
-//! or directly on a unix dev box (`t-hub-agent --stdio`). It speaks the
+//! The developer override and unix dev path launch it directly. It speaks the
 //! versioned NDJSON protocol from `t-hub-protocol` over **stdin/stdout**
 //! (stderr is reserved for human-readable diagnostics so it never corrupts the
 //! frame stream).
@@ -17,9 +19,11 @@
 //!   Windows app closing, replayed to the core on connect.
 //! - Serve control RPCs: tmux/session registry ([`registry`]), host metrics +
 //!   git/worktree queries ([`host`]).
-//! - Ingest the Claude hook → journal spine: `--hook <EVENT>` mode reads the
-//!   hook's JSON from stdin, appends a durable journal entry, and exits 0 so
-//!   Claude's turn is never blocked ([`hook`]).
+//! - Ingest provider lifecycle evidence into the journal. `--hook <EVENT>`
+//!   handles Claude hooks, while `--codex-hook <EVENT>` and `--codex-tap`
+//!   handle native interactive hooks and structured headless Codex events.
+//!   Short-lived hook handlers exit 0 so a provider turn is never blocked
+//!   ([`hook`], [`codex`]).
 //! - Ingest Claude's **statusline** JSON: `--statusline` mode reads the
 //!   statusline payload from stdin, appends a durable `StatusSnapshot` journal
 //!   entry, prints a one-line readout to stdout (so it's a valid statusline

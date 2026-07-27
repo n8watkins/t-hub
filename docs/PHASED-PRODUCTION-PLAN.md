@@ -6,8 +6,8 @@
 > [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md).
 > Powder boards, cards, claims, runs, and Crew dispatch below are historical compatibility evidence unless a section explicitly identifies a current agent-session contract.
 
-**Updated:** 2026-07-26.
-**Plan source:** implementation through `2da9915` on `fix/startup-reconciliation`.
+**Updated:** 2026-07-27.
+**Plan source:** implementation through the current validated source.
 **Historical installed build:** At the prior July 20 refresh, T-Hub `0.3.103` from exact detached source `8654986` was running on the canonical profile as Windows PID `39140`.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 

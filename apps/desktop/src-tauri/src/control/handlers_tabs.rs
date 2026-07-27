@@ -305,13 +305,14 @@ pub(super) fn move_tile(
     }
 }
 
-/// `list_tabs`: the live workspace tabs from the CORE tab registry (TASK C / #22),
-/// each `{id, name, tileIds}`. The frontend reports its full tab layout up (the
-/// `report_workspace_tabs` Tauri command) so this reflects UI-created tabs and real
-/// tile membership; MCP-driven `new_tab` / `move_tile` / named placement update it
-/// optimistically so a just-created tab is addressable immediately. This is the
-/// minimal in-memory registry that makes headless tab ops (discover an id, then
-/// `move_tile` / `focus_tab` into it) work — NOT the PRD §8 persistence layer.
+/// `list_tabs`: the live workspace projection from the CORE tab registry,
+/// each `{id, name, tileIds}`. The durable owner is [`CaptainsRegistry`];
+/// startup reconciles its placements against authoritative tmux liveness before
+/// seeding this projection. Frontend and MCP organization changes update the
+/// durable workspace first, then replace the live projection so a just-created
+/// tab is addressable immediately.
+///
+/// [`CaptainsRegistry`]: crate::control::captains_registry::CaptainsRegistry
 pub(super) fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
     ctx.tabs
         .require_authoritative_startup()

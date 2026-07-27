@@ -78,6 +78,9 @@ command -v t-hub-agent      # /home/<you>/.local/bin/t-hub-agent
 
 Now `pnpm tauri dev` will connect.
 The bridge spawns `t-hub-agent --stdio`, handshakes (`Hello`/`Ready`), replays the journal, and goes live.
+Connection lifecycle operations are serialized, and a reconnect fully retires the current helper before starting its replacement.
+The replacement becomes live only after the protocol version matches and any required replay reaches its verified durable boundary.
+Handshake errors, timeouts, malformed frames, incomplete replay, and replacement failure terminate the candidate helper and leave the bridge failed rather than publishing partial state.
 Use the developer override for a one-off without touching `PATH`:
 
 ```sh
