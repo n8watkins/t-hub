@@ -635,7 +635,9 @@ impl WorktreeCoordinator {
     }
 
     pub fn reservation_for(&self, worktree_path: &str) -> Option<RetirementReservation> {
-        let worktree_path = normalize_path(worktree_path);
+        let worktree_path = crate::files::canonical_posix_path_allow_missing(worktree_path)
+            .map(|path| normalize_path(&path))
+            .unwrap_or_else(|_| normalize_path(worktree_path));
         self.lock()
             .retirements
             .values()
@@ -650,7 +652,11 @@ impl WorktreeCoordinator {
         candidate_path: &str,
         operation: &str,
     ) -> Result<WorktreeAdmissionGuard<'_>, String> {
-        let candidate_path = normalize_path(candidate_path);
+        let candidate_path = crate::files::canonical_posix_path_allow_missing(candidate_path)
+            .map(|path| normalize_path(&path))
+            .map_err(|error| {
+                format!("{operation}: could not resolve worktree activity: {error}")
+            })?;
         let mut admissions = self
             .admissions
             .lock()
@@ -799,11 +805,7 @@ fn normalize_path(path: &str) -> String {
             component => lexical.push(component.as_os_str()),
         }
     }
-    let normalized = canonicalize_existing_prefix(&lexical)
-        .unwrap_or(lexical)
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_string();
+    let normalized = lexical.to_string_lossy().trim_end_matches('/').to_string();
     if normalized.is_empty() && replaced.starts_with('/') {
         "/".into()
     } else {
@@ -811,29 +813,16 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::canonicalize(ancestor) {
-            Ok(mut canonical) => {
-                for component in suffix.iter().rev() {
-                    canonical.push(component);
-                }
-                return Some(canonical);
-            }
-            Err(_) => {
-                suffix.push(ancestor.file_name()?.to_owned());
-                ancestor = ancestor.parent()?;
-            }
-        }
-    }
-}
-
 pub(crate) fn path_within(candidate: &str, root: &str) -> bool {
-    let candidate = normalize_path(candidate);
-    let root = normalize_path(root);
-    candidate == root || candidate.starts_with(&format!("{root}/"))
+    let canonical = |path: &str| {
+        crate::files::canonical_posix_path_allow_missing(path).map(|path| normalize_path(&path))
+    };
+    match (canonical(candidate), canonical(root)) {
+        (Ok(candidate), Ok(root)) => {
+            candidate == root || candidate.starts_with(&format!("{root}/"))
+        }
+        _ => true,
+    }
 }
 
 fn matching_active_retirement<'a>(
@@ -1193,6 +1182,28 @@ mod tests {
             alias.join("apps/cli").to_str().unwrap(),
             worktree.to_str().unwrap()
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_resolves_symlinks_before_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let nested = real.join("nested");
+        let worktree = real.join("worktree");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+        let coordinator = WorktreeCoordinator::ephemeral();
+        coordinator
+            .begin_retirement(worktree.to_str().unwrap(), "/requests/one.json")
+            .unwrap();
+
+        let candidate = alias.join("../worktree");
+        assert!(coordinator
+            .admit_activity(candidate.to_str().unwrap(), "spawn_terminal")
+            .is_err());
     }
 
     #[test]
