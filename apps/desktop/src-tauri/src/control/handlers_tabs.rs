@@ -313,6 +313,9 @@ pub(super) fn move_tile(
 /// minimal in-memory registry that makes headless tab ops (discover an id, then
 /// `move_tile` / `focus_tab` into it) work — NOT the PRD §8 persistence layer.
 pub(super) fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
+    ctx.tabs
+        .require_authoritative_startup()
+        .map_err(retryable_error)?;
     let snap = ctx.tabs.snapshot_full();
     Ok(json!({
         "tabs": snap.tabs,

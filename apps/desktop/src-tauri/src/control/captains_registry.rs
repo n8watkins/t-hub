@@ -64,7 +64,7 @@ impl CaptainsRegistry {
             git_initialization: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
-            workspace_projection_exclusions: Mutex::new(std::collections::HashMap::new()),
+            workspace_projection_exclusions: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             historical_scope_capture_hook: Mutex::new(None),
             #[cfg(test)]
@@ -235,7 +235,7 @@ impl CaptainsRegistry {
             git_initialization: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
-            workspace_projection_exclusions: Mutex::new(std::collections::HashMap::new()),
+            workspace_projection_exclusions: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             historical_scope_capture_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1671,19 +1671,17 @@ impl CaptainsRegistry {
             .iter()
             .map(|workspace| {
                 let mut projected = workspace.as_tab_record();
-                projected
-                    .tile_ids
-                    .retain(|tile| !excluded.contains_key(tile));
+                projected.tile_ids.retain(|tile| !excluded.contains(tile));
                 projected
             })
             .collect()
     }
 
-    fn apply_gone_workspace_tiles_at(
+    fn apply_gone_workspace_tiles(
         current: &mut CaptainsInner,
         gone: &std::collections::HashSet<String>,
-        since: u64,
     ) {
+        let now = now_ms();
         for workspace in &mut current.workspaces {
             workspace.tile_ids.retain(|tile| !gone.contains(tile));
         }
@@ -1693,11 +1691,11 @@ impl CaptainsRegistry {
                 .as_ref()
                 .is_some_and(|terminal| gone.contains(terminal))
             {
-                captain.state = ClaimState::Orphaned { since };
+                captain.state = ClaimState::Orphaned { since: now };
                 captain.terminal_id = None;
                 for crew in &mut captain.crew {
                     if matches!(crew.state, CrewState::Active) {
-                        crew.state = CrewState::Orphaned { since };
+                        crew.state = CrewState::Orphaned { since: now };
                     }
                 }
             }
@@ -1710,24 +1708,9 @@ impl CaptainsRegistry {
                     crew.state,
                     CrewState::CleanupPending { .. } | CrewState::Removed { .. }
                 ) {
-                    crew.state = CrewState::Removed { since };
+                    crew.state = CrewState::Removed { since: now };
                 }
             }
-        }
-    }
-
-    fn apply_workspace_projection_exclusions(
-        current: &mut CaptainsInner,
-        exclusions: &std::collections::HashMap<String, u64>,
-    ) {
-        let mut ordered = exclusions.iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)));
-        for (terminal_id, since) in ordered {
-            Self::apply_gone_workspace_tiles_at(
-                current,
-                &std::collections::HashSet::from([terminal_id.clone()]),
-                *since,
-            );
         }
     }
 
@@ -1742,8 +1725,8 @@ impl CaptainsRegistry {
     /// before the workspace projection becomes authoritative for a new app run.
     /// Durable Captain and Crew history is retained, including frozen cleanup
     /// recovery. If persistence is unavailable, an in-memory exclusion keeps the
-    /// initial and all later authoritative reads live-only until a successful
-    /// mutation durably incorporates the same cleanup.
+    /// initial and all later projections live-only until a successful mutation
+    /// durably incorporates the same cleanup.
     pub fn prune_gone_workspace_tiles(
         &self,
         is_live: impl Fn(&str) -> bool,
@@ -1762,12 +1745,11 @@ impl CaptainsRegistry {
             return Ok(Vec::new());
         }
         let gone = gone.into_iter().collect::<std::collections::HashSet<_>>();
-        let since = now_ms();
         self.workspace_projection_exclusions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(gone.iter().cloned().map(|terminal_id| (terminal_id, since)));
-        Self::apply_gone_workspace_tiles_at(&mut current, &gone, since);
+            .extend(gone.iter().cloned());
+        Self::apply_gone_workspace_tiles(&mut current, &gone);
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
         let mut pruned = gone.into_iter().collect::<Vec<_>>();
@@ -2588,7 +2570,7 @@ impl CaptainsRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        Self::apply_workspace_projection_exclusions(&mut candidate, &projection_exclusions);
+        Self::apply_gone_workspace_tiles(&mut candidate, &projection_exclusions);
         candidate.workspaces =
             Self::reconcile_durable_workspaces(&candidate.captains, candidate.workspaces);
         let generation_changes = AuthorityGenerationChanges::between(&previous, &candidate);
@@ -2609,7 +2591,7 @@ impl CaptainsRegistry {
         self.workspace_projection_exclusions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|terminal_id, _| still_placed.contains(terminal_id));
+            .retain(|terminal_id| still_placed.contains(terminal_id));
         Ok(())
     }
 
@@ -2626,29 +2608,14 @@ impl CaptainsRegistry {
 
     /// The full versioned snapshot (`list_captains` + every `sync_captains` forward).
     pub fn snapshot(&self) -> CaptainsSnapshot {
-        let g = self.lock();
-        let mut current = g.clone();
-        let projection_exclusions = self
+        let mut current = self.lock().clone();
+        let excluded = self
             .workspace_projection_exclusions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::apply_workspace_projection_exclusions(&mut current, &projection_exclusions);
-        CaptainsSnapshot {
-            schema_version: CAPTAINS_SCHEMA_VERSION,
-            seq: current.seq,
-            captains: current.captains,
-            cortana: current.cortana,
-            agent_sessions: current.agent_sessions,
-            agent_checkpoints: current.agent_checkpoints,
-            agent_events: current.agent_events,
-            projects: current.projects,
-            workspaces: current.workspaces,
-            pending_fleet_operations: current.pending_fleet_operations,
-            retired_fleet_tile_ids: current.retired_fleet_tile_ids,
-            pending_dispatch_claims: current.pending_dispatch_claims,
-            pending_dispatch_releases: current.pending_dispatch_releases,
-            pending_git_initializations: current.pending_git_initializations,
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Self::apply_gone_workspace_tiles(&mut current, &excluded);
+        Self::snapshot_for_persist(&current)
     }
 
     pub fn cortana_identity(&self) -> crate::cortana_reconcile::CortanaDurableIdentity {
@@ -4961,14 +4928,14 @@ impl CaptainsRegistry {
         if changed {
             g.seq += 1;
             let terminal_id = record.terminal_id.as_deref();
-            let excluded_since = terminal_id.and_then(|terminal_id| {
+            let was_excluded = terminal_id.is_some_and(|terminal_id| {
                 self.workspace_projection_exclusions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(terminal_id)
             });
             if let Err(error) = self.commit_mutation(g, previous) {
-                if let Some(excluded_since) = excluded_since {
+                if was_excluded {
                     self.workspace_projection_exclusions
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4976,7 +4943,6 @@ impl CaptainsRegistry {
                             terminal_id
                                 .expect("excluded terminal is present")
                                 .to_string(),
-                            excluded_since,
                         );
                 }
                 return Err(error);
@@ -5461,17 +5427,17 @@ impl CaptainsRegistry {
             c.crew.push(CrewRef::new(crew_session_id));
         }
         g.seq += 1;
-        let excluded_since = self
+        let was_excluded = self
             .workspace_projection_exclusions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(crew_session_id);
         if let Err(error) = self.commit_mutation(g, previous) {
-            if let Some(excluded_since) = excluded_since {
+            if was_excluded {
                 self.workspace_projection_exclusions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(crew_session_id.to_string(), excluded_since);
+                    .insert(crew_session_id.to_string());
             }
             return Err(error);
         }
@@ -6333,10 +6299,10 @@ pub struct CaptainsRegistry {
     powder_operations_inflight: Mutex<std::collections::HashMap<String, CrewPowderOperationKind>>,
     powder_operation_ready: Condvar,
     /// Terminal IDs proven gone by the definitive startup tmux snapshot but not
-    /// yet removed durably. This authoritative-read overlay survives persistence
+    /// yet removed durably. This projection-only overlay survives persistence
     /// failures and is folded into the next successful registry mutation. When
     /// both locks are needed, `inner` is always acquired before this mutex.
-    workspace_projection_exclusions: Mutex<std::collections::HashMap<String, u64>>,
+    workspace_projection_exclusions: Mutex<std::collections::HashSet<String>>,
     #[cfg(test)]
     #[allow(dead_code)]
     historical_scope_capture_hook: Mutex<Option<HistoricalScopeCaptureHook>>,

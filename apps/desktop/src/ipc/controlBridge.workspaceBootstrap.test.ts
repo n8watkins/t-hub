@@ -1,9 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { controlRequest, invoke, listen } = vi.hoisted(() => ({
+const { controlRequest, invoke } = vi.hoisted(() => ({
   controlRequest: vi.fn(),
   invoke: vi.fn(),
-  listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
 }));
 
 vi.mock("./controlClient", () => ({
@@ -12,12 +11,11 @@ vi.mock("./controlClient", () => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("@tauri-apps/api/event", () => ({ listen }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
+}));
 
-import {
-  bootstrapWorkspaceTabs,
-  bootstrapWorkspaceTabsUntilReady,
-} from "./controlBridge";
+import { bootstrapWorkspaceTabs } from "./controlBridge";
 import {
   CAPTAINS_TAB_ID,
   useWorkspace,
@@ -40,7 +38,12 @@ beforeEach(() => {
   invoke.mockReset();
   invoke.mockImplementation((command: string) => {
     if (command === "list_terminals") {
-      return Promise.resolve([]);
+      return Promise.resolve(
+        useWorkspace
+          .getState()
+          .tabs.flatMap((tab) => tab.order)
+          .map((id) => ({ id })),
+      );
     }
     if (command === "report_workspace_tabs") {
       return Promise.resolve({ seq: 2, stale: false });
@@ -50,73 +53,9 @@ beforeEach(() => {
 });
 
 describe("workspace registry bootstrap", () => {
-  it("does not start the bridge outside a Tauri webview", () => {
-    expect(listen).not.toHaveBeenCalled();
-    expect(controlRequest).not.toHaveBeenCalled();
-  });
-
-  it("repairs a Captain-only snapshot with only live local terminal IDs", async () => {
+  it("repairs a Captain-only server snapshot from the local work layout", async () => {
     seed([
-      {
-        id: "work-1",
-        name: "Workspace 1",
-        order: ["term-live", "term-stale"],
-      },
-      {
-        id: CAPTAINS_TAB_ID,
-        name: "Captain Workspace",
-        order: ["captain-live", "captain-stale"],
-      },
-    ]);
-    controlRequest.mockResolvedValue({
-      seq: 1,
-      activeTabId: CAPTAINS_TAB_ID,
-      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
-    });
-    invoke.mockImplementation((command: string) => {
-      if (command === "list_terminals") {
-        return Promise.resolve([
-          { id: "term-live" },
-          { id: "captain-live" },
-          { id: "unplaced-live" },
-        ]);
-      }
-      if (command === "report_workspace_tabs") {
-        return Promise.resolve({ seq: 2, stale: false });
-      }
-      return Promise.reject(new Error(`unexpected invoke: ${command}`));
-    });
-
-    await expect(bootstrapWorkspaceTabs()).resolves.toBe(true);
-
-    expect(
-      useWorkspace.getState().tabs.map((tab) => ({
-        id: tab.id,
-        tileIds: tab.order,
-      })),
-    ).toEqual([
-      { id: "work-1", tileIds: ["term-live"] },
-      { id: CAPTAINS_TAB_ID, tileIds: ["captain-live"] },
-    ]);
-    expect(useWorkspace.getState().registryAdopted).toBe(true);
-    expect(invoke).toHaveBeenCalledWith(
-      "report_workspace_tabs",
-      expect.objectContaining({
-        baseSeq: 1,
-        tabs: [
-          expect.objectContaining({ id: "work-1", tileIds: ["term-live"] }),
-          expect.objectContaining({
-            id: CAPTAINS_TAB_ID,
-            tileIds: ["captain-live"],
-          }),
-        ],
-      }),
-    );
-  });
-
-  it("does not repair the registry when terminal liveness is unavailable", async () => {
-    seed([
-      { id: "work-1", name: "Workspace 1", order: ["term-stale"] },
+      { id: "work-1", name: "Workspace 1", order: ["term-1"] },
       { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
     ]);
     controlRequest.mockResolvedValue({
@@ -124,40 +63,52 @@ describe("workspace registry bootstrap", () => {
       activeTabId: CAPTAINS_TAB_ID,
       tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
     });
-    invoke.mockRejectedValue(new Error("terminal scan unavailable"));
 
-    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
+    await bootstrapWorkspaceTabs();
 
-    expect(invoke).not.toHaveBeenCalledWith(
+    expect(useWorkspace.getState().tabs.map((tab) => tab.id)).toEqual([
+      "work-1",
+      CAPTAINS_TAB_ID,
+    ]);
+    expect(invoke).toHaveBeenCalledWith(
       "report_workspace_tabs",
-      expect.anything(),
+      expect.objectContaining({ baseSeq: 1 }),
     );
   });
 
-  it("retries an indeterminate bootstrap until the registry is authoritative", async () => {
-    seed([{ id: "work-1", name: "Workspace 1", order: ["term-local"] }]);
-    controlRequest
-      .mockRejectedValueOnce(new Error("control channel unavailable"))
-      .mockResolvedValueOnce({
-        seq: 3,
-        activeTabId: "work-live",
-        tabs: [{ id: "work-live", name: "Live Workspace", tileIds: ["term-live"] }],
-      });
-    const wait = vi.fn().mockResolvedValue(undefined);
-
-    await expect(bootstrapWorkspaceTabsUntilReady(wait)).resolves.toBe(true);
-
-    expect(wait).toHaveBeenCalledWith(1_000);
-    expect(controlRequest).toHaveBeenCalledTimes(2);
-    expect(
-      useWorkspace.getState().tabs.map((tab) => ({
-        id: tab.id,
-        tileIds: tab.order,
-      })),
-    ).toEqual([
-      { id: "work-live", tileIds: ["term-live"] },
-      { id: CAPTAINS_TAB_ID, tileIds: [] },
+  it("filters dead local terminal ids before repairing a Captain-only registry", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-live", "term-dead"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
     ]);
+    controlRequest.mockResolvedValue({
+      seq: 1,
+      activeTabId: CAPTAINS_TAB_ID,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "list_terminals") {
+        return Promise.resolve([{ id: "term-live" }]);
+      }
+      if (command === "report_workspace_tabs") {
+        return Promise.resolve({ seq: 2, stale: false, args });
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${command}`));
+    });
+
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(true);
+
+    expect(invoke).toHaveBeenCalledWith(
+      "report_workspace_tabs",
+      expect.objectContaining({
+        tabs: expect.arrayContaining([
+          expect.objectContaining({ id: "work-1", tileIds: ["term-live"] }),
+        ]),
+      }),
+    );
+    expect(
+      useWorkspace.getState().tabs.find((tab) => tab.id === "work-1")?.order,
+    ).toEqual(["term-live"]);
   });
 
   it("adopts an existing server work layout before reporting", async () => {
@@ -278,24 +229,5 @@ describe("workspace registry bootstrap", () => {
     expect(useWorkspace.getState().tabs).not.toEqual([
       { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
     ]);
-  });
-
-  it("retries when a stale repair response remains Captain-only", async () => {
-    seed([{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] }]);
-    controlRequest.mockResolvedValue({
-      seq: 9,
-      activeTabId: CAPTAINS_TAB_ID,
-      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
-    });
-    invoke.mockResolvedValue({
-      seq: 10,
-      stale: true,
-      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
-    });
-
-    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
-
-    expect(useWorkspace.getState().tabs.some((tab) => tab.id !== CAPTAINS_TAB_ID)).toBe(true);
-    expect(useWorkspace.getState().registryAdopted).toBe(false);
   });
 });

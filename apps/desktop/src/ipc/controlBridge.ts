@@ -70,6 +70,7 @@ let lastSeq = 0;
 // inside set(), so a plain flag is race-free here.
 let adoptingRegistry = false;
 let layoutSyncFailed = false;
+const STARTUP_RECONCILIATION_RETRY_MS = 1_000;
 
 function surfaceLayoutSyncFailure(error: unknown): void {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
@@ -79,7 +80,7 @@ function surfaceLayoutSyncFailure(error: unknown): void {
   notify(
     "error",
     "Workspace sync failed",
-    "Your local layout is still available. T-Hub will retry synchronization automatically.",
+    "Your local layout is still available. Restart T-Hub to retry synchronization.",
   );
 }
 
@@ -183,28 +184,25 @@ export async function bootstrapWorkspaceTabs(): Promise<boolean> {
         repairedLocal = useWorkspace.getState();
       }
       const { listTerminals, reportWorkspaceTabs } = await import("./client");
-      const liveIds = new Set((await listTerminals()).map((terminal) => terminal.id));
-      const repairedTabs = tabReports(repairedLocal.tabs).map((tab) => ({
+      const liveTerminalIds = new Set((await listTerminals()).map((terminal) => terminal.id));
+      const repairTabs = tabReports(repairedLocal.tabs).map((tab) => ({
         ...tab,
-        tileIds: tab.tileIds.filter((id) => liveIds.has(id)),
+        tileIds: tab.tileIds.filter((terminalId) => liveTerminalIds.has(terminalId)),
       }));
       const repaired = await reportWorkspaceTabs(
-        repairedTabs,
+        repairTabs,
         repairedLocal.activeTabId,
         res.seq,
       );
       if (typeof (repaired as { error?: unknown }).error === "string") {
         surfaceLayoutSyncFailure((repaired as { error: string }).error);
+        return false;
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
-      if (!repaired.error) {
-        const authoritativeTabs =
-          repaired.stale && Array.isArray(repaired.tabs)
-            ? repaired.tabs
-            : repairedTabs;
-        return adoptAuthoritativeTabs(authoritativeTabs);
+      if (repaired.stale && Array.isArray(repaired.tabs)) {
+        return adoptAuthoritativeTabs(repaired.tabs);
       }
-      return false;
+      return adoptAuthoritativeTabs(repairTabs);
     }
 
     return adoptAuthoritativeTabs(serverTabs);
@@ -213,20 +211,6 @@ export async function bootstrapWorkspaceTabs(): Promise<boolean> {
     surfaceLayoutSyncFailure(error);
     return false;
   }
-}
-
-const WORKSPACE_BOOTSTRAP_RETRY_MAX_MS = 30_000;
-
-export async function bootstrapWorkspaceTabsUntilReady(
-  wait: (milliseconds: number) => Promise<void> = (milliseconds) =>
-    new Promise((resolve) => window.setTimeout(resolve, milliseconds)),
-): Promise<true> {
-  let retryDelay = 1_000;
-  while (!(await bootstrapWorkspaceTabs())) {
-    await wait(retryDelay);
-    retryDelay = Math.min(retryDelay * 2, WORKSPACE_BOOTSTRAP_RETRY_MAX_MS);
-  }
-  return true;
 }
 
 // The last captains-registry revision this window adopted. Guards against a
@@ -535,8 +519,8 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
  */
 export function startControlBridge(): void {
   if (typeof window === "undefined") return;
-  if (!("__TAURI_INTERNALS__" in window)) return;
   if (isSatelliteWindow()) return;
+  if (!("__TAURI_INTERNALS__" in window)) return;
   void listen<ControlApply>(CONTROL_APPLY_EVENT, (ev) => {
     const payload = ev.payload;
     if (!payload || typeof payload.command !== "string") return;
@@ -549,7 +533,7 @@ export function startControlBridge(): void {
     // `listen` rejects when not running under Tauri — safe to ignore.
   });
 
-  startCaptainsBootstrap(startTabReporter());
+  startTabReporter();
 }
 
 /**
@@ -567,7 +551,7 @@ export function startControlBridge(): void {
  * snapshot. `captainsBootstrapping` is held true for the whole run so mid-loop
  * partial `sync_captains` forwards are suppressed (see {@link adoptCaptainsSync}).
  */
-export async function bootstrapCaptains(): Promise<void> {
+export async function bootstrapCaptains(): Promise<boolean> {
   captainsBootstrapping = true;
   try {
     const res = (await controlRequest("list_captains")) as {
@@ -599,24 +583,25 @@ export async function bootstrapCaptains(): Promise<void> {
     const finalRes = missing.length
       ? ((await controlRequest("list_captains")) as typeof res)
       : res;
-    adoptCaptainsSnapshot(finalRes, { authoritativeStartup: true });
+    return adoptCaptainsSnapshot(finalRes, { authoritativeStartup: true });
   } catch {
     // Not under Tauri or the control channel is down - locally persisted
     // designations stand until a sync_captains forward arrives.
+    return false;
   } finally {
     captainsBootstrapping = false;
   }
 }
 
-export async function bootstrapCaptainsAfterWorkspace(
-  workspaceBootstrap: Promise<boolean>,
-): Promise<void> {
-  if (!(await workspaceBootstrap)) return;
-  await bootstrapCaptains();
-}
-
-function startCaptainsBootstrap(workspaceBootstrap: Promise<boolean>): void {
-  void bootstrapCaptainsAfterWorkspace(workspaceBootstrap);
+function startCaptainsBootstrap(): void {
+  const reconcile = (): void => {
+    void bootstrapCaptains().then((authoritative) => {
+      if (!authoritative) {
+        window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
+      }
+    });
+  };
+  reconcile();
 }
 
 /** Test-only: reset the captains reconciliation singletons between cases (this
@@ -640,7 +625,7 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
  * returned authoritative snapshot is adopted - the rare concurrent local change
  * loses to the server, by design. Failures (e.g. not under Tauri) are swallowed.
  */
-function startTabReporter(): Promise<boolean> {
+function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
@@ -695,12 +680,22 @@ function startTabReporter(): Promise<boolean> {
   });
   // Read the authoritative registry before the first report so a cold webview
   // cannot overwrite server-side workspaces with its boot-time local snapshot.
-  const workspaceBootstrap = bootstrapWorkspaceTabsUntilReady();
-  void workspaceBootstrap.then(() => {
-    bootstrapping = false;
-    report();
-  });
-  return workspaceBootstrap;
+  // An indeterminate WSL/control result is not authority: keep reports gated and
+  // retry until startup reconciliation succeeds. Captain adoption starts only
+  // after that same workspace boundary, so a persisted pin cannot validate
+  // itself against a stale local tab during a race.
+  const reconcile = (): void => {
+    void bootstrapWorkspaceTabs().then((authoritative) => {
+      if (!authoritative) {
+        window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
+        return;
+      }
+      bootstrapping = false;
+      report();
+      startCaptainsBootstrap();
+    });
+  };
+  reconcile();
 }
 
 // Run the subscription on import (side-effect module, mirroring themeBootstrap).

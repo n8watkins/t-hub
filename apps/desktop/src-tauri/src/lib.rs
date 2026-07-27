@@ -143,30 +143,6 @@ fn spawn_agent_connect(state: &AppState) {
         .ok();
 }
 
-const STARTUP_RECONCILIATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-
-fn acquire_startup_live_sessions(
-    mut list_sessions: impl FnMut() -> Result<Vec<String>, tmux::TmuxError>,
-    mut wait: impl FnMut(std::time::Duration),
-) -> Vec<String> {
-    let mut retry_delay = std::time::Duration::from_secs(1);
-    loop {
-        match list_sessions() {
-            Ok(sessions) => return sessions,
-            Err(error) => {
-                eprintln!(
-                    "t-hub-workspaces: startup tmux session list is unavailable; retrying in {}s: {error}",
-                    retry_delay.as_secs()
-                );
-                wait(retry_delay);
-                retry_delay = retry_delay
-                    .saturating_mul(2)
-                    .min(STARTUP_RECONCILIATION_RETRY_MAX);
-            }
-        }
-    }
-}
-
 /// Best-effort, off-the-main-path startup reconcile of Claude hooks. Mirrors
 /// [`spawn_agent_connect`]: a detached `std::thread` so app launch is never
 /// blocked on the WSL hop / settings.json write, and any error is swallowed +
@@ -252,7 +228,7 @@ impl control::ApplySink for AppHandleApplySink {
 /// yet) is rejected and answered with the authoritative snapshot so the UI
 /// converges instead of clobbering the mutation.
 #[tauri::command]
-async fn report_workspace_tabs(
+fn report_workspace_tabs(
     app: tauri::AppHandle,
     tabs: Vec<control::TabRecord>,
     active_tab_id: Option<String>,
@@ -260,62 +236,41 @@ async fn report_workspace_tabs(
     registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
     captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
-) -> Result<serde_json::Value, String> {
-    let registry = registry.inner().clone();
-    let captains = captains.inner().clone();
-    let fanout = fanout.inner().clone();
-    let task_registry = registry.clone();
-    Ok(
-        match tauri::async_runtime::spawn_blocking(move || {
-            task_registry.wait_for_startup();
-            match control::apply_workspace_report(
-                &task_registry,
-                &captains,
-                tabs,
-                active_tab_id,
-                base_seq,
-            ) {
-                Ok((
-                    control::ReportOutcome::Accepted { seq, .. },
-                    captains_changed,
-                    reconciled,
-                )) => {
-                    if captains_changed {
-                        commands::forward_captains_sync(&app, &captains, &fanout);
-                    }
-                    let snapshot = task_registry.snapshot_full();
-                    serde_json::json!({
-                        "seq": seq,
-                        "stale": reconciled,
-                        "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
-                        "tabs": reconciled.then_some(snapshot.tabs),
-                    })
-                }
-                Ok((control::ReportOutcome::Stale(snap), _, _)) => serde_json::json!({
-                    "stale": true,
-                    "seq": snap.seq,
-                    "activeTabId": snap.active_tab_id,
-                    "tabs": snap.tabs,
-                }),
-                Err(error) => serde_json::json!({
-                    "stale": true,
-                    "seq": task_registry.snapshot_full().seq,
-                    "tabs": task_registry.snapshot_full().tabs,
-                    "error": error,
-                }),
+) -> serde_json::Value {
+    if let Err(error) = registry.require_authoritative_startup() {
+        return serde_json::json!({
+            "stale": true,
+            "seq": registry.snapshot_full().seq,
+            "tabs": registry.snapshot_full().tabs,
+            "error": error,
+        });
+    }
+    match control::apply_workspace_report(&registry, &captains, tabs, active_tab_id, base_seq) {
+        Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled)) => {
+            if captains_changed {
+                commands::forward_captains_sync(&app, &captains, &fanout);
             }
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => serde_json::json!({
-                "stale": true,
-                "seq": registry.snapshot_full().seq,
-                "tabs": registry.snapshot_full().tabs,
-                "error": format!("workspace report task failed: {error}"),
-            }),
-        },
-    )
+            let snapshot = registry.snapshot_full();
+            serde_json::json!({
+                "seq": seq,
+                "stale": reconciled,
+                "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
+                "tabs": reconciled.then_some(snapshot.tabs),
+            })
+        }
+        Ok((control::ReportOutcome::Stale(snap), _, _)) => serde_json::json!({
+            "stale": true,
+            "seq": snap.seq,
+            "activeTabId": snap.active_tab_id,
+            "tabs": snap.tabs,
+        }),
+        Err(error) => serde_json::json!({
+            "stale": true,
+            "seq": registry.snapshot_full().seq,
+            "tabs": registry.snapshot_full().tabs,
+            "error": error,
+        }),
+    }
 }
 
 fn start_control_listener(
@@ -796,8 +751,10 @@ pub fn run() {
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
             // Fleet Workspace identity is durable in the same registry as its
             // Captain/Assignment owner. TabRegistry is only the live projection
-            // cache and is seeded before the listener or UI can call list_tabs.
-            let tab_registry = std::sync::Arc::new(control::TabRegistry::new_reconciling());
+            // cache. Keep it unpublished until one background tmux snapshot has
+            // reconciled durable placement, so setup and the UI event loop never
+            // wait on WSL and stale local reports cannot race startup authority.
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new_pending_startup());
             app.manage(tab_registry.clone());
             // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
             // dead session (captain or crew) from the registry - the UI kills tiles
@@ -828,7 +785,68 @@ pub fn run() {
             // site that both owns the store and can supply the tmux predicate; the
             // store stays tmux-free + unit-testable.
             //
-            let identity_prune_generation = identity_store.prune_generation();
+            // Snapshot the identity generation before the background prune.
+            // The compare-and-prune step keeps identities minted or rebound while
+            // this background task is running.
+            {
+                let prune_generation = identity_store.prune_generation();
+                let identity_store = identity_store.clone();
+                let captains_registry = captains_registry.clone();
+                let tab_registry = tab_registry.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let mut retry_delay = std::time::Duration::from_millis(250);
+                    loop {
+                        let sessions = match tmux::list_sessions() {
+                            Ok(sessions) => sessions,
+                            Err(error) => {
+                                eprintln!(
+                                    "t-hub-workspaces: startup reconciliation is waiting for \
+                                     terminal liveness: {error}"
+                                );
+                                std::thread::sleep(retry_delay);
+                                retry_delay = retry_delay
+                                    .saturating_mul(2)
+                                    .min(std::time::Duration::from_secs(5));
+                                continue;
+                            }
+                        };
+                        let live = sessions
+                            .into_iter()
+                            .collect::<std::collections::HashSet<_>>();
+                        match captains_registry.prune_gone_workspace_tiles(|tile| {
+                            live.contains(&tmux::target_for_id(tile))
+                        }) {
+                            Ok(pruned) if !pruned.is_empty() => eprintln!(
+                                "t-hub-workspaces: load-time prune removed {} gone terminal \
+                                 placement{}",
+                                pruned.len(),
+                                if pruned.len() == 1 { "" } else { "s" }
+                            ),
+                            Err(error) => eprintln!(
+                                "t-hub-workspaces: load-time prune persistence failed; the \
+                                 live-only startup exclusion remains active: {error}"
+                            ),
+                            _ => {}
+                        }
+                        tab_registry.replace(captains_registry.workspace_projection());
+                        match identity_store.prune_dead_generation(&prune_generation, |tile| {
+                            live.contains(&tmux::target_for_id(tile))
+                        }) {
+                            Ok(pruned) if pruned > 0 => eprintln!(
+                                "t-hub-identity: load-time prune retired {pruned} dead/unbound \
+                                 identit{} (session gone without a clean close)",
+                                if pruned == 1 { "y" } else { "ies" }
+                            ),
+                            Err(error) => eprintln!(
+                                "t-hub-identity: load-time prune was rolled back after \
+                                 persistence failed: {error}"
+                            ),
+                            _ => {}
+                        }
+                        break;
+                    }
+                });
+            }
             // Comms-plane Phase 2 observability (§2.8): fan out each message's
             // lifecycle transition on `control://inbox` (counts/ids/lengths only,
             // never content) so the Settings health panel + delivery tests can watch
@@ -917,59 +935,17 @@ pub fn run() {
                 &state,
                 app.handle(),
                 preview_service,
-                control_fanout.clone(),
-                tab_registry.clone(),
-                captains_registry.clone(),
-                fleet_watches.clone(),
-                identity_store.clone(),
-                inbox.clone(),
-                authz_store.clone(),
-                delegated_admin_store.clone(),
+                control_fanout,
+                tab_registry,
+                captains_registry,
+                fleet_watches,
+                identity_store,
+                inbox,
+                authz_store,
+                delegated_admin_store,
             ) {
                 control_client::install(app.handle(), &handshake);
             }
-            let reconciliation_tabs = tab_registry.clone();
-            let reconciliation_captains = captains_registry.clone();
-            let reconciliation_identities = identity_store.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let startup_live_sessions =
-                    acquire_startup_live_sessions(tmux::list_sessions, std::thread::sleep);
-                let live = startup_live_sessions
-                    .iter()
-                    .cloned()
-                    .collect::<std::collections::HashSet<_>>();
-                match reconciliation_captains
-                    .prune_gone_workspace_tiles(|tile| live.contains(&tmux::target_for_id(tile)))
-                {
-                    Ok(pruned) if !pruned.is_empty() => eprintln!(
-                        "t-hub-workspaces: load-time prune removed {} gone terminal placement{}",
-                        pruned.len(),
-                        if pruned.len() == 1 { "" } else { "s" }
-                    ),
-                    Err(error) => eprintln!(
-                        "t-hub-workspaces: load-time prune was rolled back after \
-                         persistence failed: {error}"
-                    ),
-                    _ => {}
-                }
-                reconciliation_tabs.replace(reconciliation_captains.workspace_projection());
-                reconciliation_tabs.finish_startup();
-                match reconciliation_identities
-                    .prune_dead_generation(&identity_prune_generation, |tile| {
-                        live.contains(&tmux::target_for_id(tile))
-                    }) {
-                    Ok(pruned) if pruned > 0 => eprintln!(
-                        "t-hub-identity: load-time prune retired {pruned} dead/unbound \
-                         identit{} (session gone without a clean close)",
-                        if pruned == 1 { "y" } else { "ies" }
-                    ),
-                    Err(error) => eprintln!(
-                        "t-hub-identity: load-time prune was rolled back after \
-                         persistence failed: {error}"
-                    ),
-                    _ => {}
-                }
-            });
             // Install the system-tray icon + menu (#17). A tray build failure is
             // logged and does not abort startup; the app remains usable via its
             // window (close-to-tray still works regardless via on_window_event).
@@ -1146,7 +1122,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod control_start_tests {
-    use super::{acquire_startup_live_sessions, explicit_control_token_for_start};
+    use super::explicit_control_token_for_start;
 
     #[test]
     fn pending_legacy_quarantine_refuses_an_unrotatable_explicit_control_token() {
@@ -1159,36 +1135,5 @@ mod control_start_tests {
             Some("fixed-token".into())
         );
         assert_eq!(explicit_control_token_for_start(true, None).unwrap(), None);
-    }
-
-    #[test]
-    fn startup_live_session_acquisition_retries_before_publishing() {
-        let mut attempts = 0;
-        let mut waits = Vec::new();
-        let sessions = acquire_startup_live_sessions(
-            || {
-                attempts += 1;
-                if attempts < 3 {
-                    Err(crate::tmux::TmuxError {
-                        op: "list-sessions",
-                        code: None,
-                        io_kind: None,
-                        message: "WSL unavailable".into(),
-                    })
-                } else {
-                    Ok(vec!["th_live".into()])
-                }
-            },
-            |duration| waits.push(duration),
-        );
-
-        assert_eq!(sessions, vec!["th_live"]);
-        assert_eq!(
-            waits,
-            vec![
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(2),
-            ]
-        );
     }
 }
