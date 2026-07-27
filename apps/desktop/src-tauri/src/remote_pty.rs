@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn output_emit_slots_are_process_wide_and_idle_output_is_immediate() {
+    fn output_emit_slot_calculation_preserves_an_immediate_idle_event() {
         let start = Instant::now();
         let mut next_slot = start;
         assert_eq!(
@@ -1033,6 +1033,66 @@ mod tests {
                 OUTPUT_EMIT_PERIOD,
             ),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn sustained_output_is_process_throttled_and_post_idle_output_is_prompt() {
+        const READER_COUNT: usize = 4;
+        const EVENTS_PER_READER: usize = 4;
+        const EVENT_COUNT: usize = READER_COUNT * EVENTS_PER_READER;
+
+        {
+            let mut next_slot = NEXT_OUTPUT_EMIT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *next_slot = Instant::now();
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(READER_COUNT + 1));
+        let (timestamps_tx, timestamps_rx) = std::sync::mpsc::channel();
+        let readers = (0..READER_COUNT)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let timestamps_tx = timestamps_tx.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..EVENTS_PER_READER {
+                        throttle_output_emit();
+                        timestamps_tx.send(Instant::now()).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(timestamps_tx);
+
+        barrier.wait();
+        let mut timestamps = timestamps_rx.iter().collect::<Vec<_>>();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        timestamps.sort_unstable();
+
+        assert_eq!(timestamps.len(), EVENT_COUNT);
+        let flood_span = timestamps.last().unwrap().duration_since(timestamps[0]);
+        let minimum_span = OUTPUT_EMIT_PERIOD * (EVENT_COUNT as u32 - 2);
+        assert!(
+            flood_span >= minimum_span,
+            "{EVENT_COUNT} events escaped the process-wide throttle in {flood_span:?}"
+        );
+
+        std::thread::sleep(OUTPUT_EMIT_PERIOD * 2);
+        let idle_emit_started = Instant::now();
+        throttle_output_emit();
+        let idle_latency = idle_emit_started.elapsed();
+        assert!(
+            idle_latency < OUTPUT_EMIT_PERIOD,
+            "first post-idle event waited {idle_latency:?}"
+        );
+
+        println!(
+            "terminal output flood: {EVENT_COUNT} events from {READER_COUNT} readers spanned \
+             {flood_span:?}; first post-idle event returned in {idle_latency:?}"
         );
     }
 
