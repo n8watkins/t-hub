@@ -116,6 +116,11 @@ interface WorkspaceRegistrySnapshot {
   activeTabId: string;
 }
 
+interface StartupWorkspaceDelta {
+  baselineTabs: TabReport[];
+  localTabs: TabReport[];
+}
+
 function workspaceRegistrySnapshot(): WorkspaceRegistrySnapshot {
   const { tabs, activeTabId } = useWorkspace.getState();
   return {
@@ -287,6 +292,17 @@ export function rebaseStartupWorkspaceTabs(
     }
   }
   return rebased;
+}
+
+export function rebaseStartupWorkspaceDeltas(
+  authoritativeTabs: TabReport[],
+  deltas: StartupWorkspaceDelta[],
+): TabReport[] {
+  return deltas.reduce(
+    (tabs, delta) =>
+      rebaseStartupWorkspaceTabs(tabs, delta.baselineTabs, delta.localTabs),
+    authoritativeTabs,
+  );
 }
 
 function hasWorkWorkspace(tabs: TabReport[]): boolean {
@@ -803,16 +819,20 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
  * Up-sync USER-originated workspace-tab changes to the core's AUTHORITATIVE tab
  * registry (TASK C / #22, headless-org) whenever the layout or active tab
  * changes. Reports are SERIALIZED (at most one in flight; trailing changes
- * coalesce into one follow-up) and carry `baseSeq`; on a stale rejection the
- * returned authoritative snapshot is adopted - the rare concurrent local change
- * loses to the server, by design. Failures (e.g. not under Tauri) are swallowed.
+ * coalesce into one follow-up) and carry `baseSeq`. Failures (e.g. not under
+ * Tauri) are swallowed.
  */
 function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
   const startupBaseline = workspaceRegistrySnapshot();
-  let startupLocal = startupBaseline;
+  const startupDeltas: StartupWorkspaceDelta[] = [
+    {
+      baselineTabs: startupBaseline.tabs,
+      localTabs: startupBaseline.tabs,
+    },
+  ];
 
   const report = (): void => {
     if (adoptingRegistry) return; // never echo a server-applied snapshot back up
@@ -825,6 +845,7 @@ function startTabReporter(): void {
       return;
     }
     inFlight = true;
+    pending = false;
     const { tabs, activeTabId } = useWorkspace.getState();
     const payload = tabReports(tabs);
     void import("./client")
@@ -837,8 +858,20 @@ function startTabReporter(): void {
         if (res && typeof res.seq === "number") {
           lastSeq = res.seq;
           if (res.stale && Array.isArray(res.tabs)) {
-            // A server mutation raced this report: converge on the registry.
-            adoptAuthoritativeTabs(res.tabs);
+            const rebasedTabs = rebaseStartupWorkspaceDeltas(
+              res.tabs,
+              startupDeltas,
+            );
+            adoptAuthoritativeTabs(rebasedTabs);
+            if (startupDeltas.length > 0) {
+              startupDeltas.push({
+                baselineTabs: rebasedTabs,
+                localTabs: rebasedTabs,
+              });
+              pending = true;
+            }
+          } else if (startupDeltas.length > 0 && !pending) {
+            startupDeltas.length = 0;
           }
         }
       })
@@ -859,8 +892,9 @@ function startTabReporter(): void {
   // mirrors the active tab for default spawn placement + focus proofs).
   useWorkspace.subscribe((state, prev) => {
     if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId) {
-      if (bootstrapping && !adoptingRegistry) {
-        startupLocal = workspaceRegistrySnapshot();
+      if (startupDeltas.length > 0 && !adoptingRegistry) {
+        startupDeltas[startupDeltas.length - 1].localTabs =
+          workspaceRegistrySnapshot().tabs;
       }
       report();
     }
@@ -873,12 +907,17 @@ function startTabReporter(): void {
   // itself against a stale local tab during a race.
   const reconcile = (): void => {
     void bootstrapWorkspaceTabs((tabs) =>
-      rebaseStartupWorkspaceTabs(tabs, startupBaseline.tabs, startupLocal.tabs),
+      rebaseStartupWorkspaceDeltas(tabs, startupDeltas),
     ).then((authoritative) => {
       if (!authoritative) {
         window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
         return;
       }
+      const reconciledTabs = workspaceRegistrySnapshot().tabs;
+      startupDeltas.push({
+        baselineTabs: reconciledTabs,
+        localTabs: reconciledTabs,
+      });
       bootstrapping = false;
       report();
       startCaptainsBootstrap();

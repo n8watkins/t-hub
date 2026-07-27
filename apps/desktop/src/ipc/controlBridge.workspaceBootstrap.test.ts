@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   bootstrapWorkspaceTabs,
+  rebaseStartupWorkspaceDeltas,
   rebaseStartupWorkspaceTabs,
 } from "./controlBridge";
 import {
@@ -304,5 +305,57 @@ describe("workspace registry bootstrap", () => {
     ]);
     expect(state.terminals["term-new"]).toMatchObject({ title: "New terminal" });
     expect(state.activeTabId).toBe(addedTabId);
+  });
+
+  it("retains startup deltas across consecutive stale server snapshots", () => {
+    const initial = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-existing"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain" as const,
+        tileIds: [],
+      },
+    ];
+    const renamed = initial.map((tab) =>
+      tab.id === "work-1" ? { ...tab, name: "Renamed locally" } : tab,
+    );
+    const firstRebased = rebaseStartupWorkspaceDeltas(
+      [
+        { ...initial[0], name: "Renamed remotely", tileIds: ["term-existing"] },
+        initial[1],
+      ],
+      [{ baselineTabs: initial, localTabs: renamed }],
+    );
+    const withSpawn = firstRebased.map((tab) =>
+      tab.id === "work-1"
+        ? { ...tab, tileIds: [...tab.tileIds, "term-new"] }
+        : tab,
+    );
+
+    const secondRebased = rebaseStartupWorkspaceDeltas(
+      [
+        {
+          ...initial[0],
+          name: "Renamed remotely again",
+          tileIds: ["term-existing", "term-remote"],
+        },
+        initial[1],
+      ],
+      [
+        { baselineTabs: initial, localTabs: renamed },
+        { baselineTabs: firstRebased, localTabs: withSpawn },
+      ],
+    );
+
+    expect(secondRebased.find((tab) => tab.id === "work-1")).toMatchObject({
+      name: "Renamed locally",
+      tileIds: ["term-existing", "term-new", "term-remote"],
+    });
   });
 });
