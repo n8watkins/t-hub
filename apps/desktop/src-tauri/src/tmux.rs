@@ -318,7 +318,7 @@ fn managed_helper_failure(
         code,
         io_kind: matches!(
             code,
-            Some(77 | 80 | 82 | 83 | 84 | 90 | 92 | 94 | 100 | 101 | 118)
+            Some(77 | 80 | 83 | 84 | 90 | 92 | 94 | 100 | 101 | 118)
         )
             .then_some(std::io::ErrorKind::WouldBlock),
         message: message.into(),
@@ -1371,6 +1371,11 @@ sys.argv = [sys.argv[0], *sys.argv[2:]]
 def proc_stat(pid):
     try:
         raw = open(f"/proc/{pid}/stat", "r", encoding="ascii").read()
+    except (FileNotFoundError, ProcessLookupError):
+        refuse(74)
+    except (PermissionError, OSError):
+        refuse(41)
+    try:
         fields = raw.rsplit(") ", 1)[1].split()
         if len(fields) < 20:
             refuse(40)
@@ -1378,8 +1383,8 @@ def proc_stat(pid):
             "pid": int(pid), "ppid": int(fields[1]), "pgrp": int(fields[2]),
             "sid": int(fields[3]), "tpgid": int(fields[5]), "start": int(fields[19]),
         }
-    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
-        refuse(41)
+    except (ValueError, IndexError):
+        refuse(40)
 
 def prefixed(value, prefix):
     if not value.startswith(prefix):
@@ -3637,7 +3642,7 @@ while True:
 
     #[test]
     fn cortana_retryable_managed_evidence_classifies_only_inconclusive_helpers() {
-        for code in [77, 80, 82, 83, 84, 90, 92, 94, 100, 101, 118] {
+        for code in [77, 80, 83, 84, 90, 92, 94, 100, 101, 118] {
             for op in [
                 "managed-runtime-preflight",
                 "observe-managed-runtime-owner",
@@ -3649,7 +3654,7 @@ while True:
             }
         }
 
-        for code in [76, 78, 79, 81, 89, 91, 93, 120, 130] {
+        for code in [76, 78, 79, 81, 82, 89, 91, 93, 120, 130] {
             for op in [
                 "managed-runtime-preflight",
                 "observe-managed-runtime-owner",
@@ -3673,7 +3678,7 @@ while True:
             assert!(error.is_retryable_observation(), "helper exit {code}");
         }
 
-        for code in [40, 42, 44, 45, 46, 47] {
+        for code in [40, 42, 44, 45, 46, 47, 74] {
             let error = exact_effect_observation_failure(
                 "observe-session-effect",
                 Some(code),
