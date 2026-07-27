@@ -77,7 +77,7 @@ function buildOnWindows() {
   const tauriWsl = wslPath(tauriDir);
   const targetWsl = wslPath(targetDir);
   const buildScript =
-    'set -eu; unset RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER; cd "$1"; CARGO_TARGET_DIR="$2" cargo build --locked --release -p t-hub-agent';
+    'set -eu; unset CARGO_HOME RUSTUP_HOME RUSTC RUSTDOC RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER; cd "$1"; CARGO_TARGET_DIR="$2" cargo build --locked --release -p t-hub-agent';
   run("wsl.exe", [
     "-e",
     "bash",
