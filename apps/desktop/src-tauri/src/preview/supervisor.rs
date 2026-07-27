@@ -1050,6 +1050,25 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    fn read_nonempty_until(path: &Path, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) if !contents.is_empty() => return contents,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read test process result: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test process did not publish a result at {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn handshake_requires_generation_and_group_leader_identity() {
         let generation = "a".repeat(32);
@@ -1282,20 +1301,7 @@ time.sleep(30)"#;
         let mut supervised = prepared
             .spawn_authenticated(Duration::from_secs(3))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let outcome = loop {
-            match std::fs::read_to_string(&result) {
-                Ok(outcome) if !outcome.is_empty() => break outcome,
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("read lifeline probe result: {error}"),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "lifeline probe did not publish a result"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let outcome = read_nonempty_until(&result, Duration::from_secs(2));
         assert_eq!(outcome, "denied");
         let stopped = Instant::now();
         supervised.stdin.take();
@@ -1345,11 +1351,10 @@ time.sleep(30)"#;
         let mut supervised = prepared
             .spawn_authenticated(Duration::from_secs(3))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !result.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(std::fs::read_to_string(result).unwrap(), "protected 1");
+        assert_eq!(
+            read_nonempty_until(&result, Duration::from_secs(2)),
+            "protected 1"
+        );
         supervised.stdin.take();
         assert!(supervised.child.wait().unwrap().success());
         assert_exclusive_lock_available(&lock_path);
@@ -1392,12 +1397,7 @@ while True:
         let mut supervised = prepared
             .spawn_authenticated(Duration::from_secs(3))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !ready.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let pids = std::fs::read_to_string(&ready)
-            .unwrap()
+        let pids = read_nonempty_until(&ready, Duration::from_secs(3))
             .split_whitespace()
             .map(|value| value.parse::<u32>().unwrap())
             .collect::<Vec<_>>();
