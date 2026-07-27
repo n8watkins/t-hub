@@ -169,11 +169,34 @@ pub async fn claude_hooks_managed() -> Result<Vec<String>, String> {
 
 // --- Codex native lifecycle hook installer ---
 
+fn ensure_packaged_codex_helper(state: &AppState) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        state
+            .agent
+            .deploy_packaged_agent(&crate::default_distro())
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "bundled WSL helper deployment failed; refusing Codex hook operation with an \
+                     unverified helper: {error}"
+                )
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub async fn install_codex_hooks(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
+    ensure_packaged_codex_helper(&state)?;
     let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
         .map_err(|error| error.to_string())?;
     crate::codex::hooks_install::install_runtime(&paths, consent).map_err(|error| error.to_string())
@@ -181,9 +204,11 @@ pub async fn install_codex_hooks(
 
 #[tauri::command]
 pub async fn repair_codex_hooks(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
+    ensure_packaged_codex_helper(&state)?;
     let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
         .map_err(|error| error.to_string())?;
     crate::codex::hooks_install::repair_runtime(&paths, consent).map_err(|error| error.to_string())
@@ -200,9 +225,11 @@ pub async fn uninstall_codex_hooks(
 
 #[tauri::command]
 pub async fn codex_hooks_health(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     project_root: Option<String>,
 ) -> Result<crate::codex::hooks_install::ProducerHealth, String> {
+    ensure_packaged_codex_helper(&state)?;
     let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
         .map_err(|error| error.to_string())?;
     let project_root = project_root

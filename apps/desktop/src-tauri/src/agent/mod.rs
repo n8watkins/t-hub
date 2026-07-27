@@ -327,6 +327,17 @@ impl AgentBridge {
         *self.inner.bundled_agent.lock() = path;
     }
 
+    #[cfg(windows)]
+    pub(crate) fn deploy_packaged_agent(&self, distro: &str) -> Result<DeployOutcome, String> {
+        let resource = self
+            .inner
+            .bundled_agent
+            .lock()
+            .clone()
+            .ok_or_else(|| "bundled WSL helper resource path is unavailable".to_string())?;
+        deploy_bundled_agent(distro, &resource).map_err(|error| format!("{error:#}"))
+    }
+
     /// Current connection state (for the UI health area / diagnostics).
     pub fn state(&self) -> ConnectionState {
         *self.inner.state.lock()
@@ -447,28 +458,18 @@ impl AgentBridge {
 
         #[cfg(windows)]
         if !std::env::var_os("T_HUB_AGENT_BIN").is_some_and(|value| !value.is_empty()) {
-            let resource = self.inner.bundled_agent.lock().clone().ok_or_else(|| {
-                self.set_state(ConnectionState::Failed);
-                "bundled WSL helper resource path is unavailable".to_string()
-            })?;
-            match deploy_bundled_agent(distro, &resource) {
+            match self.deploy_packaged_agent(distro) {
                 Ok(DeployOutcome::AlreadyCurrent) => {
-                    eprintln!(
-                        "t-hub: bundled WSL helper verified ({})",
-                        resource.display()
-                    );
+                    eprintln!("t-hub: bundled WSL helper verified");
                 }
                 Ok(DeployOutcome::Installed) => {
-                    eprintln!(
-                        "t-hub: installed and verified bundled WSL helper ({})",
-                        resource.display()
-                    );
+                    eprintln!("t-hub: installed and verified bundled WSL helper");
                 }
                 Err(error) => {
                     self.set_state(ConnectionState::Failed);
                     return Err(format!(
                         "bundled WSL helper deployment failed; refusing to connect with an \
-                         unverified helper: {error:#}"
+                         unverified helper: {error}"
                     ));
                 }
             }
