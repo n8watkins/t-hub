@@ -6,8 +6,8 @@
 //!   - performs the [`Hello`]/[`Ready`] handshake;
 //!   - correlates [`AgentRequest`]s with [`AgentResponse`]s by [`RequestId`];
 //!   - consumes streamed/replayed [`EventJournalEntry`]s, advances the journal
-//!     cursor, feeds [`crate::supervision::Supervisor`], and fans entries out to
-//!     the UI via the [`crate::events`] journal/agent channels;
+//!     cursor, feeds [`crate::supervision::Supervisor`], publishes live entries,
+//!     and coalesces cold replay into bounded state snapshots;
 //!   - exposes WSL metrics / git / registry RPCs to the rest of the core.
 //!
 //! This file defines the public bridge contract and owns the serialized
@@ -1014,18 +1014,22 @@ impl AgentBridge {
         map_terminal_snapshot_response(response)
     }
 
-    /// Consume one journal entry: advance the cursor, feed supervision, emit the
-    /// live UI events, and return the affected session id.
+    /// Consume one journal entry: advance the cursor, feed supervision, publish
+    /// live UI events or accumulate replay state, and return the affected session
+    /// id.
     ///
     /// This is the core's single ingestion point for the spine. It is where the
-    /// previously-missing **live emit** happens — when an entry is consumed it
-    /// now fans out:
+    /// previously-missing **live emit** happens. A live entry fans out:
     ///   - `agent://journal` (the entry, forwarded verbatim);
     ///   - `agent://state` (if the cursor advanced — the health area shows it);
     ///   - `supervision://tree` + `session://status` (for the affected session,
     ///     after the supervision reducer has updated);
     ///   - `status://snapshot` (when the entry is a `StatusSnapshot`, routed
     ///     through the status bridge if one is wired).
+    ///
+    /// Replayed entries reconstruct authority without forwarding historical
+    /// `agent://journal` events. [`AgentBridge::flush_replay`] publishes one
+    /// bounded final state snapshot per affected session after replay commits.
     ///
     /// All emission is best-effort and a no-op before [`AgentBridge::set_emitter`]
     /// (so the unit tests that call this directly still pass). Returns the

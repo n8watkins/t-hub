@@ -72,6 +72,7 @@ pnpm-workspace.yaml            Workspace manifest (lists apps/desktop)
 ### Windows 11 (primary target)
 1. Install the Rust **MSVC** toolchain, the [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-studio-build-tools/), and the WebView2 runtime (preinstalled on Win11).
 2. Ensure your WSL distro has `tmux` (the app reaches in via `wsl.exe`).
+   Building an installer also requires a Rust toolchain in WSL so the matching bundled Linux helper can be compiled, or an externally built helper supplied through `T_HUB_AGENT_RESOURCE_SOURCE`.
 3. `pnpm install` then `pnpm tauri dev` (or `pnpm tauri build` for an installer).
 
 ### Inside WSL2 via WSLg (Linux dev build)

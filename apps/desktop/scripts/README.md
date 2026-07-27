@@ -1,13 +1,14 @@
 # T-Hub desktop helper scripts
 
-Operator/host-side shell helpers for the T-Hub desktop app.
-These are thin clients of the running app; they are not built or bundled.
+Development and operator helpers for the T-Hub desktop app.
+The operator scripts are thin clients of the running app, while release packaging invokes the resource-preparation script.
 
 | Script | Purpose |
 | --- | --- |
 | `announce.sh` | Captain voice announcements (TTS) with the canonical Scribe dictation gate. |
-| `mcp_proof.sh` | End-to-end proof harness for the local MCP server. |
 | `bump-version.sh` | Release version bump helper. |
+| `mcp_proof.sh` | End-to-end proof harness for the local MCP server. |
+| `prepare-agent-resource.mjs` | Builds or validates the Linux `t-hub-agent` resource before release packaging. |
 
 ## announce.sh
 

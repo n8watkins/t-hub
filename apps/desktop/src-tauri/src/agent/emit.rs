@@ -29,8 +29,9 @@ use serde::Serialize;
 // Channel names (single source of truth, mirrored in src/ipc/types.ts Events05)
 // ---------------------------------------------------------------------------
 
-/// `agent://journal` — a durable journal entry the core consumed (streamed or
-/// replayed). Payload: [`JournalEventPayload`].
+/// `agent://journal` - a newly committed live journal entry.
+/// Cold replay is coalesced into bounded state snapshots instead.
+/// Payload: [`JournalEventPayload`].
 pub const EVT_JOURNAL: &str = "agent://journal";
 /// `supervision://tree` — a supervision tree snapshot changed for a session.
 /// Payload: [`crate::model::SupervisionTree`].
