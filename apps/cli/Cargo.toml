@@ -21,3 +21,25 @@ serde_json = "1"
 # cleanly (Rust otherwise ignores SIGPIPE and `println!` panics on EPIPE).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = "none"
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test.package."*"]
+debug = "none"
+
+[profile.full-debug]
+inherits = "dev"
+debug = "full"
+incremental = false
+
+[profile.full-debug.package."*"]
+debug = "full"
