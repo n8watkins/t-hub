@@ -70,12 +70,18 @@ pub(crate) struct ReaderJournalFlow {
 
 enum ReaderJournalState {
     Buffering(Vec<BufferedJournal>),
-    Replaying { live_entries: Vec<BufferedJournal> },
+    Replaying {
+        live_entries: Vec<BufferedJournal>,
+        verified_seq: u64,
+        boundary_received: bool,
+        protocol_error: Option<String>,
+    },
     Live,
     Cancelled,
 }
 
 struct BufferedJournal {
+    seq: u64,
     entry: EventJournalEntry,
     replayed: bool,
 }
@@ -87,15 +93,20 @@ impl ReaderJournalFlow {
         })
     }
 
-    pub(crate) fn begin_replay(&self, bridge: &AgentBridge) {
+    pub(crate) fn begin_replay(&self, bridge: &AgentBridge, after_seq: u64) {
         let mut state = self.state.lock();
         if let ReaderJournalState::Buffering(entries) = &mut *state {
             let entries = std::mem::take(entries);
             let (replayed, live_entries): (Vec<_>, Vec<_>) =
                 entries.into_iter().partition(|entry| entry.replayed);
-            *state = ReaderJournalState::Replaying { live_entries };
+            *state = ReaderJournalState::Replaying {
+                live_entries,
+                verified_seq: after_seq,
+                boundary_received: false,
+                protocol_error: None,
+            };
             for buffered in sorted_entries(replayed) {
-                bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
+                Self::ingest_replayed(&mut state, bridge, buffered.seq, buffered.entry);
             }
         }
     }
@@ -117,7 +128,7 @@ impl ReaderJournalFlow {
 
     pub(crate) fn complete_replay(&self, bridge: &AgentBridge) {
         let mut state = self.state.lock();
-        let ReaderJournalState::Replaying { live_entries } =
+        let ReaderJournalState::Replaying { live_entries, .. } =
             std::mem::replace(&mut *state, ReaderJournalState::Live)
         else {
             return;
@@ -141,24 +152,123 @@ impl ReaderJournalFlow {
         }
     }
 
-    pub(crate) fn ingest(&self, bridge: &AgentBridge, entry: EventJournalEntry, replayed: bool) {
+    pub(crate) fn ingest(
+        &self,
+        bridge: &AgentBridge,
+        seq: u64,
+        entry: EventJournalEntry,
+        replayed: bool,
+    ) {
         let mut state = self.state.lock();
         match &mut *state {
             ReaderJournalState::Buffering(entries) => {
-                entries.push(BufferedJournal { entry, replayed });
+                entries.push(BufferedJournal {
+                    seq,
+                    entry,
+                    replayed,
+                });
             }
-            ReaderJournalState::Replaying { live_entries } => {
-                if replayed {
-                    bridge.consume_journal_entry_with_provenance(&entry, true);
-                } else {
-                    live_entries.push(BufferedJournal { entry, replayed });
-                }
+            ReaderJournalState::Replaying { .. } if replayed => {
+                Self::ingest_replayed(&mut state, bridge, seq, entry);
+            }
+            ReaderJournalState::Replaying { live_entries, .. } => {
+                live_entries.push(BufferedJournal {
+                    seq,
+                    entry,
+                    replayed,
+                });
             }
             ReaderJournalState::Live => {
                 bridge.consume_journal_entry_with_provenance(&entry, false);
             }
             ReaderJournalState::Cancelled => {}
         }
+    }
+
+    fn ingest_replayed(
+        state: &mut ReaderJournalState,
+        bridge: &AgentBridge,
+        seq: u64,
+        entry: EventJournalEntry,
+    ) {
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            protocol_error,
+            ..
+        } = state
+        else {
+            return;
+        };
+        if protocol_error.is_some() {
+            return;
+        }
+        if *boundary_received {
+            *protocol_error = Some("journal entry received after replay boundary".to_string());
+        } else if seq != entry.seq {
+            *protocol_error = Some(format!(
+                "journal frame sequence {seq} does not match entry sequence {}",
+                entry.seq
+            ));
+        } else if seq <= *verified_seq {
+            *protocol_error = Some(format!(
+                "journal replay sequence {seq} did not advance past {verified_seq}"
+            ));
+        } else {
+            *verified_seq = seq;
+            bridge.consume_journal_entry_with_provenance(&entry, true);
+        }
+    }
+
+    pub(crate) fn observe_replay_boundary(&self, last_seq: u64) {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            protocol_error,
+            ..
+        } = &mut *state
+        else {
+            return;
+        };
+        if protocol_error.is_some() {
+            return;
+        }
+        if *boundary_received {
+            *protocol_error = Some("duplicate replay boundary".to_string());
+        } else if last_seq < *verified_seq {
+            *protocol_error = Some(format!(
+                "replay boundary {last_seq} is below consumed sequence {verified_seq}"
+            ));
+        } else {
+            *verified_seq = last_seq;
+            *boundary_received = true;
+        }
+    }
+
+    pub(crate) fn finish_replay(&self, last_seq: u64) -> Result<u64, String> {
+        let state = self.state.lock();
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            protocol_error,
+            ..
+        } = &*state
+        else {
+            return Err("replay completed outside an active replay".to_string());
+        };
+        if let Some(error) = protocol_error {
+            return Err(error.clone());
+        }
+        if !boundary_received {
+            return Err("replay completed without a durable boundary".to_string());
+        }
+        if last_seq != *verified_seq {
+            return Err(format!(
+                "replay completion sequence {last_seq} does not match verified boundary {verified_seq}"
+            ));
+        }
+        Ok(*verified_seq)
     }
 }
 
@@ -323,7 +433,7 @@ pub(crate) fn spawn_reader(
     // Sent once when Ready arrives.
     ready_tx: Sender<Ready>,
     // Sent once when ReplayComplete arrives.
-    replay_done_tx: Sender<u64>,
+    replay_done_tx: Sender<Result<u64, String>>,
 ) {
     std::thread::Builder::new()
         .name("agent-reader".into())
@@ -380,13 +490,16 @@ pub(crate) fn spawn_reader(
                         entry,
                         replayed,
                     } => {
-                        journal_flow.ingest(&bridge, entry, replayed);
-                        let _ = seq; // cursor advancement is done inside consume_journal_entry
+                        journal_flow.ingest(&bridge, seq, entry, replayed);
+                    }
+
+                    AgentToCore::ReplayBoundary { last_seq } => {
+                        journal_flow.observe_replay_boundary(last_seq);
                     }
 
                     AgentToCore::ReplayComplete { last_seq } => {
                         eprintln!("agent-bridge: replay complete (last_seq={last_seq})");
-                        let _ = replay_done_tx.send(last_seq);
+                        let _ = replay_done_tx.send(journal_flow.finish_replay(last_seq));
                     }
 
                     AgentToCore::Pong { nonce: _ } => {

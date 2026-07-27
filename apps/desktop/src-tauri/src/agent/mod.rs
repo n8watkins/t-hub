@@ -486,7 +486,7 @@ impl AgentBridge {
 
         // One-shot channels for the handshake/replay synchronisation.
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (replay_done_tx, replay_done_rx) = mpsc::channel::<u64>();
+        let (replay_done_tx, replay_done_rx) = mpsc::channel::<Result<u64, String>>();
         let journal_flow = ReaderJournalFlow::new();
 
         // Spawn the reader thread.  It captures a clone of `self` (AgentBridge
@@ -554,7 +554,7 @@ impl AgentBridge {
         let cursor = self.journal_cursor();
         let replayed = journal_head_seq > cursor;
         if replayed {
-            journal_flow.begin_replay(self);
+            journal_flow.begin_replay(self, cursor);
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
@@ -574,7 +574,14 @@ impl AgentBridge {
             }
 
             let last_seq = match replay_done_rx.recv_timeout(replay_timeout) {
-                Ok(last_seq) => last_seq,
+                Ok(Ok(last_seq)) => last_seq,
+                Ok(Err(error)) => {
+                    return Err(self.fail_connection(
+                        &handles,
+                        &journal_flow,
+                        format!("incomplete journal replay: {error}"),
+                    ));
+                }
                 Err(_) => {
                     return Err(self.fail_connection(
                         &handles,
@@ -593,6 +600,7 @@ impl AgentBridge {
                     ),
                 ));
             }
+            self.advance_cursor(last_seq);
             journal_flow.complete_replay(self);
         } else {
             journal_flow.complete_without_replay(self);
@@ -1581,7 +1589,7 @@ printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
 IFS= read -r _
 printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":10}}'
 IFS= read -r _
-printf '%s\n' '{{"channel":"control","type":"replay_complete","last_seq":0}}'
+printf '%s\n' '{{"channel":"control","type":"replay_complete","last_seq":10}}'
 while IFS= read -r _; do :; done
 "#
             ),
@@ -1620,6 +1628,57 @@ while IFS= read -r _; do :; done
             !std::path::Path::new("/proc").join(pid.trim()).exists(),
             "incomplete replay helper process {pid} survived the failed handshake"
         );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compacted_replay_boundary_advances_cursor_without_event() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-compacted-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("compacted-replay-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":10}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"replay_boundary","last_seq":10}}'
+printf '%s\n' '{{"channel":"events","type":"replay_complete","last_seq":10}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap();
+        assert_eq!(bridge.state(), ConnectionState::Live);
+        assert_eq!(bridge.journal_cursor(), 10);
+        bridge.disconnect();
+        drop(agent_bin_env);
+        drop(env_lock);
+
         std::fs::remove_dir_all(temp_dir).ok();
     }
 
@@ -2215,10 +2274,11 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge);
+        journal_flow.begin_replay(&bridge, 0);
 
         journal_flow.ingest(
             &bridge,
+            3,
             EventJournalEntry {
                 seq: 3,
                 timestamp_ms: 3,
@@ -2236,6 +2296,7 @@ while IFS= read -r _; do :; done
         );
         journal_flow.ingest(
             &bridge,
+            1,
             EventJournalEntry {
                 seq: 1,
                 timestamp_ms: 1,
@@ -2276,10 +2337,11 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge);
+        journal_flow.begin_replay(&bridge, 0);
 
         journal_flow.ingest(
             &bridge,
+            1,
             EventJournalEntry {
                 seq: 1,
                 timestamp_ms: 1,
@@ -2300,6 +2362,7 @@ while IFS= read -r _; do :; done
 
         journal_flow.ingest(
             &bridge,
+            2,
             EventJournalEntry {
                 seq: 2,
                 timestamp_ms: 2,
@@ -2337,11 +2400,12 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge);
+        journal_flow.begin_replay(&bridge, 0);
         bridge.set_state(ConnectionState::Replaying);
 
         journal_flow.ingest(
             &bridge,
+            1,
             EventJournalEntry {
                 seq: 1,
                 timestamp_ms: 1,
@@ -2374,7 +2438,7 @@ while IFS= read -r _; do :; done
     fn completed_replay_wins_a_simultaneous_timeout_check() {
         let bridge = AgentBridge::new();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge);
+        journal_flow.begin_replay(&bridge, 0);
 
         journal_flow.complete_replay(&bridge);
 

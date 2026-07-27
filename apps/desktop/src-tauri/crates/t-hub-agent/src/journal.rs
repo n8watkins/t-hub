@@ -126,6 +126,11 @@ pub enum AppendOutcome {
     Duplicate(EventJournalEntry),
 }
 
+pub struct JournalReplay {
+    pub entries: Vec<EventJournalEntry>,
+    pub last_seq: u64,
+}
+
 impl AppendOutcome {
     pub fn is_appended(&self) -> bool {
         matches!(self, Self::Appended(_))
@@ -679,9 +684,16 @@ impl Journal {
     }
 
     /// Read back all entries with `seq > after_seq`, in order, for replay to the
-    /// core. `after_seq == 0` replays the whole journal. Torn/garbage lines are
-    /// skipped (same tolerance as recovery).
+    /// core. `after_seq == 0` replays the whole journal. A torn final line is
+    /// ignored, but a malformed complete record fails replay closed.
+    #[cfg(test)]
     pub fn replay(&self, after_seq: u64) -> Result<Vec<EventJournalEntry>> {
+        Ok(self.replay_with_boundary(after_seq)?.entries)
+    }
+
+    /// Read a replay batch together with the durable cursor represented by the
+    /// scanned file, including a compaction watermark that is not an event.
+    pub fn replay_with_boundary(&self, after_seq: u64) -> Result<JournalReplay> {
         // Take the lock to get a consistent view, then read from the start of the
         // file via a fresh handle so we don't disturb the append cursor.
         let _guard = self.inner.lock().expect("journal mutex poisoned");
@@ -692,7 +704,10 @@ impl Journal {
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
-                return Ok(Vec::new());
+                return Ok(JournalReplay {
+                    entries: Vec::new(),
+                    last_seq: after_seq,
+                });
             }
             Err(e) => return Err(e).context("opening journal for replay"),
         };
@@ -708,8 +723,10 @@ impl Journal {
 
         let mut out = Vec::new();
         let mut seq: u64 = 0;
+        let mut last_seq = after_seq;
         let mut scanned = 0_u64;
         loop {
+            let record_offset = scanned;
             let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
                 break;
             };
@@ -722,19 +739,25 @@ impl Journal {
             match serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 Ok(mut entry) => {
                     seq = entry.seq.max(seq.saturating_add(1));
+                    last_seq = last_seq.max(seq);
                     if seq > after_seq && !Self::is_compaction_watermark(&entry) {
                         entry.seq = seq;
                         out.push(entry);
                     }
                 }
-                Err(_) => {
-                    // A complete unknown/future record does not consume an
-                    // event sequence and must not hide later valid entries.
-                    continue;
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "decoding complete journal record at byte offset {record_offset} during replay"
+                        )
+                    });
                 }
             }
         }
-        Ok(out)
+        Ok(JournalReplay {
+            entries: out,
+            last_seq,
+        })
     }
 
     /// The current on-disk size of the journal file in bytes (0 if absent).
@@ -1719,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_drops_status_keeps_durable_entries() {
+    fn compacted_replay_drops_status_keeps_durable_entries() {
         let status = |entity: &str| EventJournalEntry {
             seq: 0,
             timestamp_ms: 1,
@@ -1749,6 +1772,12 @@ mod tests {
             j.head_seq(),
             4,
             "compaction preserves the high-water sequence of dropped records"
+        );
+        let replay = j.replay_with_boundary(0).unwrap();
+        assert_eq!(replay.entries.len(), 2);
+        assert_eq!(
+            replay.last_seq, 4,
+            "replay exposes the compacted durable cursor boundary"
         );
 
         let compacted_bytes = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
@@ -1806,9 +1835,38 @@ mod tests {
             .append(entry(JournalEventType::SessionEnd, "second"))
             .unwrap();
         assert_eq!(appended.seq, 2);
-        let replayed = journal.replay(0).unwrap();
-        assert_eq!(replayed.len(), 2);
-        assert_eq!(replayed[1].seq, appended.seq);
+        let error = journal
+            .replay_with_boundary(0)
+            .err()
+            .expect("replay must fail closed on preserved unknown bytes");
+        assert!(
+            format!("{error:#}").contains("decoding complete journal record"),
+            "unexpected replay error: {error:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_fails_closed_on_a_malformed_complete_record() {
+        let dir = temp_dir("malformed-replay-record");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = entry(JournalEventType::SessionStart, "first");
+        first.seq = 1;
+        let mut third = entry(JournalEventType::SessionEnd, "third");
+        third.seq = 3;
+        let journal_bytes = format!(
+            "{}\n{{\"seq\":2,\"event_type\":\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&third).unwrap()
+        );
+        std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
+
+        let replay = Journal::open(&dir).unwrap().replay_with_boundary(0);
+        assert!(
+            replay.is_err(),
+            "replay must not attest a boundary after silently dropping a malformed record"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
