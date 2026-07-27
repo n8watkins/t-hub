@@ -47,7 +47,7 @@ use t_hub_protocol::{
 };
 
 use crate::supervision::Supervisor;
-use connection::{spawn_child, spawn_reader, write_frame, TransportHandles};
+use connection::{spawn_child, spawn_reader, write_frame, ReaderJournalFlow, TransportHandles};
 use emit::{
     JournalEventPayload, JournalVoiceAnnouncement, JournalVoiceAnnouncementKind,
     SessionStatusPayload, SessionTitlePayload, EVT_AGENT_STATE, EVT_JOURNAL, EVT_SESSION_STATUS,
@@ -433,6 +433,7 @@ impl AgentBridge {
         // One-shot channels for the handshake/replay synchronisation.
         let (ready_tx, ready_rx) = mpsc::channel::<u64>();
         let (replay_done_tx, replay_done_rx) = mpsc::channel::<u64>();
+        let journal_flow = ReaderJournalFlow::new();
 
         // Spawn the reader thread.  It captures a clone of `self` (AgentBridge
         // is Clone/Arc-backed) so it can call consume_journal_entry.
@@ -440,6 +441,7 @@ impl AgentBridge {
             child_stdout,
             Arc::clone(&pending),
             self.clone(),
+            Arc::clone(&journal_flow),
             ready_tx,
             replay_done_tx,
         );
@@ -476,6 +478,7 @@ impl AgentBridge {
         let cursor = self.journal_cursor();
         let replayed = journal_head_seq > cursor;
         if replayed {
+            journal_flow.begin_replay();
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
@@ -496,15 +499,11 @@ impl AgentBridge {
                 self.set_state(ConnectionState::Failed);
                 return Err("timed out waiting for ReplayComplete from agent".to_string());
             }
+        } else {
+            journal_flow.complete_without_replay(self);
         }
 
-        self.enter_live_state();
         Ok(())
-    }
-
-    fn enter_live_state(&self) {
-        self.set_state(ConnectionState::Live);
-        self.flush_replay();
     }
 
     /// Tear down the live connection so a fresh [`connect`](Self::connect) can't
@@ -1825,14 +1824,34 @@ mod tests {
     }
 
     #[test]
-    fn live_boundary_flushes_replay_retained_after_cursor_catches_up() {
+    fn replay_boundary_orders_historical_publication_before_buffered_live_frames() {
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay();
 
-        bridge.consume_journal_entry_with_provenance(
-            &EventJournalEntry {
+        journal_flow.ingest(
+            &bridge,
+            EventJournalEntry {
+                seq: 3,
+                timestamp_ms: 3,
+                source: JournalSource::Agent,
+                event_id: None,
+                entity_id: Some("session-1".to_string()),
+                event_type: JournalEventType::UserPromptSubmit,
+                payload: serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "Live title"
+                }),
+                result: None,
+            },
+            false,
+        );
+        journal_flow.ingest(
+            &bridge,
+            EventJournalEntry {
                 seq: 1,
                 timestamp_ms: 1,
                 source: JournalSource::Agent,
@@ -1848,20 +1867,21 @@ mod tests {
             true,
         );
 
-        assert_eq!(bridge.journal_cursor(), 1);
+        assert_eq!(bridge.journal_cursor(), 0);
         assert!(rec.events.lock().is_empty());
 
-        bridge.enter_live_state();
+        journal_flow.complete_replay(&bridge);
 
-        let channels = rec
+        let titles = rec
             .events
             .lock()
             .iter()
-            .map(|(channel, _)| channel.clone())
+            .filter(|(channel, _)| channel == super::EVT_TITLE)
+            .map(|(_, payload)| payload["title"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert!(channels.contains(&super::EVT_AGENT_STATE.to_string()));
-        assert!(channels.contains(&super::EVT_TITLE.to_string()));
-        assert!(channels.contains(&super::EVT_SESSION_STATUS.to_string()));
+        assert_eq!(titles, vec!["Recovered title", "Live title"]);
+        assert_eq!(bridge.journal_cursor(), 3);
+        assert_eq!(bridge.state(), ConnectionState::Live);
     }
 
     #[test]

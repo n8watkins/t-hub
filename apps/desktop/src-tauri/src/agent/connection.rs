@@ -55,11 +55,95 @@ use std::{
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use t_hub_protocol::{decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame};
+use t_hub_protocol::{
+    decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame, EventJournalEntry,
+};
 
 // Re-export AgentBridge so the reader thread can call consume_journal_entry
 // without a circular import (the thread captures a clone of AgentBridge).
 use super::AgentBridge;
+
+pub(crate) struct ReaderJournalFlow {
+    state: Mutex<ReaderJournalState>,
+}
+
+enum ReaderJournalState {
+    Buffering(Vec<BufferedJournal>),
+    Replaying(Vec<BufferedJournal>),
+    Live,
+}
+
+struct BufferedJournal {
+    entry: EventJournalEntry,
+    replayed: bool,
+}
+
+impl ReaderJournalFlow {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ReaderJournalState::Buffering(Vec::new())),
+        })
+    }
+
+    pub(crate) fn begin_replay(&self) {
+        let mut state = self.state.lock();
+        if let ReaderJournalState::Buffering(entries) = &mut *state {
+            let entries = std::mem::take(entries);
+            *state = ReaderJournalState::Replaying(entries);
+        }
+    }
+
+    pub(crate) fn complete_without_replay(&self, bridge: &AgentBridge) {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Buffering(entries) =
+            std::mem::replace(&mut *state, ReaderJournalState::Live)
+        else {
+            return;
+        };
+
+        bridge.set_state(ConnectionState::Live);
+        for buffered in sorted_entries(entries) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
+        }
+    }
+
+    pub(crate) fn complete_replay(&self, bridge: &AgentBridge) {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Replaying(entries) =
+            std::mem::replace(&mut *state, ReaderJournalState::Live)
+        else {
+            return;
+        };
+
+        let (replayed, live): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|entry| entry.replayed);
+        for buffered in sorted_entries(replayed) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
+        }
+        bridge.flush_replay();
+        bridge.set_state(ConnectionState::Live);
+        for buffered in sorted_entries(live) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
+        }
+    }
+
+    pub(crate) fn ingest(&self, bridge: &AgentBridge, entry: EventJournalEntry, replayed: bool) {
+        let mut state = self.state.lock();
+        match &mut *state {
+            ReaderJournalState::Buffering(entries) | ReaderJournalState::Replaying(entries) => {
+                entries.push(BufferedJournal { entry, replayed });
+            }
+            ReaderJournalState::Live => {
+                bridge.consume_journal_entry_with_provenance(&entry, false);
+            }
+        }
+    }
+}
+
+fn sorted_entries(mut entries: Vec<BufferedJournal>) -> Vec<BufferedJournal> {
+    entries.sort_by_key(|entry| entry.entry.seq);
+    entries
+}
 
 // ---------------------------------------------------------------------------
 // ConnectionState (fixed contract — do NOT alter)
@@ -203,6 +287,7 @@ pub(crate) fn spawn_reader(
     child_stdout: std::process::ChildStdout,
     pending: Arc<CorrelationMap>,
     bridge: AgentBridge,
+    journal_flow: Arc<ReaderJournalFlow>,
     // Sent once when Ready arrives: carries the agent's journal_head_seq.
     ready_tx: Sender<u64>,
     // Sent once when ReplayComplete arrives.
@@ -265,12 +350,13 @@ pub(crate) fn spawn_reader(
                         entry,
                         replayed,
                     } => {
-                        bridge.consume_journal_entry_with_provenance(&entry, replayed);
+                        journal_flow.ingest(&bridge, entry, replayed);
                         let _ = seq; // cursor advancement is done inside consume_journal_entry
                     }
 
                     AgentToCore::ReplayComplete { last_seq } => {
                         eprintln!("agent-bridge: replay complete (last_seq={last_seq})");
+                        journal_flow.complete_replay(&bridge);
                         let _ = replay_done_tx.send(last_seq);
                     }
 
