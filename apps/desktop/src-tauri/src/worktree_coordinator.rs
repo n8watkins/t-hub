@@ -531,10 +531,7 @@ impl WorktreeCoordinator {
         let operation_id = record.operation_id.clone();
         let completion = (|| {
             if !Path::new(&record.request_path).is_file() {
-                return ProviderCompletion::Failed(format!(
-                    "durable provider request is missing: {}",
-                    record.request_path
-                ));
+                return missing_request_completion(&record);
             }
             if let Err(error) = self.transition(&operation_id, RetirementState::Running, None) {
                 return ProviderCompletion::RecoveryRequired(format!(
@@ -597,6 +594,18 @@ impl WorktreeCoordinator {
             "{operation}: worktree '{}' is reserved for Cargo cleanup by operation '{}'",
             record.worktree_path, record.operation_id
         ))
+    }
+}
+
+fn missing_request_completion(record: &WorktreeRetirement) -> ProviderCompletion {
+    let error = format!(
+        "durable provider request is missing: {}",
+        record.request_path
+    );
+    if record.state == RetirementState::Reserved {
+        ProviderCompletion::Failed(error)
+    } else {
+        ProviderCompletion::RecoveryRequired(error)
     }
 }
 
@@ -1138,6 +1147,23 @@ mod tests {
         assert!(matches!(
             classify_provider_output(&output),
             ProviderCompletion::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn missing_running_request_requires_recovery() {
+        let mut record = WorktreeCoordinator::ephemeral()
+            .begin_retirement("/repo/worktree", "/missing/request.json")
+            .unwrap();
+        assert!(matches!(
+            missing_request_completion(&record),
+            ProviderCompletion::Failed(_)
+        ));
+
+        record.state = RetirementState::Running;
+        assert!(matches!(
+            missing_request_completion(&record),
+            ProviderCompletion::RecoveryRequired(_)
         ));
     }
 
