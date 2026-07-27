@@ -202,8 +202,7 @@ export async function bootstrapWorkspaceTabs(): Promise<boolean> {
           repaired.stale && Array.isArray(repaired.tabs)
             ? repaired.tabs
             : repairedTabs;
-        adoptAuthoritativeTabs(authoritativeTabs);
-        return true;
+        return adoptAuthoritativeTabs(authoritativeTabs);
       }
       return false;
     }

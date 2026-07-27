@@ -279,4 +279,23 @@ describe("workspace registry bootstrap", () => {
       { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
     ]);
   });
+
+  it("retries when a stale repair response remains Captain-only", async () => {
+    seed([{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] }]);
+    controlRequest.mockResolvedValue({
+      seq: 9,
+      activeTabId: CAPTAINS_TAB_ID,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+    invoke.mockResolvedValue({
+      seq: 10,
+      stale: true,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
+
+    expect(useWorkspace.getState().tabs.some((tab) => tab.id !== CAPTAINS_TAB_ID)).toBe(true);
+    expect(useWorkspace.getState().registryAdopted).toBe(false);
+  });
 });
