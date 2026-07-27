@@ -7,10 +7,17 @@ PLAN_ONLY="${2:-}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/ci/local-test.sh [fast|full] [--plan]
+Usage: scripts/ci/local-test.sh <profile> [--plan]
 
-fast  Runs deterministic Rust libraries, CLI tests, frontend tests, and typecheck.
-full  Runs the complete Rust, CLI, frontend, browser, build, and contract gates.
+fast            Rust libraries, CLI tests, frontend tests, and typecheck.
+standard        All Rust targets except slow process modules, plus the fast lanes.
+backend         The standard Rust lane and CLI tests.
+frontend        Typecheck, Vitest, and the production frontend bundle.
+browser         The production frontend bundle and Playwright browser tests.
+process         Real control and tmux process lifecycle tests.
+contracts       Portable repository, voice-gate, and skill contracts.
+host-contracts  Codex and Claude CLI provisioning and installation contracts.
+full            Complete Rust, CLI, frontend, browser, bundle, and portable contracts.
 EOF
 }
 
@@ -18,10 +25,13 @@ if [[ "$PROFILE" == "-h" || "$PROFILE" == "--help" ]]; then
   usage
   exit 0
 fi
-if [[ "$PROFILE" != "fast" && "$PROFILE" != "full" ]]; then
-  usage >&2
-  exit 2
-fi
+case "$PROFILE" in
+  fast | standard | backend | frontend | browser | process | contracts | host-contracts | full) ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
 if [[ -n "$PLAN_ONLY" && "$PLAN_ONLY" != "--plan" ]]; then
   usage >&2
   exit 2
@@ -44,6 +54,31 @@ rust_fast() {
     -- \
     --skip control::tests \
     --skip tmux::tests
+}
+
+rust_standard() {
+  cargo build \
+    --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
+    -p t-hub-mcp &&
+    cargo test \
+      --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
+      --workspace \
+      -- \
+      --skip control::tests \
+      --skip tmux::tests
+}
+
+rust_process() {
+  cargo test \
+    --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
+    -p t-hub \
+    --lib \
+    control::tests &&
+    cargo test \
+      --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
+      -p t-hub \
+      --lib \
+      tmux::tests
 }
 
 rust_full() {
@@ -74,32 +109,96 @@ frontend_product() {
   frontend_bundle && frontend_browser
 }
 
-repository_contracts() {
+portable_contracts() {
   cd "$ROOT" || return
   bash apps/desktop/scripts/check-version.sh --history &&
+    bash apps/desktop/scripts/announce_gate.test.sh &&
     bash scripts/perf/perf-benchmark.test.sh &&
     bash scripts/ci/local-test.test.sh &&
-    bash scripts/ci/workflow-actions.test.sh
+    bash scripts/ci/workflow-actions.test.sh &&
+    bash scripts/captain/handoff-skill.test.sh
+}
+
+host_contracts() {
+  cd "$ROOT" || return
+  local missing=0
+  local command
+  for command in codex claude; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+      printf '%s is required for the host-contracts profile\n' "$command" >&2
+      missing=1
+    fi
+  done
+  if ((missing)); then
+    return 1
+  fi
+  bash scripts/captain/ensure-thub-codex.test.sh &&
+    bash scripts/captain/ensure-thub-claude.test.sh &&
+    bash scripts/captain/install-thub-codex.test.sh
 }
 
 print_plan() {
-  if [[ "$PROFILE" == "fast" ]]; then
-    cat <<'EOF'
+  case "$PROFILE" in
+    fast)
+      cat <<'EOF'
 rust: cargo test --workspace --lib -- --skip control::tests --skip tmux::tests
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
 frontend-unit: pnpm --filter t-hub-desktop test
 EOF
-  else
-    cat <<'EOF'
+      ;;
+    standard)
+      cat <<'EOF'
+rust: cargo build -p t-hub-mcp, then cargo test --workspace -- --skip control::tests --skip tmux::tests
+cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
+frontend-typecheck: pnpm --filter t-hub-desktop typecheck
+frontend-unit: pnpm --filter t-hub-desktop test
+EOF
+      ;;
+    backend)
+      cat <<'EOF'
+rust: cargo build -p t-hub-mcp, then cargo test --workspace -- --skip control::tests --skip tmux::tests
+cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
+EOF
+      ;;
+    frontend)
+      cat <<'EOF'
+frontend-typecheck: pnpm --filter t-hub-desktop typecheck
+frontend-unit: pnpm --filter t-hub-desktop test
+frontend-bundle: pnpm --filter t-hub-desktop build:bundle
+EOF
+      ;;
+    browser)
+      cat <<'EOF'
+frontend-product: pnpm --filter t-hub-desktop build:bundle, then test:browser
+EOF
+      ;;
+    process)
+      cat <<'EOF'
+rust-process: cargo test -p t-hub --lib control::tests, then tmux::tests
+EOF
+      ;;
+    contracts)
+      cat <<'EOF'
+contracts: version, voice gate, performance, test profile, workflow pinning, and handoff skill
+EOF
+      ;;
+    host-contracts)
+      cat <<'EOF'
+host-contracts: Codex provisioning, Claude provisioning, and Codex installation
+EOF
+      ;;
+    full)
+      cat <<'EOF'
 rust: apps/desktop/scripts/workspace_gate.sh
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
 frontend-unit: pnpm --filter t-hub-desktop test
 frontend-product: pnpm --filter t-hub-desktop build:bundle, then test:browser
-contracts: version, performance benchmark, test profile, and workflow pinning contracts
+contracts: version, voice gate, performance, test profile, workflow pinning, and handoff skill
 EOF
-  fi
+      ;;
+  esac
 }
 
 if [[ "$PLAN_ONLY" == "--plan" ]]; then
@@ -123,18 +222,49 @@ start_lane() {
   LANE_PIDS+=("$!")
 }
 
-if [[ "$PROFILE" == "fast" ]]; then
-  start_lane rust rust_fast
-else
-  start_lane rust rust_full
-fi
-start_lane cli cli_tests
-start_lane frontend-typecheck frontend_typecheck
-start_lane frontend-unit frontend_tests
-if [[ "$PROFILE" == "full" ]]; then
-  start_lane frontend-product frontend_product
-  start_lane contracts repository_contracts
-fi
+case "$PROFILE" in
+  fast)
+    start_lane rust rust_fast
+    start_lane cli cli_tests
+    start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-unit frontend_tests
+    ;;
+  standard)
+    start_lane rust rust_standard
+    start_lane cli cli_tests
+    start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-unit frontend_tests
+    ;;
+  backend)
+    start_lane rust rust_standard
+    start_lane cli cli_tests
+    ;;
+  frontend)
+    start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-unit frontend_tests
+    start_lane frontend-bundle frontend_bundle
+    ;;
+  browser)
+    start_lane frontend-product frontend_product
+    ;;
+  process)
+    start_lane rust-process rust_process
+    ;;
+  contracts)
+    start_lane contracts portable_contracts
+    ;;
+  host-contracts)
+    start_lane host-contracts host_contracts
+    ;;
+  full)
+    start_lane rust rust_full
+    start_lane cli cli_tests
+    start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-unit frontend_tests
+    start_lane frontend-product frontend_product
+    start_lane contracts portable_contracts
+    ;;
+esac
 
 printf 'Running %s profile in %d parallel lanes:' "$PROFILE" "${#LANE_NAMES[@]}"
 printf ' %s' "${LANE_NAMES[@]}"

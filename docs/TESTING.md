@@ -1,10 +1,25 @@
 # Testing T-Hub
 
-T-Hub has two local test profiles so normal iteration does not pay the cost of every real process and installer boundary.
+T-Hub has layered local test profiles so normal iteration does not pay the cost of every real process, browser, host CLI, and installer boundary.
+
+## Profile summary
+
+| Command | Coverage | Warm baseline |
+|---|---|---:|
+| `pnpm test` or `pnpm test:fast` | Rust libraries, CLI, typecheck, and Vitest | 25 seconds |
+| `pnpm test:standard` | Every Rust target except the slow process modules, plus the fast frontend and CLI lanes | About 1 minute |
+| `pnpm test:backend` | Standard Rust and CLI lanes | About 1 minute |
+| `pnpm test:frontend` | Typecheck, Vitest, and the production bundle | Under 1 minute |
+| `pnpm test:browser` | Production bundle and Playwright | Under 1 minute |
+| `pnpm test:contracts` | Portable repository, voice-gate, performance, and skill contracts | About 30 seconds |
+| `pnpm test:host-contracts` | Real Codex and Claude provisioning and installation contracts | About 7 minutes |
+| `pnpm test:process` | Real control and tmux process lifecycle tests | About 8 minutes |
+| `pnpm test:full` | Complete Rust, CLI, frontend, browser, bundle, and portable contracts | About 8 to 9 minutes |
+
+Run a focused test first when changing one behavior.
+Then choose the narrowest profile that crosses the boundaries affected by the change.
 
 ## Fast profile
-
-Run `pnpm test` or `pnpm test:fast` from the repository root.
 
 The fast profile runs these independent lanes concurrently:
 
@@ -14,15 +29,32 @@ The fast profile runs these independent lanes concurrently:
 - All frontend Vitest tests.
 
 The Rust lane excludes `control::tests` and `tmux::tests`.
-Those modules contain real process, socket, systemd, and tmux lifecycle tests that share an isolated tmux server and must serialize their ownership transitions.
-They remain mandatory in the full profile and in CI.
+It also selects library targets, so binary and integration targets belong to the standard profile.
 
 Use the fast profile during implementation and after focused tests for the code being changed.
-If a change touches control or tmux process ownership, run its exact focused tests during implementation and run the full profile before handoff.
 
-## Full profile
+## Standard and targeted profiles
 
-Run `pnpm test:full` from the repository root.
+The standard profile adds every Rust binary and integration target while still excluding the two slow process modules.
+It builds the real `t-hub-mcp` binary before running the workspace so MCP integration tests remain deterministic from a clean target directory.
+
+Use the backend profile for Rust or CLI-only changes.
+Use the frontend profile for TypeScript, state, and component changes.
+Use the browser profile when layout, interaction, rendering, or the production bundle can change.
+Use the contracts profile for repository scripts, voice gating, performance evidence, workflow pinning, and skill packaging.
+Use the host-contracts profile when Codex or Claude provisioning and installation can change.
+
+The host-contracts profile fails when either real CLI is missing.
+It never silently treats a skipped compatibility test as coverage.
+The contract scripts use isolated temporary homes and do not mutate the operator's real Codex or Claude configuration.
+
+## Process and full profiles
+
+The process profile runs only `control::tests` and `tmux::tests`.
+Those modules exercise real process, socket, shell, systemd, and tmux lifecycle behavior.
+They share isolated infrastructure and serialize ownership transitions, which is why they dominate runtime.
+
+Run the process profile after changes to control dispatch, terminal ownership, tmux, history resume, supervision, or process evidence.
 
 The full profile runs these independent lanes concurrently:
 
@@ -31,24 +63,28 @@ The full profile runs these independent lanes concurrently:
 - Frontend TypeScript checking.
 - All frontend Vitest tests.
 - The production Vite bundle followed by the Playwright browser suite in one local lane.
-- Version, packaged performance, test-profile, and GitHub Actions pinning contracts.
+- Portable version, voice-gate, performance, test-profile, workflow-pinning, and handoff-skill contracts.
 
-The full profile is the local pre-push and release-candidate gate.
+The full profile is the local pre-push gate for changes that cross several areas.
 The real Windows installer build and installation remain a separate host-level release validation because they intentionally modify installed Windows state.
 
 ## CI layout
 
-CI keeps the complete test coverage.
+CI keeps the complete portable coverage and runs the real Codex and Claude compatibility contracts in a dedicated pinned-CLI job.
 Frontend unit and build checks run separately from Playwright so browser installation and execution no longer block the faster frontend lane.
 The local full profile keeps bundle and browser execution sequential because concurrent Vite build and development-server processes share local Vite state.
 TypeScript is checked once, and the production bundle uses `build:bundle` instead of invoking TypeScript a second time.
 
+CI also runs Rust formatting, Clippy, the minimum supported Rust version, and Windows installer contracts.
+The native Windows installer build, installation, launch, hook, voice, and state-preservation smoke test remains a release workflow boundary.
+
 ## Measured baseline
 
-On the WSL development host on July 27, 2026, the frontend Vitest suite took about 19 seconds, typecheck took about 16 seconds, and CLI tests took about 13 seconds.
+On the WSL development host on July 27, 2026, the normal profile completed in 25.38 seconds.
+The standard Rust lane completed in 49.74 seconds, so the parallel standard profile is expected to remain close to one minute.
 The complete Rust workspace took about 8 minutes.
 The complete local profile is therefore expected to finish in about 8 to 9 minutes because its independent lanes run concurrently.
-The fast profile took 22 seconds with warm build artifacts and 39 seconds in an earlier compilation-bearing run.
 
+Cold builds can take longer because Cargo must compile and link every native Tauri test target.
 The slow Rust cost comes from real process and tmux lifecycle coverage rather than obsolete unit-test volume.
 Do not delete those tests solely to improve local iteration time.

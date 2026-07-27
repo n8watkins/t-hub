@@ -177,6 +177,9 @@ jobs:
       - name: Desktop version contract
         run: bash apps/desktop/scripts/check-version.sh --history
 
+      - name: Voice announcement gate contract
+        run: bash apps/desktop/scripts/announce_gate.test.sh
+
       - name: Packaged runtime benchmark contract
         run: bash scripts/perf/perf-benchmark.test.sh
 
@@ -185,6 +188,31 @@ jobs:
 
       - name: GitHub Actions pinning contract
         run: bash scripts/ci/workflow-actions.test.sh
+
+      - name: Handoff skill contract
+        run: bash scripts/captain/handoff-skill.test.sh
+
+  host-cli-contracts:
+    name: Host CLI contracts (Codex + Claude)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install pinned host CLIs
+        run: npm install --global @openai/codex@0.145.0 @anthropic-ai/claude-code@2.1.220
+
+      - name: Codex provisioning contract
+        run: bash scripts/captain/ensure-thub-codex.test.sh
+
+      - name: Claude provisioning contract
+        run: bash scripts/captain/ensure-thub-claude.test.sh
+
+      - name: Codex installation contract
+        run: bash scripts/captain/install-thub-codex.test.sh
 
   frontend-browser:
     name: Frontend browser (Playwright)

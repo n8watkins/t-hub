@@ -8,6 +8,13 @@
     "build": "pnpm --filter t-hub-desktop build",
     "test": "bash scripts/ci/local-test.sh fast",
     "test:fast": "bash scripts/ci/local-test.sh fast",
+    "test:standard": "bash scripts/ci/local-test.sh standard",
+    "test:backend": "bash scripts/ci/local-test.sh backend",
+    "test:frontend": "bash scripts/ci/local-test.sh frontend",
+    "test:browser": "bash scripts/ci/local-test.sh browser",
+    "test:process": "bash scripts/ci/local-test.sh process",
+    "test:contracts": "bash scripts/ci/local-test.sh contracts",
+    "test:host-contracts": "bash scripts/ci/local-test.sh host-contracts",
     "test:full": "bash scripts/ci/local-test.sh full",
     "typecheck": "pnpm --filter t-hub-desktop typecheck",
     "tauri": "pnpm --filter t-hub-desktop tauri"
