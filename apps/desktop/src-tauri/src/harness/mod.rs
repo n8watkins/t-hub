@@ -2597,9 +2597,20 @@ mod tests {
             {
                 continue;
             }
-            resolve_launch_executable_with_shell(provider, Some(shell)).unwrap_or_else(|error| {
-                panic!("launch resolution failed through {shell}: {error}")
-            });
+            resolve_launch_executable_with_shell(provider, Some(shell))
+                .or_else(|first_error| {
+                    // This test runs alongside process-heavy tmux and supervisor
+                    // suites. A saturated CI host can consume the entire bounded
+                    // probe window before the login shell is scheduled. Retry the
+                    // same production path once: deterministic trust failures
+                    // remain failures, while scheduler starvation does not make
+                    // this shell-compatibility test flaky.
+                    resolve_launch_executable_with_shell(provider, Some(shell))
+                        .map_err(|_| first_error)
+                })
+                .unwrap_or_else(|error| {
+                    panic!("launch resolution failed through {shell}: {error}")
+                });
             tested.push(shell);
         }
         assert!(tested.iter().any(|shell| shell.ends_with("/bash")));
