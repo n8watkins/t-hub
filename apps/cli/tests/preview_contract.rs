@@ -147,10 +147,7 @@ fn start_forwards_exact_scope_target_and_idempotency_identity() {
         })
     );
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        envelope["data"]["status"]["previewUrl"],
-        authoritative_url
-    );
+    assert_eq!(envelope["data"]["status"]["previewUrl"], authoritative_url);
 }
 
 #[test]
