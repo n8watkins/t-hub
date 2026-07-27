@@ -246,7 +246,7 @@ impl control::ApplySink for AppHandleApplySink {
 /// yet) is rejected and answered with the authoritative snapshot so the UI
 /// converges instead of clobbering the mutation.
 #[tauri::command]
-fn report_workspace_tabs(
+async fn report_workspace_tabs(
     app: tauri::AppHandle,
     tabs: Vec<control::TabRecord>,
     active_tab_id: Option<String>,
@@ -254,6 +254,50 @@ fn report_workspace_tabs(
     registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
     captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
+) -> Result<serde_json::Value, String> {
+    // Reconciliation can wait for registry or Captain persistence held by
+    // another control request. Running a synchronous Tauri command here blocked
+    // the window thread directly after terminal creation, compounding a slow
+    // spawn into a second visible freeze.
+    let registry = registry.inner().clone();
+    let recovery_registry = registry.clone();
+    let captains = captains.inner().clone();
+    let fanout = fanout.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        report_workspace_tabs_blocking(
+            &app,
+            tabs,
+            active_tab_id,
+            base_seq,
+            registry.as_ref(),
+            captains.as_ref(),
+            fanout.as_ref(),
+        )
+    })
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let snapshot = recovery_registry.snapshot_full();
+            Ok(serde_json::json!({
+                "stale": true,
+                "seq": snapshot.seq,
+                "activeTabId": snapshot.active_tab_id,
+                "tabs": snapshot.tabs,
+                "error": format!("report_workspace_tabs task failed: {error}"),
+            }))
+        }
+    }
+}
+
+fn report_workspace_tabs_blocking(
+    app: &tauri::AppHandle,
+    tabs: Vec<control::TabRecord>,
+    active_tab_id: Option<String>,
+    base_seq: Option<u64>,
+    registry: &control::TabRegistry,
+    captains: &control::CaptainsRegistry,
+    fanout: &control::EventFanout,
 ) -> serde_json::Value {
     if let Err(error) = registry.require_authoritative_startup() {
         return serde_json::json!({
@@ -263,10 +307,10 @@ fn report_workspace_tabs(
             "error": error,
         });
     }
-    match control::apply_workspace_report(&registry, &captains, tabs, active_tab_id, base_seq) {
+    match control::apply_workspace_report(registry, captains, tabs, active_tab_id, base_seq) {
         Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled)) => {
             if captains_changed {
-                commands::forward_captains_sync(&app, &captains, &fanout);
+                commands::forward_captains_sync(app, captains, fanout);
             }
             let snapshot = registry.snapshot_full();
             serde_json::json!({
