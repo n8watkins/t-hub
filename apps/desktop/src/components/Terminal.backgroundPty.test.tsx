@@ -145,6 +145,7 @@ describe("TerminalView background PTY lifecycle", () => {
       terminals: {
         term: {
           id: "term",
+          tmuxSession: "th_term",
           title: "Shell",
           cwd: "/home/test",
           state: "live",
