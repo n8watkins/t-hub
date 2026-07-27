@@ -320,7 +320,7 @@ fn managed_helper_failure(
             code,
             Some(77 | 80 | 83 | 84 | 90 | 92 | 94 | 100 | 101 | 118)
         )
-            .then_some(std::io::ErrorKind::WouldBlock),
+        .then_some(std::io::ErrorKind::WouldBlock),
         message: message.into(),
     }
 }
