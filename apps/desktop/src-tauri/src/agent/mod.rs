@@ -447,15 +447,10 @@ impl AgentBridge {
 
         #[cfg(windows)]
         if !std::env::var_os("T_HUB_AGENT_BIN").is_some_and(|value| !value.is_empty()) {
-            let resource = self
-                .inner
-                .bundled_agent
-                .lock()
-                .clone()
-                .ok_or_else(|| {
-                    self.set_state(ConnectionState::Failed);
-                    "bundled WSL helper resource path is unavailable".to_string()
-                })?;
+            let resource = self.inner.bundled_agent.lock().clone().ok_or_else(|| {
+                self.set_state(ConnectionState::Failed);
+                "bundled WSL helper resource path is unavailable".to_string()
+            })?;
             match deploy_bundled_agent(distro, &resource) {
                 Ok(DeployOutcome::AlreadyCurrent) => {
                     eprintln!(
@@ -1927,8 +1922,7 @@ while IFS= read -r _; do :; done
             .unwrap_or_else(|error| error.into_inner());
         let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
         let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
-        let attempts_file_env =
-            TestEnvVar::set("T_HUB_TEST_ATTEMPTS_FILE", &attempts_file);
+        let attempts_file_env = TestEnvVar::set("T_HUB_TEST_ATTEMPTS_FILE", &attempts_file);
         let bridge = AgentBridge::new();
         bridge
             .connect_with_timeouts(
