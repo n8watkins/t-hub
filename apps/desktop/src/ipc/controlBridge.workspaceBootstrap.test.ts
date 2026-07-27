@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { controlRequest, invoke } = vi.hoisted(() => ({
+const { controlRequest, invoke, listen } = vi.hoisted(() => ({
   controlRequest: vi.fn(),
   invoke: vi.fn(),
+  listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
 }));
 
 vi.mock("./controlClient", () => ({
@@ -11,9 +12,7 @@ vi.mock("./controlClient", () => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
-}));
+vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
 import {
   bootstrapWorkspaceTabs,
@@ -51,6 +50,11 @@ beforeEach(() => {
 });
 
 describe("workspace registry bootstrap", () => {
+  it("does not start the bridge outside a Tauri webview", () => {
+    expect(listen).not.toHaveBeenCalled();
+    expect(controlRequest).not.toHaveBeenCalled();
+  });
+
   it("repairs a Captain-only snapshot with only live local terminal IDs", async () => {
     seed([
       {

@@ -536,6 +536,7 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
  */
 export function startControlBridge(): void {
   if (typeof window === "undefined") return;
+  if (!("__TAURI_INTERNALS__" in window)) return;
   if (isSatelliteWindow()) return;
   void listen<ControlApply>(CONTROL_APPLY_EVENT, (ev) => {
     const payload = ev.payload;
