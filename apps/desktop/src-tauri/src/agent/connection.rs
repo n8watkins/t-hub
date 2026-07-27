@@ -69,8 +69,9 @@ pub(crate) struct ReaderJournalFlow {
 
 enum ReaderJournalState {
     Buffering(Vec<BufferedJournal>),
-    Replaying(Vec<BufferedJournal>),
+    Replaying { live_entries: Vec<BufferedJournal> },
     Live,
+    Cancelled,
 }
 
 struct BufferedJournal {
@@ -85,11 +86,16 @@ impl ReaderJournalFlow {
         })
     }
 
-    pub(crate) fn begin_replay(&self) {
+    pub(crate) fn begin_replay(&self, bridge: &AgentBridge) {
         let mut state = self.state.lock();
         if let ReaderJournalState::Buffering(entries) = &mut *state {
             let entries = std::mem::take(entries);
-            *state = ReaderJournalState::Replaying(entries);
+            let (replayed, live_entries): (Vec<_>, Vec<_>) =
+                entries.into_iter().partition(|entry| entry.replayed);
+            *state = ReaderJournalState::Replaying { live_entries };
+            for buffered in sorted_entries(replayed) {
+                bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
+            }
         }
     }
 
@@ -101,6 +107,7 @@ impl ReaderJournalFlow {
             return;
         };
 
+        bridge.flush_replay();
         bridge.set_state(ConnectionState::Live);
         for buffered in sorted_entries(entries) {
             bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
@@ -109,33 +116,46 @@ impl ReaderJournalFlow {
 
     pub(crate) fn complete_replay(&self, bridge: &AgentBridge) {
         let mut state = self.state.lock();
-        let ReaderJournalState::Replaying(entries) =
+        let ReaderJournalState::Replaying { live_entries } =
             std::mem::replace(&mut *state, ReaderJournalState::Live)
         else {
             return;
         };
 
-        let (replayed, live): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|entry| entry.replayed);
-        for buffered in sorted_entries(replayed) {
-            bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
-        }
         bridge.flush_replay();
         bridge.set_state(ConnectionState::Live);
-        for buffered in sorted_entries(live) {
+        for buffered in sorted_entries(live_entries) {
             bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
+        }
+    }
+
+    pub(crate) fn cancel_replay(&self) -> bool {
+        let mut state = self.state.lock();
+        if matches!(*state, ReaderJournalState::Replaying { .. }) {
+            *state = ReaderJournalState::Cancelled;
+            true
+        } else {
+            false
         }
     }
 
     pub(crate) fn ingest(&self, bridge: &AgentBridge, entry: EventJournalEntry, replayed: bool) {
         let mut state = self.state.lock();
         match &mut *state {
-            ReaderJournalState::Buffering(entries) | ReaderJournalState::Replaying(entries) => {
+            ReaderJournalState::Buffering(entries) => {
                 entries.push(BufferedJournal { entry, replayed });
+            }
+            ReaderJournalState::Replaying { live_entries } => {
+                if replayed {
+                    bridge.consume_journal_entry_with_provenance(&entry, true);
+                } else {
+                    live_entries.push(BufferedJournal { entry, replayed });
+                }
             }
             ReaderJournalState::Live => {
                 bridge.consume_journal_entry_with_provenance(&entry, false);
             }
+            ReaderJournalState::Cancelled => {}
         }
     }
 }

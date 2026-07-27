@@ -478,7 +478,7 @@ impl AgentBridge {
         let cursor = self.journal_cursor();
         let replayed = journal_head_seq > cursor;
         if replayed {
-            journal_flow.begin_replay();
+            journal_flow.begin_replay(self);
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
@@ -495,6 +495,7 @@ impl AgentBridge {
             if replay_done_rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .is_err()
+                && journal_flow.cancel_replay()
             {
                 self.set_state(ConnectionState::Failed);
                 return Err("timed out waiting for ReplayComplete from agent".to_string());
@@ -1830,7 +1831,7 @@ mod tests {
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay();
+        journal_flow.begin_replay(&bridge);
 
         journal_flow.ingest(
             &bridge,
@@ -1867,7 +1868,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(bridge.journal_cursor(), 0);
+        assert_eq!(bridge.journal_cursor(), 1);
         assert!(rec.events.lock().is_empty());
 
         journal_flow.complete_replay(&bridge);
@@ -1881,6 +1882,119 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(titles, vec!["Recovered title", "Live title"]);
         assert_eq!(bridge.journal_cursor(), 3);
+        assert_eq!(bridge.state(), ConnectionState::Live);
+    }
+
+    #[test]
+    fn replay_reduces_history_incrementally_and_buffers_only_live_entries() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(&bridge);
+
+        journal_flow.ingest(
+            &bridge,
+            EventJournalEntry {
+                seq: 1,
+                timestamp_ms: 1,
+                source: JournalSource::Agent,
+                event_id: None,
+                entity_id: Some("session-1".to_string()),
+                event_type: JournalEventType::UserPromptSubmit,
+                payload: serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "Recovered title"
+                }),
+                result: None,
+            },
+            true,
+        );
+        assert_eq!(bridge.journal_cursor(), 1);
+        assert!(rec.events.lock().is_empty());
+
+        journal_flow.ingest(
+            &bridge,
+            EventJournalEntry {
+                seq: 2,
+                timestamp_ms: 2,
+                source: JournalSource::Agent,
+                event_id: None,
+                entity_id: Some("session-1".to_string()),
+                event_type: JournalEventType::UserPromptSubmit,
+                payload: serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "Live title"
+                }),
+                result: None,
+            },
+            false,
+        );
+        assert_eq!(bridge.journal_cursor(), 1);
+
+        journal_flow.complete_replay(&bridge);
+
+        let titles = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::EVT_TITLE)
+            .map(|(_, payload)| payload["title"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["Recovered title", "Live title"]);
+        assert_eq!(bridge.journal_cursor(), 2);
+    }
+
+    #[test]
+    fn cancelled_replay_cannot_publish_or_restore_live_state() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(&bridge);
+        bridge.set_state(ConnectionState::Replaying);
+
+        journal_flow.ingest(
+            &bridge,
+            EventJournalEntry {
+                seq: 1,
+                timestamp_ms: 1,
+                source: JournalSource::Agent,
+                event_id: None,
+                entity_id: Some("session-1".to_string()),
+                event_type: JournalEventType::UserPromptSubmit,
+                payload: serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "Recovered title"
+                }),
+                result: None,
+            },
+            true,
+        );
+
+        assert!(journal_flow.cancel_replay());
+        bridge.set_state(ConnectionState::Failed);
+        journal_flow.complete_replay(&bridge);
+
+        assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert!(rec
+            .events
+            .lock()
+            .iter()
+            .all(|(channel, _)| channel != super::EVT_TITLE));
+    }
+
+    #[test]
+    fn completed_replay_wins_a_simultaneous_timeout_check() {
+        let bridge = AgentBridge::new();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(&bridge);
+
+        journal_flow.complete_replay(&bridge);
+
+        assert!(!journal_flow.cancel_replay());
         assert_eq!(bridge.state(), ConnectionState::Live);
     }
 
