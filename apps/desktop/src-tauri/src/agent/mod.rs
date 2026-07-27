@@ -32,7 +32,10 @@ pub(crate) use install::bundled_agent_path;
 #[cfg(windows)]
 pub(crate) use install::{deploy_bundled_agent, DeployOutcome};
 
-use std::sync::{mpsc, Arc, LazyLock, Weak};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{mpsc, Arc, LazyLock, Weak},
+};
 
 use parking_lot::Mutex;
 use t_hub_protocol::{
@@ -197,6 +200,10 @@ struct BridgeInner {
     /// Highest journal sequence the core has durably consumed (the replay
     /// cursor). Advanced as entries arrive; persisted by workstream G later.
     journal_cursor: Mutex<u64>,
+    /// Cold-start replay rebuilds backend authority without forwarding every
+    /// historical event into the webview. The latest title/status plus the set
+    /// of affected sessions are flushed once after ReplayComplete.
+    replay_accumulator: Mutex<ReplayAccumulator>,
     /// Live transport handles (stdin writer + correlation map). `None` when
     /// disconnected. Set by `connect()`, read by `request()`.
     transport: Mutex<Option<Arc<TransportHandles>>>,
@@ -217,6 +224,13 @@ struct BridgeInner {
     /// orchestrator. `None` pre-setup and under unit tests (then a no-op). Kept
     /// trait-free (a boxed closure) so the `agent` module needs no fleet types.
     status_observer: Mutex<Option<StatusObserver>>,
+}
+
+#[derive(Default)]
+struct ReplayAccumulator {
+    sessions: BTreeSet<String>,
+    status_sessions: BTreeSet<String>,
+    titles: BTreeMap<String, SessionTitlePayload>,
 }
 
 /// A callback fired on every session status emit: `(session_uuid, status)`. The
@@ -289,6 +303,7 @@ impl Default for AgentBridge {
                 supervisor: Mutex::new(Supervisor::new()),
                 state: Mutex::new(ConnectionState::Disconnected),
                 journal_cursor: Mutex::new(0),
+                replay_accumulator: Mutex::new(ReplayAccumulator::default()),
                 transport: Mutex::new(None),
                 emitter: Mutex::new(None),
                 status: Mutex::new(None),
@@ -462,7 +477,8 @@ impl AgentBridge {
 
         // If the agent has journal entries we haven't consumed, request replay.
         let cursor = self.journal_cursor();
-        if journal_head_seq > cursor {
+        let replayed = journal_head_seq > cursor;
+        if replayed {
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
@@ -486,6 +502,9 @@ impl AgentBridge {
         }
 
         self.set_state(ConnectionState::Live);
+        if replayed {
+            self.flush_replay();
+        }
         Ok(())
     }
 
@@ -819,20 +838,25 @@ impl AgentBridge {
             entry.event_type,
             t_hub_protocol::JournalEventType::StatusSnapshot
         ) {
-            self.ingest_status_from_journal(entry);
+            let affected = self.ingest_status_from_journal(entry, !replayed);
+            if replayed {
+                if let Some(session_id) = affected.as_deref() {
+                    self.inner
+                        .replay_accumulator
+                        .lock()
+                        .status_sessions
+                        .insert(session_id.to_string());
+                }
+            }
             // Return the entry's own session id for callers/tests; no tree/status
             // emit (the reducer status is unchanged by a status snapshot).
-            return entry.entity_id.clone().or_else(|| {
-                entry
-                    .payload
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
+            return affected;
         }
 
         // 1. The replay cursor moved, so the health area's journalCursor changed.
-        self.emit_agent_state();
+        if !replayed {
+            self.emit_agent_state();
+        }
 
         // NOTE: StatusSnapshot entries never reach here — they are short-circuited
         // at the top of this method onto a dedicated minimal path (status bridge +
@@ -844,7 +868,17 @@ impl AgentBridge {
         //     Legacy entries that already contain a prompt remain readable.
         //     Carries `cwd` so the frontend can correlate the Claude session id
         //     to a T-Hub terminal.
-        self.emit_session_title(entry);
+        if let Some(title) = self.session_title_payload(entry) {
+            if replayed {
+                self.inner
+                    .replay_accumulator
+                    .lock()
+                    .titles
+                    .insert(title.session_id.clone(), title);
+            } else {
+                self.inner.emit(EVT_TITLE, &title);
+            }
+        }
 
         // 4. Feed the supervision reducer. Pull the subagent base fields out of
         //    the payload (hooks put `agent_id` / `agent_type` in stdin inside
@@ -863,7 +897,9 @@ impl AgentBridge {
             .payload
             .get("notification_type")
             .and_then(|v| v.as_str());
-        let previous_status = session_id.map(|sid| self.with_supervisor(|s| s.status(sid)));
+        let previous_status = (!replayed)
+            .then(|| session_id.map(|sid| self.with_supervisor(|s| s.status(sid))))
+            .flatten();
 
         // Structured provider lifecycle events carry the exact tmux binding.
         // Feed that binding into the existing session-to-terminal authority so
@@ -872,6 +908,13 @@ impl AgentBridge {
             if let (Some(sid), Some(status_bridge)) = (session_id, self.inner.status.lock().clone())
             {
                 status_bridge.ingest(sid, &entry.payload, entry.timestamp_ms);
+                if replayed {
+                    self.inner
+                        .replay_accumulator
+                        .lock()
+                        .status_sessions
+                        .insert(sid.to_string());
+                }
             }
         }
 
@@ -886,6 +929,27 @@ impl AgentBridge {
                 Some(&entry.payload),
             )
         });
+
+        if replayed {
+            if let Some(session_id) = affected.as_deref().or(session_id) {
+                self.inner
+                    .replay_accumulator
+                    .lock()
+                    .sessions
+                    .insert(session_id.to_string());
+            }
+            if matches!(
+                entry.event_type,
+                t_hub_protocol::JournalEventType::SessionEnd
+            ) {
+                if let (Some(sid), Some(status_bridge)) =
+                    (session_id, self.inner.status.lock().clone())
+                {
+                    status_bridge.evict(sid);
+                }
+            }
+            return affected;
+        }
 
         // Emit the committed journal entry only after its exact reducer result
         // is known. Voice consumes this correlated authority instead of racing a
@@ -988,42 +1052,37 @@ impl AgentBridge {
     /// `agent://title` for the session (GOAL NAMES). No-op for entries that carry
     /// no usable title signal, or that have no session id. Best-effort + behind
     /// the optional emitter, like every other emit on this path.
-    fn emit_session_title(&self, entry: &EventJournalEntry) {
+    fn session_title_payload(&self, entry: &EventJournalEntry) -> Option<SessionTitlePayload> {
         let session_id = entry
             .entity_id
             .as_deref()
             .or_else(|| entry.payload.get("session_id").and_then(|v| v.as_str()));
-        let Some(sid) = session_id else { return };
-        let Some(title) = derive_session_title(entry.event_type, &entry.payload) else {
-            return;
-        };
+        let sid = session_id?;
+        let title = derive_session_title(entry.event_type, &entry.payload)?;
         let cwd = entry
             .payload
             .get("cwd")
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned());
-        self.inner.emit(
-            EVT_TITLE,
-            &SessionTitlePayload {
-                session_id: sid.to_string(),
-                cwd,
-                title,
-            },
-        );
+        Some(SessionTitlePayload {
+            session_id: sid.to_string(),
+            cwd,
+            title,
+        })
     }
 
     /// Route a `StatusSnapshot` journal entry into the status bridge (if wired)
     /// and emit `status://snapshot`. The payload carries the raw statusline JSON
     /// (the hook/agent put it there); we ingest it under the entry's session id.
-    fn ingest_status_from_journal(&self, entry: &EventJournalEntry) {
+    fn ingest_status_from_journal(&self, entry: &EventJournalEntry, emit: bool) -> Option<String> {
         let Some(status_bridge) = self.inner.status.lock().clone() else {
-            return; // no status bridge wired (pre-setup / tests)
+            return None; // no status bridge wired (pre-setup / tests)
         };
         let session_id = entry
             .entity_id
             .as_deref()
             .or_else(|| entry.payload.get("session_id").and_then(|v| v.as_str()));
-        let Some(sid) = session_id else { return };
+        let sid = session_id?;
         // The raw statusline lives under `payload.status` when the agent wraps it;
         // fall back to the whole payload for forward-compat.
         let raw = entry.payload.get("status").unwrap_or(&entry.payload);
@@ -1036,8 +1095,36 @@ impl AgentBridge {
         // just skip the redundant emit.
         let prev = status_bridge.get(sid);
         let snap = status_bridge.ingest(sid, raw, entry.timestamp_ms);
-        if prev.as_ref().is_none_or(|p| !p.same_status(&snap)) {
+        if emit && prev.as_ref().is_none_or(|p| !p.same_status(&snap)) {
             self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
+        }
+        Some(sid.to_string())
+    }
+
+    /// Publish one bounded summary after a cold journal replay.
+    ///
+    /// The reducer and status bridge consume every durable entry so authority is
+    /// reconstructed exactly, but forwarding each historical transition into
+    /// the webview can produce hundreds of thousands of events. Replay therefore
+    /// records only the latest title/status and the affected session ids, then
+    /// flushes one final snapshot of each after ReplayComplete.
+    fn flush_replay(&self) {
+        let replay = std::mem::take(&mut *self.inner.replay_accumulator.lock());
+
+        for title in replay.titles.into_values() {
+            self.inner.emit(EVT_TITLE, &title);
+        }
+
+        if let Some(status_bridge) = self.inner.status.lock().clone() {
+            for session_id in replay.status_sessions {
+                if let Some(snapshot) = status_bridge.get(&session_id) {
+                    self.inner.emit(EVT_STATUS_SNAPSHOT, &snapshot);
+                }
+            }
+        }
+
+        for session_id in replay.sessions {
+            self.emit_session(&session_id);
         }
     }
 }
@@ -1612,6 +1699,7 @@ mod tests {
             &entry(2, "o1", None, JournalEventType::Elicitation),
             false,
         );
+        bridge.flush_replay();
 
         let journal_flags = rec
             .events
@@ -1622,8 +1710,118 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             journal_flags,
-            vec![true, false],
-            "a live tail frame interleaved before ReplayComplete stays live"
+            vec![false],
+            "historical replay stays silent while an interleaved live frame stays live"
+        );
+    }
+
+    #[test]
+    fn cold_replay_coalesces_large_history_into_bounded_session_snapshots() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status));
+        rec.events.lock().clear();
+
+        let mut seq = 0;
+        for iteration in 0..2_000 {
+            seq += 1;
+            bridge.consume_journal_entry_with_provenance(
+                &EventJournalEntry {
+                    seq,
+                    timestamp_ms: seq,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "cwd": "/workspace/project",
+                        "prompt": format!("Replay prompt {iteration}")
+                    }),
+                    result: None,
+                },
+                true,
+            );
+            seq += 1;
+            bridge.consume_journal_entry_with_provenance(
+                &EventJournalEntry {
+                    seq,
+                    timestamp_ms: seq,
+                    source: JournalSource::Status,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::StatusSnapshot,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "status": {
+                            "context_window": {
+                                "used_percentage": iteration as f64 / 20.0
+                            }
+                        }
+                    }),
+                    result: None,
+                },
+                true,
+            );
+        }
+
+        assert!(
+            rec.events.lock().is_empty(),
+            "historical replay must not emit per-entry UI events"
+        );
+        assert_eq!(bridge.journal_cursor(), 4_000);
+
+        bridge.flush_replay();
+        let events = rec.events.lock().clone();
+        let channels = events
+            .iter()
+            .map(|(channel, _)| channel.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_TITLE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_STATUS_SNAPSHOT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_SESSION_STATUS)
+                .count(),
+            1
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_JOURNAL)
+                .count(),
+            0
+        );
+        assert!(
+            events.len() <= 4,
+            "4,000 replay entries must coalesce to at most four UI events, got {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|(channel, _)| channel == super::EVT_TITLE)
+                .unwrap()
+                .1["title"],
+            "Replay prompt 1999"
+        );
+        assert_eq!(
+            status.get("session-1").unwrap().context_used_pct,
+            Some(99.95)
         );
     }
 
