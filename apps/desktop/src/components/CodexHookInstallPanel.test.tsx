@@ -248,4 +248,16 @@ describe("CodexHookInstallPanel", () => {
       screen.queryByText("Enable the handlers in Codex"),
     ).toBeNull();
   });
+
+  it("warns that preserved inline hooks can duplicate voice events", async () => {
+    vi.mocked(codexHooksHealth).mockResolvedValue(
+      health("healthy", { inlineUserHooksPresent: true }),
+    );
+
+    render(<CodexHookInstallPanel agentBin="t-hub-agent" />);
+
+    expect(await screen.findByText("Review legacy inline hooks")).not.toBeNull();
+    expect(screen.getByText(/duplicate status and voice events/)).not.toBeNull();
+    expect(screen.getByText("~/.codex/config.toml")).not.toBeNull();
+  });
 });

@@ -238,6 +238,16 @@ export function CodexHookInstallPanel({
         </Notice>
       )}
 
+      {health?.inlineUserHooksPresent && (
+        <Notice tone="warn" title="Review legacy inline hooks">
+          Codex also found lifecycle hooks in <code>~/.codex/config.toml</code>.
+          T-Hub preserves them, but redundant handlers can produce duplicate status
+          and voice events. After the T-Hub entries are healthy, use{" "}
+          <code>/hooks</code> to identify and migrate only the redundant inline
+          handlers.
+        </Notice>
+      )}
+
       {health?.managedOnlyPolicy && (
         <Notice tone="bad" title="Organization policy blocks user hooks">
           This Codex installation accepts only centrally managed hooks. Ask your
