@@ -298,10 +298,13 @@ pub struct TmuxError {
 }
 
 impl TmuxError {
-    /// True when a bounded subprocess observation timed out before it could
-    /// produce authoritative evidence.
-    pub fn is_retryable_timeout(&self) -> bool {
-        self.io_kind == Some(std::io::ErrorKind::TimedOut)
+    /// True when a bounded subprocess observation could not produce
+    /// authoritative evidence.
+    pub fn is_retryable_observation(&self) -> bool {
+        matches!(
+            self.io_kind,
+            Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+        )
     }
 }
 
@@ -2487,7 +2490,7 @@ pub(crate) fn retire_managed_runtime(
             return Err(TmuxError {
                 op: "retire-managed-runtime",
                 code: None,
-                io_kind: None,
+                io_kind: Some(std::io::ErrorKind::WouldBlock),
                 message: "tmux generation liveness is indeterminate before retirement".into(),
             });
         }

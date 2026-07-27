@@ -26,7 +26,7 @@ import { listen } from "@tauri-apps/api/event";
 import { isSatelliteWindow, useWorkspace } from "../store/workspace";
 import { useCaptain, type CaptainClaimRecord, type CrewRef } from "../store/captain";
 import { notify } from "../lib/notify";
-import { controlRequest } from "./controlClient";
+import { controlRequest, isRetryableControlError } from "./controlClient";
 import type { TabReport, TabReportResult } from "./types";
 
 /** Exact Tauri event the backend control listener emits to apply a UI mutation. */
@@ -433,7 +433,9 @@ export async function bootstrapWorkspaceTabs(
     return adoptAuthoritativeTabs(reconcileTabs(serverTabs));
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
-    surfaceLayoutSyncFailure(error);
+    if (!isRetryableControlError(error)) {
+      surfaceLayoutSyncFailure(error);
+    }
     return false;
   }
 }

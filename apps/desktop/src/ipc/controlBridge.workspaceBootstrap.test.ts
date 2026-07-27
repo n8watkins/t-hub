@@ -1,16 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { controlRequest, invoke } = vi.hoisted(() => ({
+const { controlRequest, invoke, notify } = vi.hoisted(() => ({
   controlRequest: vi.fn(),
   invoke: vi.fn(),
+  notify: vi.fn(),
 }));
 
 vi.mock("./controlClient", () => ({
   controlRequest,
+  isRetryableControlError: (reason: unknown) =>
+    typeof reason === "object" &&
+    reason !== null &&
+    "retryable" in reason &&
+    reason.retryable === true,
   onControlEvent: () => () => {},
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("../lib/notify", () => ({ notify }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
 }));
@@ -40,6 +47,7 @@ function seed(tabs: WorkspaceTab[]): void {
 beforeEach(() => {
   controlRequest.mockReset();
   invoke.mockReset();
+  notify.mockReset();
   invoke.mockImplementation((command: string) => {
     if (command === "list_terminals") {
       return Promise.resolve(
@@ -57,6 +65,40 @@ beforeEach(() => {
 });
 
 describe("workspace registry bootstrap", () => {
+  it("silently retries while startup reconciliation is pending", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    controlRequest.mockRejectedValue({
+      message: "workspace startup reconciliation is still pending",
+      retryable: true,
+    });
+
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
+
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("reports definitive startup synchronization failures", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    controlRequest.mockRejectedValue({
+      message: "workspace registry is corrupt",
+      retryable: false,
+    });
+
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
+
+    expect(notify).toHaveBeenCalledWith(
+      "error",
+      "Workspace sync failed",
+      "Your local layout is still available. Restart T-Hub to retry synchronization.",
+    );
+  });
+
   it("repairs a Captain-only server snapshot from the local work layout", async () => {
     seed([
       { id: "work-1", name: "Workspace 1", order: ["term-1"] },

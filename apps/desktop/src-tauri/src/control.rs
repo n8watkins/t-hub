@@ -182,7 +182,7 @@ fn is_retryable_error(message: &str) -> bool {
 }
 
 fn cortana_tmux_observation_error(context: &str, error: crate::tmux::TmuxError) -> String {
-    let retryable = error.is_retryable_timeout();
+    let retryable = error.is_retryable_observation();
     let message = format!("{context}: {error}");
     if retryable {
         retryable_error(message)
@@ -9317,9 +9317,13 @@ fn cleanup_cortana_managed_launch(
 ) -> Result<(), String> {
     match owner {
         Some(owner) => tmux::retire_managed_runtime(&launch.tmux_target, owner)
-            .map_err(|error| format!("exact observed owner cleanup failed: {error}"))?,
+            .map_err(|error| {
+                cortana_tmux_observation_error("exact observed owner cleanup failed", error)
+            })?,
         None => tmux::retire_prepared_managed_runtime(&tmux_cortana_launch(launch))
-            .map_err(|error| format!("exact prepared owner cleanup failed: {error}"))?,
+            .map_err(|error| {
+                cortana_tmux_observation_error("exact prepared owner cleanup failed", error)
+            })?,
     }
     ctx.captains.clear_prepared_cortana_managed_launch(launch)?;
     Ok(())
@@ -10050,7 +10054,12 @@ fn revalidate_unresolved_cortana_attestation(
         |error| cortana_tmux_observation_error("unresolved Cortana managed owner changed", error),
     )?;
     let bearer = tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV)
-        .map_err(|error| format!("unresolved Cortana bearer inspection failed: {error}"))?
+        .map_err(|error| {
+            cortana_tmux_observation_error(
+                "unresolved Cortana bearer inspection failed",
+                error,
+            )
+        })?
         .filter(|bearer| !bearer.is_empty())
         .ok_or("unresolved Cortana runtime has no retained session bearer")?;
     let observed = crate::harness::observe_scoped_harness_process(
@@ -11126,9 +11135,15 @@ fn reconcile_cortana_inner(
                             &tmux_target(terminal_id),
                             &tmux_cortana_owner(&owner),
                         ) {
-                            let reason = format!(
-                                "managed owner for gone terminal '{terminal_id}' remains populated or unverifiable: {error}"
+                            let reason = cortana_tmux_observation_error(
+                                &format!(
+                                    "managed owner for gone terminal '{terminal_id}' remains populated or unverifiable"
+                                ),
+                                error,
                             );
+                            if is_retryable_error(&reason) {
+                                return Err(reason);
+                            }
                             ctx.captains.mark_cortana_degraded(operation_id, &reason)?;
                             return Err(format!("reconcile_cortana: {reason}"));
                         }
@@ -11804,9 +11819,12 @@ fn reconcile_cortana_inner(
                 &tmux_cortana_owner(owner),
             )
             .map_err(|error| {
-                format!(
-                    "reconcile_cortana: failed managed runtime '{}' could not be retired: {error}",
-                    candidate.terminal_id
+                cortana_tmux_observation_error(
+                    &format!(
+                        "reconcile_cortana: failed managed runtime '{}' could not be retired",
+                        candidate.terminal_id
+                    ),
+                    error,
                 )
             })?;
             ctx.tabs.retire_tile_locked(&candidate.terminal_id);

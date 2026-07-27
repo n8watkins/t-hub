@@ -1458,6 +1458,18 @@ fn cortana_inconclusive_observations_never_enter_quarantine_branch() {
     let timeout_response = ControlResponse::err(timeout_error);
     assert!(timeout_response.retryable);
 
+    let indeterminate = crate::tmux::TmuxError {
+        op: "retire-managed-runtime",
+        code: None,
+        io_kind: Some(std::io::ErrorKind::WouldBlock),
+        message: "tmux generation liveness is indeterminate before retirement".into(),
+    };
+    let indeterminate_error = cortana_tmux_observation_error(
+        "managed owner for gone terminal remains populated or unverifiable",
+        indeterminate,
+    );
+    assert!(is_retryable_error(&indeterminate_error));
+
     let unreadable_error = cortana_harness_observation_error(
         "active Cortana Harness attestation failed",
         crate::harness::LaunchAttestationError::UnreadableEvidence,
