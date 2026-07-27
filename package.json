@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "pnpm --filter t-hub-desktop dev",
     "build": "pnpm --filter t-hub-desktop build",
+    "test": "bash scripts/ci/local-test.sh fast",
+    "test:fast": "bash scripts/ci/local-test.sh fast",
+    "test:full": "bash scripts/ci/local-test.sh full",
     "typecheck": "pnpm --filter t-hub-desktop typecheck",
     "tauri": "pnpm --filter t-hub-desktop tauri"
   }

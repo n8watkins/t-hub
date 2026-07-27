@@ -8,6 +8,7 @@
     "dev": "vite",
     "dev:browser-test": "vite --host 127.0.0.1 --port 4180",
     "build": "tsc --noEmit && vite build",
+    "build:bundle": "vite build",
     "build:release": "pnpm prepare:agent-resource && pnpm build",
     "prepare:agent-resource": "node scripts/prepare-agent-resource.mjs",
     "preview": "vite preview",

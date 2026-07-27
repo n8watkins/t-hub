@@ -142,7 +142,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   frontend:
-    name: Frontend (vitest + tsc)
+    name: Frontend (vitest + bundle)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -169,18 +169,10 @@ jobs:
       - name: vitest run
         run: pnpm --filter t-hub-desktop test
 
-      - name: Install Playwright Chromium
-        run: pnpm --filter t-hub-desktop exec playwright install --with-deps chromium
-
-      # Runs the real Chromium suite, including the responsive Package 2 header
-      # matrix. The package script owns Vite startup and teardown.
-      - name: Playwright browser suite
-        run: pnpm --filter t-hub-desktop test:browser
-
-      # Compile the actual production bundle as well as checking TypeScript.
+      # Compile the production bundle without running TypeScript a second time.
       # This catches Vite import, asset, and bundling failures that jsdom does not.
       - name: Production frontend build
-        run: pnpm build
+        run: pnpm --filter t-hub-desktop build:bundle
 
       - name: Desktop version contract
         run: bash apps/desktop/scripts/check-version.sh --history
@@ -188,8 +180,38 @@ jobs:
       - name: Packaged runtime benchmark contract
         run: bash scripts/perf/perf-benchmark.test.sh
 
+      - name: Local test profile contract
+        run: bash scripts/ci/local-test.test.sh
+
       - name: GitHub Actions pinning contract
         run: bash scripts/ci/workflow-actions.test.sh
+
+  frontend-browser:
+    name: Frontend browser (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter t-hub-desktop exec playwright install --with-deps chromium
+
+      # Runs the real Chromium suite, including the responsive Package 2 header
+      # matrix. The package script owns Vite startup and teardown.
+      - name: Playwright browser suite
+        run: pnpm --filter t-hub-desktop test:browser
 
   package5-windows-contracts:
     name: Package 5 Windows contracts
