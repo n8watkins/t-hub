@@ -176,17 +176,19 @@ export function loadAcknowledgedWorkspaceSnapshot():
     const value = JSON.parse(
       localStorage.getItem(WORKSPACE_REGISTRY_BASELINE_KEY) ?? "",
     ) as Partial<AcknowledgedWorkspaceSnapshot>;
+    const seq = value.seq;
     if (
       value.version !== 1 ||
-      !Number.isSafeInteger(value.seq) ||
-      (value.seq ?? -1) < 0 ||
+      typeof seq !== "number" ||
+      !Number.isSafeInteger(seq) ||
+      seq < 0 ||
       !validAcknowledgedTabs(value.tabs)
     ) {
       return undefined;
     }
     return {
       version: 1,
-      seq: value.seq,
+      seq,
       tabs: value.tabs.map((tab) => ({ ...tab, tileIds: [...tab.tileIds] })),
     };
   } catch {
