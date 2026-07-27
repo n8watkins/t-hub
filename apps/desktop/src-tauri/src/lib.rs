@@ -1172,6 +1172,7 @@ mod control_start_tests {
                     Err(crate::tmux::TmuxError {
                         op: "list-sessions",
                         code: None,
+                        io_kind: None,
                         message: "WSL unavailable".into(),
                     })
                 } else {
