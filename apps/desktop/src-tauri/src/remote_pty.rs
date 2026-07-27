@@ -533,7 +533,7 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(8);
 /// Flush a pending batch the moment it reaches this many DECODED bytes, so a
 /// firehose stays responsive (and memory bounded) even within one window.
 const MAX_BATCH_BYTES: usize = 256 * 1024;
-/// Minimum spacing between terminal-output events across the whole process.
+/// Reservation period for terminal-output events across the whole process.
 ///
 /// `AppHandle::emit` queues work onto the Windows host event loop without
 /// backpressure. A continuous PTY firehose could therefore enqueue roughly 100
