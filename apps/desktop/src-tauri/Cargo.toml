@@ -193,6 +193,28 @@ t-hub-mcp = { path = "crates/t-hub-mcp" }
 tempfile = "3"
 libc = "0.2"
 
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = "none"
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test.package."*"]
+debug = "none"
+
+[profile.full-debug]
+inherits = "dev"
+debug = "full"
+incremental = false
+
+[profile.full-debug.package."*"]
+debug = "full"
+
 [profile.release]
 codegen-units = 1
 lto = true
