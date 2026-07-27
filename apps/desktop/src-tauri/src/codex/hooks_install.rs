@@ -132,7 +132,7 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
         Ok(RuntimePaths {
             codex_home,
             requirements_path: requirements_path(),
-            agent_bin: PathBuf::from(agent_bin),
+            agent_bin: resolve_unix_agent_bin(agent_bin),
             hooks_state_path,
         })
     }
@@ -149,6 +149,55 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
             hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
         })
     }
+}
+
+#[cfg(unix)]
+fn resolve_unix_agent_bin(agent_bin: &str) -> PathBuf {
+    resolve_unix_agent_bin_from(
+        agent_bin,
+        std::env::var_os("PATH").as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+#[cfg(unix)]
+fn resolve_unix_agent_bin_from(
+    agent_bin: &str,
+    search_path: Option<&std::ffi::OsStr>,
+    current_dir: Option<&Path>,
+) -> PathBuf {
+    let supplied = PathBuf::from(agent_bin);
+    if supplied.is_absolute() {
+        return supplied;
+    }
+
+    if supplied.components().count() > 1 {
+        if let Some(current_dir) = current_dir {
+            let candidate = current_dir.join(&supplied);
+            if executable_ok(&candidate) {
+                return candidate;
+            }
+        }
+        return supplied;
+    }
+
+    let Some(search_path) = search_path else {
+        return supplied;
+    };
+    for directory in std::env::split_paths(search_path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else if let Some(current_dir) = current_dir {
+            current_dir.join(directory)
+        } else {
+            continue;
+        };
+        let candidate = directory.join(&supplied);
+        if executable_ok(&candidate) {
+            return candidate;
+        }
+    }
+    supplied
 }
 
 #[cfg(any(windows, test))]
@@ -1187,6 +1236,26 @@ mod tests {
         assert!(!health.agent_capable);
         assert_eq!(health.agent_version, None);
         assert!(install(&home, &requirements, &agent, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_runtime_agent_path_resolves_from_path_without_blocking_cleanup_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("work");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let agent = executable(temp.path());
+        let search_path = std::env::join_paths([bin_dir]).unwrap();
+
+        assert_eq!(
+            resolve_unix_agent_bin_from("t-hub-agent", Some(&search_path), Some(&working_dir)),
+            agent
+        );
+        assert_eq!(
+            resolve_unix_agent_bin_from("missing-agent", Some(&search_path), Some(&working_dir)),
+            PathBuf::from("missing-agent")
+        );
     }
 
     #[test]
