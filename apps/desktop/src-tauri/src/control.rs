@@ -177,6 +177,45 @@ fn retryable_error(message: impl std::fmt::Display) -> String {
     format!("{RETRYABLE_ERROR_MARKER}{message}")
 }
 
+fn is_retryable_error(message: &str) -> bool {
+    message.starts_with(RETRYABLE_ERROR_MARKER)
+}
+
+fn cortana_tmux_observation_error(context: &str, error: crate::tmux::TmuxError) -> String {
+    let retryable = error.is_retryable_timeout();
+    let message = format!("{context}: {error}");
+    if retryable {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn cortana_harness_observation_error(
+    context: &str,
+    error: crate::harness::LaunchAttestationError,
+) -> String {
+    let retryable = error == crate::harness::LaunchAttestationError::UnreadableEvidence;
+    let message = format!("{context}: {error}");
+    if retryable {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+/// Keep an inconclusive Cortana observation outside the destructive quarantine
+/// branch. Definitive mismatches remain available to the caller as the inner
+/// error, while retryable observations return immediately with authority intact.
+fn separate_retryable_cortana_observation<T>(
+    result: Result<T, String>,
+) -> Result<Result<T, String>, String> {
+    match result {
+        Err(error) if is_retryable_error(&error) => Err(error),
+        result => Ok(result),
+    }
+}
+
 impl ControlResponse {
     fn ok(result: Value) -> Self {
         Self {
@@ -8410,7 +8449,10 @@ fn authorize_inflight_cortana_bootstrap(
     }
     tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
         .map_err(|error| {
-            format!("cortana_bootstrap: managed owner revalidation failed: {error}")
+            cortana_tmux_observation_error(
+                "cortana_bootstrap: managed owner revalidation failed",
+                error,
+            )
         })?;
     let expected = launch
         .expected_harness_launch_provenance
@@ -8432,7 +8474,9 @@ fn authorize_inflight_cortana_bootstrap(
         owner.tmux.pane_start_ticks,
         Instant::now() + Duration::from_secs(5),
     )
-    .map_err(|error| format!("cortana_bootstrap: Harness revalidation failed: {error}"))?;
+    .map_err(|error| {
+        cortana_harness_observation_error("cortana_bootstrap: Harness revalidation failed", error)
+    })?;
     if launch
         .harness_process
         .as_ref()
@@ -9665,7 +9709,10 @@ fn observe_cortana_harness_process(
         Instant::now() + Duration::from_secs(2),
     )
     .map_err(|error| {
-        format!("reconcile_cortana: managed Harness process attestation failed: {error}")
+        cortana_harness_observation_error(
+            "reconcile_cortana: managed Harness process attestation failed",
+            error,
+        )
     })
 }
 
@@ -9692,7 +9739,10 @@ fn revalidate_cortana_managed_owner_after_process_observation(
     let _ = ctx;
     tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
         .map_err(|error| {
-            format!("reconcile_cortana: managed launch owner changed after Harness observation: {error}")
+            cortana_tmux_observation_error(
+                "reconcile_cortana: managed launch owner changed after Harness observation",
+                error,
+            )
         })?;
     Ok(CortanaManagedObservationEvidence {
         process,
@@ -9857,7 +9907,10 @@ fn attest_cortana_managed_harness(
         .ok_or("reconcile_cortana: Harness attestation lost its managed owner")?;
     tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
         .map_err(|error| {
-            format!("reconcile_cortana: managed launch owner is unverifiable: {error}")
+            cortana_tmux_observation_error(
+                "reconcile_cortana: managed launch owner is unverifiable",
+                error,
+            )
         })?;
     let mut current = durable.clone();
     if launch.harness_process.is_none() {
@@ -9943,8 +9996,9 @@ fn revalidate_active_cortana_authority(
         })
         .ok_or("active Cortana identity binding changed")?;
     let target = tmux_target(terminal_id);
-    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
-        .map_err(|error| format!("active Cortana managed owner changed: {error}"))?;
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
+        |error| cortana_tmux_observation_error("active Cortana managed owner changed", error),
+    )?;
     let observed = crate::harness::observe_scoped_harness_process(
         &target,
         harness,
@@ -9955,7 +10009,9 @@ fn revalidate_active_cortana_authority(
         owner.tmux.pane_start_ticks,
         Instant::now() + Duration::from_secs(1),
     )
-    .map_err(|error| format!("active Cortana Harness attestation failed: {error}"))?;
+    .map_err(|error| {
+        cortana_harness_observation_error("active Cortana Harness attestation failed", error)
+    })?;
     if observed == attestation.process {
         Ok(())
     } else {
@@ -9990,8 +10046,9 @@ fn revalidate_unresolved_cortana_attestation(
         return Err("unresolved Cortana Harness attestation is structurally invalid".into());
     }
     let target = tmux_target(terminal_id);
-    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
-        .map_err(|error| format!("unresolved Cortana managed owner changed: {error}"))?;
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
+        |error| cortana_tmux_observation_error("unresolved Cortana managed owner changed", error),
+    )?;
     let bearer = tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV)
         .map_err(|error| format!("unresolved Cortana bearer inspection failed: {error}"))?
         .filter(|bearer| !bearer.is_empty())
@@ -10006,7 +10063,9 @@ fn revalidate_unresolved_cortana_attestation(
         owner.tmux.pane_start_ticks,
         Instant::now() + Duration::from_secs(1),
     )
-    .map_err(|error| format!("unresolved Cortana Harness attestation failed: {error}"))?;
+    .map_err(|error| {
+        cortana_harness_observation_error("unresolved Cortana Harness attestation failed", error)
+    })?;
     if observed == attestation.process {
         Ok(())
     } else {
@@ -10049,8 +10108,9 @@ fn observe_live_cortana_with_expected_provenance(
         })
         .ok_or("live Cortana identity binding changed")?;
     let target = tmux_target(terminal_id);
-    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
-        .map_err(|error| format!("live Cortana managed owner changed: {error}"))?;
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
+        |error| cortana_tmux_observation_error("live Cortana managed owner changed", error),
+    )?;
     crate::harness::observe_scoped_harness_process(
         &target,
         harness,
@@ -10061,7 +10121,9 @@ fn observe_live_cortana_with_expected_provenance(
         owner.tmux.pane_start_ticks,
         deadline,
     )
-    .map_err(|error| format!("live Cortana Harness attestation failed: {error}"))
+    .map_err(|error| {
+        cortana_harness_observation_error("live Cortana Harness attestation failed", error)
+    })
 }
 
 fn finalize_cortana_active_attestation_recovery_observation(
@@ -10493,6 +10555,9 @@ fn reconcile_cortana_with_transition_count(
             Some(CORTANA_SPAWN_ADMISSION_REQUIRED)
         ) {
             if let Err(error) = &result {
+                if is_retryable_error(error) {
+                    return result;
+                }
                 let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
             }
             return result;
@@ -10533,6 +10598,9 @@ fn reconcile_cortana_with_transition_count(
         );
     }
     if let Err(error) = &result {
+        if is_retryable_error(error) {
+            return result;
+        }
         let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
     }
     result
@@ -11154,8 +11222,9 @@ fn reconcile_cortana_inner(
                 &tmux_cortana_owner(&basis.owner),
             )
             .map_err(|error| {
-                format!(
-                    "reconcile_cortana: prepared managed incumbent owner changed after WAL: {error}"
+                cortana_tmux_observation_error(
+                    "reconcile_cortana: prepared managed incumbent owner changed after WAL",
+                    error,
                 )
             })?;
             revalidate_unresolved_cortana_attestation(&durable)?;
@@ -11434,7 +11503,10 @@ fn reconcile_cortana_inner(
                 &tmux_cortana_owner(owner),
             )
             .map_err(|error| {
-                format!("reconcile_cortana: replacement owner could not be revalidated: {error}")
+                cortana_tmux_observation_error(
+                    "reconcile_cortana: replacement owner could not be revalidated",
+                    error,
+                )
             })?;
             claim_cortana_runtime(ctx, candidate)?;
             let identity_id = candidate
@@ -11539,7 +11611,7 @@ fn reconcile_cortana_inner(
                     .and_then(|observed| observed.active_result.as_ref())
                     .ok_or(CORTANA_ATTESTATION_REQUIRED)?
                     .clone();
-                match active_result {
+                match separate_retryable_cortana_observation(active_result)? {
                     Ok(()) => {
                         let committed =
                             ctx.captains.complete_cortana_keep(operation_id, &durable)?;
@@ -11573,7 +11645,7 @@ fn reconcile_cortana_inner(
                 .and_then(|observed| observed.legacy_result.as_ref())
                 .ok_or(CORTANA_ATTESTATION_REQUIRED)?
                 .clone();
-            match attestation {
+            match separate_retryable_cortana_observation(attestation)? {
                 Ok((expected_launch_provenance, process)) => {
                     let recovery =
                         crate::cortana_reconcile::CortanaActiveHarnessAttestationRecovery {

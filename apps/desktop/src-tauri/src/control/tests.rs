@@ -1440,6 +1440,48 @@ fn low1_retryable_errors_carry_a_structured_flag_not_prose() {
 }
 
 #[test]
+fn cortana_inconclusive_observations_never_enter_quarantine_branch() {
+    let timeout = crate::tmux::TmuxError {
+        op: "trusted-python",
+        code: None,
+        io_kind: Some(std::io::ErrorKind::TimedOut),
+        message: "bounded WSL observation timed out".into(),
+    };
+    let timeout_error =
+        cortana_tmux_observation_error("active Cortana managed owner changed", timeout);
+    assert!(is_retryable_error(&timeout_error));
+    assert_eq!(
+        separate_retryable_cortana_observation::<()>(Err(timeout_error.clone())),
+        Err(timeout_error.clone()),
+        "a WSL/tmux timeout must return before authority revocation"
+    );
+    let timeout_response = ControlResponse::err(timeout_error);
+    assert!(timeout_response.retryable);
+
+    let unreadable_error = cortana_harness_observation_error(
+        "active Cortana Harness attestation failed",
+        crate::harness::LaunchAttestationError::UnreadableEvidence,
+    );
+    assert!(is_retryable_error(&unreadable_error));
+    assert_eq!(
+        separate_retryable_cortana_observation::<()>(Err(unreadable_error.clone())),
+        Err(unreadable_error),
+        "temporarily unreadable process evidence must return before quarantine"
+    );
+
+    let definitive = cortana_harness_observation_error(
+        "active Cortana Harness attestation failed",
+        crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch,
+    );
+    assert!(!is_retryable_error(&definitive));
+    assert_eq!(
+        separate_retryable_cortana_observation::<()>(Err(definitive.clone())),
+        Ok(Err(definitive)),
+        "positive mismatch evidence must remain available to quarantine"
+    );
+}
+
+#[test]
 fn git_init_recovery_errors_are_structured_on_the_control_wire() {
     let response = ControlResponse::err(
             "git_init_recovery code=git_init_recovery operation=git-init-123 phase=recovery_blocked message=ownership marker changed",
@@ -17908,7 +17950,11 @@ fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
         crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
     ));
     let terminal_id = active.terminal_id.clone().unwrap();
+    let identity_id = active.identity_id.clone().unwrap();
+    let generation = active.generation;
+    let quarantine_ledger = active.quarantine_ledger.clone();
     let owner = active.owner.clone().unwrap();
+    let sessions_before = tmux::list_sessions().unwrap();
 
     // Keep this retry observation-only after an uncertain result. That
     // makes the elapsed bound measure the shared observation deadline,
@@ -17944,7 +17990,10 @@ fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
 
     let (result, elapsed) = worker.join().unwrap();
     let error = result.unwrap_err();
-    assert!(!error.trim().is_empty());
+    assert!(
+        is_retryable_error(&error),
+        "an inconclusive ancestry observation must be retryable: {error:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(3),
         "one-second aggregate observation deadline took {elapsed:?}"
@@ -17952,6 +18001,30 @@ fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
     assert!(
         ctx.dispatch_admission.try_lock().is_ok(),
         "dispatch admission remained unavailable after observation timeout"
+    );
+    let retained = ctx.captains.cortana_identity();
+    assert_eq!(retained.identity_id.as_deref(), Some(identity_id.as_str()));
+    assert_eq!(retained.terminal_id.as_deref(), Some(terminal_id.as_str()));
+    assert_eq!(retained.generation, generation);
+    assert_eq!(retained.quarantine_ledger, quarantine_ledger);
+    assert!(ctx.captains.snapshot().captains.iter().any(|captain| {
+        captain.role == FleetRole::Cortana
+            && captain.state == ClaimState::Active
+            && captain.terminal_id.as_deref() == Some(terminal_id.as_str())
+    }));
+    let retained_identity = ctx.identity.get(&identity_id).unwrap();
+    assert_eq!(
+        retained_identity.session_tile.as_deref(),
+        Some(terminal_id.as_str())
+    );
+    assert_eq!(
+        tmux::session_liveness(&tmux_target(&terminal_id)),
+        tmux::SessionLiveness::Alive
+    );
+    assert_eq!(
+        tmux::list_sessions().unwrap(),
+        sessions_before,
+        "a transient observation must not spawn a replacement Cortana"
     );
 
     tmux::retire_managed_runtime(&tmux_target(&terminal_id), &tmux_cortana_owner(&owner)).unwrap();
