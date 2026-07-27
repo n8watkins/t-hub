@@ -52,6 +52,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{atomic::AtomicU64, mpsc::Sender, Arc},
+    thread::JoinHandle,
 };
 
 use parking_lot::Mutex;
@@ -150,6 +151,10 @@ impl ReaderJournalFlow {
             }
             ReaderJournalState::Live | ReaderJournalState::Cancelled => false,
         }
+    }
+
+    pub(crate) fn retire(&self) {
+        *self.state.lock() = ReaderJournalState::Cancelled;
     }
 
     pub(crate) fn fail_protocol(&self, error: String) {
@@ -341,14 +346,22 @@ pub(crate) struct TransportHandles {
     /// The child handle, kept alive so the process isn't reaped.
     #[allow(dead_code)]
     pub(crate) child: Mutex<Child>,
+    pub(crate) journal_flow: Arc<ReaderJournalFlow>,
+    pub(crate) reader: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl TransportHandles {
     pub(crate) fn shutdown(&self) {
+        self.journal_flow.retire();
         self.pending.lock().clear();
-        let mut child = self.child.lock();
-        let _ = child.kill();
-        let _ = child.wait();
+        {
+            let mut child = self.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.lock().take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -449,7 +462,7 @@ pub(crate) fn spawn_reader(
     ready_tx: Sender<Result<Ready, String>>,
     // Sent once when ReplayComplete arrives.
     replay_done_tx: Sender<Result<u64, String>>,
-) {
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("agent-reader".into())
         .spawn(move || {
@@ -537,7 +550,6 @@ pub(crate) fn spawn_reader(
             }
             eprintln!("agent-bridge: reader thread exiting (agent stdout closed)");
         })
-        .expect("failed to spawn agent-reader thread");
 }
 
 // ---------------------------------------------------------------------------

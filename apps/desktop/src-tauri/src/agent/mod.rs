@@ -512,29 +512,37 @@ impl AgentBridge {
         ));
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
-        // Build transport handles (Arc so request() can clone a reference).
-        let handles = Arc::new(TransportHandles {
-            stdin: Mutex::new(child_stdin),
-            pending: Arc::clone(&pending),
-            next_id: Arc::clone(&next_id),
-            child: Mutex::new(child),
-        });
-
         // One-shot channels for the handshake/replay synchronisation.
         let (ready_tx, ready_rx) = mpsc::channel();
         let (replay_done_tx, replay_done_rx) = mpsc::channel::<Result<u64, String>>();
         let journal_flow = ReaderJournalFlow::new();
 
-        // Spawn the reader thread.  It captures a clone of `self` (AgentBridge
-        // is Clone/Arc-backed) so it can call consume_journal_entry.
-        spawn_reader(
+        let reader = match spawn_reader(
             child_stdout,
             Arc::clone(&pending),
             self.clone(),
             Arc::clone(&journal_flow),
             ready_tx,
             replay_done_tx,
-        );
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_state(ConnectionState::Failed);
+                return Err(format!("failed to spawn agent reader: {error}"));
+            }
+        };
+
+        // Build transport handles (Arc so request() can clone a reference).
+        let handles = Arc::new(TransportHandles {
+            stdin: Mutex::new(child_stdin),
+            pending: Arc::clone(&pending),
+            next_id: Arc::clone(&next_id),
+            child: Mutex::new(child),
+            journal_flow: Arc::clone(&journal_flow),
+            reader: Mutex::new(Some(reader)),
+        });
 
         // Set state and store transport handles.
         self.set_state(ConnectionState::Handshaking);
@@ -692,20 +700,9 @@ impl AgentBridge {
     ///      `Sender` wakes its blocked `request()` caller right away (its
     ///      `recv_timeout` returns `Err` instead of hanging the full 10 s), so no
     ///      in-flight sender is orphaned waiting on a reply that can never come.
-    ///   3. **Kill the child** (`Child::kill`). Closing its stdout is what makes
-    ///      the detached `agent-reader` thread hit EOF and exit — that's how the
-    ///      old reader thread is reclaimed. `spawn_reader` returns no `JoinHandle`
-    ///      (the thread is detached and self-terminating on EOF), so we cannot
-    ///      `join()` it; killing the child is the deterministic teardown signal.
-    ///      We then `wait()` to reap the zombie.
-    ///
-    /// LIMITATION: the reader thread is detached, so we can't *block* until it has
-    /// fully unwound — we kill the child (its EOF trigger) and rely on it exiting
-    /// promptly. In practice it returns from `BufReader::lines()` the moment stdout
-    /// closes. Because each `connect()` builds a brand-new `pending` map + reader
-    /// thread (nothing is shared with the previous connection), a not-yet-exited
-    /// old reader can only touch its OWN now-empty map — it can't corrupt the new
-    /// connection's state.
+    ///   3. **Retire the reader flow, kill and reap the child, then join the
+    ///      reader thread.** A replacement transport is not published until the
+    ///      old reader can no longer mutate the shared reducer or journal cursor.
     pub fn disconnect(&self) {
         let _lifecycle = self.inner.lifecycle.lock();
         self.disconnect_locked();
@@ -2621,6 +2618,38 @@ while IFS= read -r _; do :; done
 
         assert!(!journal_flow.cancel());
         assert_eq!(bridge.state(), ConnectionState::Live);
+    }
+
+    #[test]
+    fn retired_reader_flow_cannot_mutate_the_shared_bridge() {
+        let bridge = AgentBridge::new();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.complete_without_replay(&bridge);
+        journal_flow.retire();
+
+        journal_flow.ingest(
+            &bridge,
+            1,
+            EventJournalEntry {
+                seq: 1,
+                timestamp_ms: 1,
+                source: JournalSource::Agent,
+                event_id: None,
+                entity_id: Some("session-1".to_string()),
+                event_type: JournalEventType::UserPromptSubmit,
+                payload: serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "Superseded title"
+                }),
+                result: None,
+            },
+            false,
+        );
+
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("session-1"))
+            .is_none());
     }
 
     #[test]
