@@ -947,7 +947,10 @@ mod tests {
 
     #[test]
     fn slow_bounded_commands_get_specific_response_windows_without_widening_normal_reads() {
-        assert_eq!(response_timeout_for_command("list_tabs"), CONTROL_DEADLINE);
+        assert_eq!(
+            response_timeout_for_command("list_tabs"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
         assert_eq!(
             response_timeout_for_command("codex_usage"),
             CONTROL_DEADLINE
