@@ -23,9 +23,7 @@ pub use connection::ConnectionState;
 pub use emit::EventEmitter;
 pub(crate) use install::bundled_agent_path;
 #[cfg(windows)]
-pub(crate) use install::deploy_bundled_agent;
-#[cfg(any(windows, test))]
-pub(crate) use install::{DeployOutcome, DeployedAgent};
+use install::{deploy_bundled_agent, DeployOutcome, DeployedAgent};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -632,7 +630,13 @@ impl AgentBridge {
         let cursor = self.journal_cursor();
         let replayed = journal_head_seq > cursor;
         if replayed {
-            journal_flow.begin_replay(cursor);
+            if let Err(error) = journal_flow.begin_replay(cursor) {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("invalid journal replay start: {error}"),
+                ));
+            }
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
@@ -675,8 +679,12 @@ impl AgentBridge {
                     format!("invalid journal replay: {error}"),
                 ));
             }
-        } else {
-            journal_flow.complete_without_replay(self);
+        } else if let Err(error) = journal_flow.complete_without_replay(self) {
+            return Err(self.fail_connection(
+                &handles,
+                &journal_flow,
+                format!("invalid agent handshake completion: {error}"),
+            ));
         }
 
         Ok(())
@@ -709,6 +717,7 @@ impl AgentBridge {
     }
 
     fn fail_reader_transport(&self, journal_flow: &Arc<ReaderJournalFlow>, error: &str) {
+        journal_flow.retire();
         let handles = {
             let mut transport = self.inner.transport.lock();
             if transport
@@ -724,7 +733,6 @@ impl AgentBridge {
             return;
         };
 
-        handles.journal_flow.retire();
         handles.pending.lock().clear();
         {
             let mut child = handles.child.lock();
@@ -1774,6 +1782,129 @@ while IFS= read -r _; do :; done
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn helper_stdout_close_fails_the_live_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-agent-eof-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("closing-agent");
+        let close_file = temp_dir.join("close");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+while [ ! -e "$T_HUB_TEST_CLOSE_FILE" ]; do sleep 0.01; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let close_file_env = TestEnvVar::set("T_HUB_TEST_CLOSE_FILE", &close_file);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(bridge.state(), ConnectionState::Live);
+
+        std::fs::write(&close_file, b"close").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bridge.state() == ConnectionState::Live && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if has_transport {
+            bridge.disconnect();
+        }
+        drop(pid_file_env);
+        drop(close_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "closed helper process {pid} survived reader teardown"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsolicited_ready_then_exit_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-early-ready-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("early-ready-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        let _connect_result = bridge.connect_with_timeouts(
+            "ignored",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bridge.state() != ConnectionState::Failed && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if has_transport {
+            bridge.disconnect();
+        }
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn replay_only_frame_after_completion_fails_the_live_transport() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2584,7 +2715,7 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(0);
+        journal_flow.begin_replay(0).unwrap();
 
         journal_flow
             .ingest(
@@ -2653,7 +2784,7 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(0);
+        journal_flow.begin_replay(0).unwrap();
 
         journal_flow
             .ingest(
@@ -2725,7 +2856,7 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(0);
+        journal_flow.begin_replay(0).unwrap();
         bridge.set_state(ConnectionState::Replaying);
 
         journal_flow
@@ -2769,7 +2900,7 @@ while IFS= read -r _; do :; done
     fn completed_replay_wins_a_simultaneous_timeout_check() {
         let bridge = AgentBridge::new();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(0);
+        journal_flow.begin_replay(0).unwrap();
 
         journal_flow.observe_replay_boundary(0).unwrap();
         assert_eq!(journal_flow.finish_replay(0), Ok(0));
@@ -2783,7 +2914,7 @@ while IFS= read -r _; do :; done
     fn retired_reader_flow_cannot_mutate_the_shared_bridge() {
         let bridge = AgentBridge::new();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.complete_without_replay(&bridge);
+        journal_flow.complete_without_replay(&bridge).unwrap();
         journal_flow.retire();
 
         journal_flow
@@ -2811,6 +2942,17 @@ while IFS= read -r _; do :; done
         assert!(bridge
             .with_supervisor(|supervisor| supervisor.tree("session-1"))
             .is_none());
+    }
+
+    #[test]
+    fn reader_failure_before_transport_publication_cancels_the_handshake() {
+        let bridge = AgentBridge::new();
+        let journal_flow = ReaderJournalFlow::new();
+        bridge.fail_reader_transport(&journal_flow, "reader exited before publication");
+
+        assert!(journal_flow.complete_without_replay(&bridge).is_err());
+        assert!(journal_flow.begin_replay(0).is_err());
+        assert_eq!(bridge.state(), ConnectionState::Disconnected);
     }
 
     #[test]

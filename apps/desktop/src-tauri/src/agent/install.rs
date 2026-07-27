@@ -337,6 +337,18 @@ mod tests {
         process::{Command, Stdio},
     };
 
+    #[test]
+    fn deployment_result_preserves_outcome_and_verified_path() {
+        for outcome in [DeployOutcome::AlreadyCurrent, DeployOutcome::Installed] {
+            let deployed = DeployedAgent {
+                outcome,
+                wsl_path: "/home/test/.local/lib/t-hub/agents/digest/t-hub-agent".to_string(),
+            };
+            assert_eq!(deployed.outcome, outcome);
+            assert!(deployed.wsl_path.ends_with("/digest/t-hub-agent"));
+        }
+    }
+
     fn fake_elf(payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0_u8; MIN_AGENT_BYTES as usize];
         bytes[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);

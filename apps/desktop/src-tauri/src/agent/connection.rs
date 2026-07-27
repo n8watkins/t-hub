@@ -74,21 +74,12 @@ pub(crate) struct ReaderJournalFlow {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReaderFlowError {
     message: String,
-    live_transport: bool,
 }
 
 impl ReaderFlowError {
-    fn replay(message: impl Into<String>) -> Self {
+    fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            live_transport: false,
-        }
-    }
-
-    fn live(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            live_transport: true,
         }
     }
 }
@@ -120,39 +111,42 @@ impl ReaderJournalFlow {
         })
     }
 
-    pub(crate) fn begin_replay(&self, after_seq: u64) {
+    pub(crate) fn begin_replay(&self, after_seq: u64) -> Result<(), String> {
         let mut state = self.state.lock();
-        if let ReaderJournalState::Buffering(entries) = &mut *state {
-            let entries = std::mem::take(entries);
-            let (replayed, live_entries): (Vec<_>, Vec<_>) =
-                entries.into_iter().partition(|entry| entry.replayed);
-            *state = ReaderJournalState::Replaying {
-                replay_entries: Vec::new(),
-                live_entries,
-                verified_seq: after_seq,
-                boundary_received: false,
-                completion_received: false,
-                protocol_error: None,
-            };
-            for buffered in sorted_entries(replayed) {
-                Self::ingest_replayed(&mut state, buffered.seq, buffered.entry);
-            }
+        let ReaderJournalState::Buffering(entries) = &mut *state else {
+            return Err("replay requested after the reader flow terminated".to_string());
+        };
+        let entries = std::mem::take(entries);
+        let (replayed, live_entries): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|entry| entry.replayed);
+        *state = ReaderJournalState::Replaying {
+            replay_entries: Vec::new(),
+            live_entries,
+            verified_seq: after_seq,
+            boundary_received: false,
+            completion_received: false,
+            protocol_error: None,
+        };
+        for buffered in sorted_entries(replayed) {
+            Self::ingest_replayed(&mut state, buffered.seq, buffered.entry);
         }
+        Ok(())
     }
 
-    pub(crate) fn complete_without_replay(&self, bridge: &AgentBridge) {
+    pub(crate) fn complete_without_replay(&self, bridge: &AgentBridge) -> Result<(), String> {
         let mut state = self.state.lock();
-        let ReaderJournalState::Buffering(entries) =
-            std::mem::replace(&mut *state, ReaderJournalState::Live)
-        else {
-            return;
+        let ReaderJournalState::Buffering(entries) = &mut *state else {
+            return Err("handshake completed after the reader flow terminated".to_string());
         };
+        let entries = std::mem::take(entries);
+        *state = ReaderJournalState::Live;
 
         bridge.flush_replay();
         bridge.set_state(ConnectionState::Live);
         for buffered in sorted_entries(entries) {
             bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
         }
+        Ok(())
     }
 
     pub(crate) fn complete_replay(
@@ -219,24 +213,21 @@ impl ReaderJournalFlow {
         *self.state.lock() = ReaderJournalState::Cancelled;
     }
 
-    pub(crate) fn fail_protocol(&self, error: String) -> bool {
+    pub(crate) fn fail_protocol(&self, error: String) {
         let mut state = self.state.lock();
         match &mut *state {
             ReaderJournalState::Replaying { protocol_error, .. } => {
                 if protocol_error.is_none() {
                     *protocol_error = Some(error);
                 }
-                false
             }
             ReaderJournalState::Buffering(_) => {
                 *state = ReaderJournalState::Cancelled;
-                false
             }
             ReaderJournalState::Live => {
                 *state = ReaderJournalState::Cancelled;
-                true
             }
-            ReaderJournalState::Cancelled => false,
+            ReaderJournalState::Cancelled => {}
         }
     }
 
@@ -272,7 +263,7 @@ impl ReaderJournalFlow {
             ReaderJournalState::Live => {
                 if replayed {
                     *state = ReaderJournalState::Cancelled;
-                    Err(ReaderFlowError::live(
+                    Err(ReaderFlowError::new(
                         "journal replay entry received after replay commit",
                     ))
                 } else {
@@ -289,7 +280,7 @@ impl ReaderJournalFlow {
             return Ok(());
         };
         match protocol_error {
-            Some(error) => Err(ReaderFlowError::replay(error.clone())),
+            Some(error) => Err(ReaderFlowError::new(error.clone())),
             None => Ok(()),
         }
     }
@@ -345,14 +336,14 @@ impl ReaderJournalFlow {
             return match &*state {
                 ReaderJournalState::Live => {
                     *state = ReaderJournalState::Cancelled;
-                    Err(ReaderFlowError::live(
+                    Err(ReaderFlowError::new(
                         "replay boundary received after replay commit",
                     ))
                 }
                 ReaderJournalState::Cancelled => Ok(()),
                 ReaderJournalState::Buffering(_) => {
                     *state = ReaderJournalState::Cancelled;
-                    Err(ReaderFlowError::replay(
+                    Err(ReaderFlowError::new(
                         "replay boundary received outside an active replay",
                     ))
                 }
@@ -388,29 +379,29 @@ impl ReaderJournalFlow {
             return match &*state {
                 ReaderJournalState::Live => {
                     *state = ReaderJournalState::Cancelled;
-                    Err(ReaderFlowError::live(
+                    Err(ReaderFlowError::new(
                         "replay completion received after replay commit",
                     ))
                 }
                 ReaderJournalState::Cancelled | ReaderJournalState::Buffering(_) => Err(
-                    ReaderFlowError::replay("replay completed outside an active replay"),
+                    ReaderFlowError::new("replay completed outside an active replay"),
                 ),
                 ReaderJournalState::Replaying { .. } => unreachable!(),
             };
         };
         if let Some(error) = protocol_error {
-            return Err(ReaderFlowError::replay(error.clone()));
+            return Err(ReaderFlowError::new(error.clone()));
         }
         if !*boundary_received {
-            return Err(ReaderFlowError::replay(
+            return Err(ReaderFlowError::new(
                 "replay completed without a durable boundary",
             ));
         }
         if *completion_received {
-            return Err(ReaderFlowError::replay("duplicate replay completion"));
+            return Err(ReaderFlowError::new("duplicate replay completion"));
         }
         if last_seq != *verified_seq {
-            return Err(ReaderFlowError::replay(format!(
+            return Err(ReaderFlowError::new(format!(
                 "replay completion sequence {last_seq} does not match verified boundary {verified_seq}"
             )));
         }
@@ -592,11 +583,12 @@ pub(crate) fn spawn_reader(
         .name("agent-reader".into())
         .spawn(move || {
             let reader = BufReader::new(child_stdout);
+            let mut exit_error = "agent stdout closed".to_string();
             for line_result in reader.lines() {
                 let line = match line_result {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("agent-bridge: reader I/O error: {e}");
+                        exit_error = format!("agent reader I/O error: {e}");
                         break;
                     }
                 };
@@ -608,12 +600,8 @@ pub(crate) fn spawn_reader(
                     Err(e) => {
                         let error = format!("malformed agent frame: {e} (line={line:?})");
                         eprintln!("agent-bridge: {error}");
-                        let live_transport = journal_flow.fail_protocol(error.clone());
-                        let _ = ready_tx.send(Err(error.clone()));
-                        let _ = replay_done_tx.send(Err(error.clone()));
-                        if live_transport {
-                            bridge.fail_reader_transport(&journal_flow, &error);
-                        }
+                        journal_flow.fail_protocol(error.clone());
+                        exit_error = error;
                         break;
                     }
                 };
@@ -652,11 +640,7 @@ pub(crate) fn spawn_reader(
                     } => {
                         if let Err(error) = journal_flow.ingest(&bridge, seq, entry, replayed) {
                             eprintln!("agent-bridge: protocol violation: {}", error.message);
-                            let _ = ready_tx.send(Err(error.message.clone()));
-                            let _ = replay_done_tx.send(Err(error.message.clone()));
-                            if error.live_transport {
-                                bridge.fail_reader_transport(&journal_flow, &error.message);
-                            }
+                            exit_error = error.message;
                             break;
                         }
                     }
@@ -664,11 +648,7 @@ pub(crate) fn spawn_reader(
                     AgentToCore::ReplayBoundary { last_seq } => {
                         if let Err(error) = journal_flow.observe_replay_boundary(last_seq) {
                             eprintln!("agent-bridge: protocol violation: {}", error.message);
-                            let _ = ready_tx.send(Err(error.message.clone()));
-                            let _ = replay_done_tx.send(Err(error.message.clone()));
-                            if error.live_transport {
-                                bridge.fail_reader_transport(&journal_flow, &error.message);
-                            }
+                            exit_error = error.message;
                             break;
                         }
                     }
@@ -681,10 +661,7 @@ pub(crate) fn spawn_reader(
                             }
                             Err(error) => {
                                 eprintln!("agent-bridge: protocol violation: {}", error.message);
-                                let _ = replay_done_tx.send(Err(error.message.clone()));
-                                if error.live_transport {
-                                    bridge.fail_reader_transport(&journal_flow, &error.message);
-                                }
+                                exit_error = error.message;
                                 break;
                             }
                         }
@@ -704,7 +681,10 @@ pub(crate) fn spawn_reader(
                     }
                 }
             }
-            eprintln!("agent-bridge: reader thread exiting (agent stdout closed)");
+            let _ = ready_tx.send(Err(exit_error.clone()));
+            let _ = replay_done_tx.send(Err(exit_error.clone()));
+            bridge.fail_reader_transport(&journal_flow, &exit_error);
+            eprintln!("agent-bridge: reader thread exiting ({exit_error})");
         })
 }
 
