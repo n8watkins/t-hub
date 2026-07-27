@@ -211,8 +211,8 @@ describe("bootstrapCaptains", () => {
   it("waits for authoritative workspace adoption before checking legacy pins", async () => {
     seedCaptains(["capZ"]);
     mockState.handlers = { list_captains: { seq: 2, captains: [] } };
-    let finishWorkspaceBootstrap: (() => void) | undefined;
-    const workspaceBootstrap = new Promise<void>((resolve) => {
+    let finishWorkspaceBootstrap: ((ready: boolean) => void) | undefined;
+    const workspaceBootstrap = new Promise<boolean>((resolve) => {
       finishWorkspaceBootstrap = resolve;
     });
 
@@ -224,13 +224,23 @@ describe("bootstrapCaptains", () => {
       tabs: [{ id: "t1", name: "W1", order: [] }],
       focusedId: null,
     });
-    finishWorkspaceBootstrap?.();
+    finishWorkspaceBootstrap?.(true);
     await bootstrap;
 
     expect(
       controlRequests.some((r) => r.command === "claim_captain"),
     ).toBe(false);
     expect(useCaptain.getState().captainIds).toEqual([]);
+  });
+
+  it("does not reconcile legacy pins after indeterminate workspace bootstrap", async () => {
+    seedCaptains(["capZ"]);
+    mockState.handlers = { list_captains: { seq: 2, captains: [] } };
+
+    await bootstrapCaptainsAfterWorkspace(Promise.resolve(false));
+
+    expect(controlRequests).toEqual([]);
+    expect(useCaptain.getState().captainIds).toEqual(["capZ"]);
   });
 
   it("claims live-tile pins the server lacks, then adopts the final snapshot", async () => {

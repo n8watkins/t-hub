@@ -80,7 +80,7 @@ describe("workspace registry bootstrap", () => {
       return Promise.reject(new Error(`unexpected invoke: ${command}`));
     });
 
-    await bootstrapWorkspaceTabs();
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(true);
 
     expect(
       useWorkspace.getState().tabs.map((tab) => ({
@@ -117,16 +117,9 @@ describe("workspace registry bootstrap", () => {
       activeTabId: CAPTAINS_TAB_ID,
       tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
     });
-    await vi.waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith(
-        "report_workspace_tabs",
-        expect.anything(),
-      );
-    });
-    invoke.mockClear();
     invoke.mockRejectedValue(new Error("terminal scan unavailable"));
 
-    await bootstrapWorkspaceTabs();
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
 
     expect(invoke).not.toHaveBeenCalledWith(
       "report_workspace_tabs",
@@ -145,7 +138,7 @@ describe("workspace registry bootstrap", () => {
       ],
     });
 
-    await bootstrapWorkspaceTabs();
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(true);
 
     expect(useWorkspace.getState().tabs.map((tab) => tab.id)).toEqual([
       "work-2",
@@ -186,7 +179,7 @@ describe("workspace registry bootstrap", () => {
       ],
     });
 
-    await bootstrapWorkspaceTabs();
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(true);
     useWorkspace.getState().setTerminals([]);
 
     const state = useWorkspace.getState();
@@ -220,7 +213,7 @@ describe("workspace registry bootstrap", () => {
       tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
     });
 
-    await bootstrapWorkspaceTabs();
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(true);
 
     const tabs = useWorkspace.getState().tabs;
     expect(tabs.map((tab) => tab.id)).toHaveLength(2);
@@ -246,7 +239,7 @@ describe("workspace registry bootstrap", () => {
       tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
     });
 
-    await bootstrapWorkspaceTabs();
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
 
     expect(useWorkspace.getState().tabs.some((tab) => tab.id !== CAPTAINS_TAB_ID)).toBe(true);
     expect(useWorkspace.getState().tabs).not.toEqual([

@@ -140,7 +140,7 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
  * This also lets setTerminals() surface pre-existing sessions while the first
  * control request is still in flight.
  */
-export async function bootstrapWorkspaceTabs(): Promise<void> {
+export async function bootstrapWorkspaceTabs(): Promise<boolean> {
   try {
     const res = (await controlRequest("list_tabs")) as {
       seq?: unknown;
@@ -154,7 +154,7 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
       !Array.isArray(res.tabs) ||
       res.tabs.length === 0
     ) {
-      return;
+      return false;
     }
 
     const serverTabs = res.tabs as TabReport[];
@@ -203,14 +203,16 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
             ? repaired.tabs
             : repairedTabs;
         adoptAuthoritativeTabs(authoritativeTabs);
+        return true;
       }
-      return;
+      return false;
     }
 
-    adoptAuthoritativeTabs(serverTabs);
+    return adoptAuthoritativeTabs(serverTabs);
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
     surfaceLayoutSyncFailure(error);
+    return false;
   }
 }
 
@@ -593,13 +595,13 @@ export async function bootstrapCaptains(): Promise<void> {
 }
 
 export async function bootstrapCaptainsAfterWorkspace(
-  workspaceBootstrap: Promise<void>,
+  workspaceBootstrap: Promise<boolean>,
 ): Promise<void> {
-  await workspaceBootstrap;
+  if (!(await workspaceBootstrap)) return;
   await bootstrapCaptains();
 }
 
-function startCaptainsBootstrap(workspaceBootstrap: Promise<void>): void {
+function startCaptainsBootstrap(workspaceBootstrap: Promise<boolean>): void {
   void bootstrapCaptainsAfterWorkspace(workspaceBootstrap);
 }
 
@@ -624,7 +626,7 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
  * returned authoritative snapshot is adopted - the rare concurrent local change
  * loses to the server, by design. Failures (e.g. not under Tauri) are swallowed.
  */
-function startTabReporter(): Promise<void> {
+function startTabReporter(): Promise<boolean> {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
@@ -680,7 +682,8 @@ function startTabReporter(): Promise<void> {
   // Read the authoritative registry before the first report so a cold webview
   // cannot overwrite server-side workspaces with its boot-time local snapshot.
   const workspaceBootstrap = bootstrapWorkspaceTabs();
-  void workspaceBootstrap.finally(() => {
+  void workspaceBootstrap.then((ready) => {
+    if (!ready) return;
     bootstrapping = false;
     report();
   });
