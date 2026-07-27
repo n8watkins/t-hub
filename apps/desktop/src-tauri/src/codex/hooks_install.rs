@@ -1244,6 +1244,36 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn executable_fixture_is_published_and_runnable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let agent = executable(temp.path());
+        let staging = agent.with_file_name(".t-hub-agent.fixture");
+        let output = std::process::Command::new(&agent)
+            .arg("--capabilities-json")
+            .output()
+            .unwrap();
+        let capabilities: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mode = std::fs::metadata(&agent).unwrap().permissions().mode() & 0o777;
+
+        assert!(output.status.success());
+        assert!(!staging.exists());
+        assert_eq!(mode, 0o700);
+        assert_eq!(
+            capabilities["capabilities"],
+            json!(["codex-native-hooks-v1"])
+        );
+        println!(
+            "published={} staging_exists={} mode={mode:o} capabilities={}",
+            agent.display(),
+            staging.exists(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+
     #[test]
     fn health_rejects_an_executable_without_codex_hook_capability() {
         let temp = tempfile::tempdir().unwrap();
