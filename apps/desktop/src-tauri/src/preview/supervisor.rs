@@ -1283,10 +1283,20 @@ time.sleep(30)"#;
             .spawn_authenticated(Duration::from_secs(3))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !result.exists() && Instant::now() < deadline {
+        let outcome = loop {
+            match std::fs::read_to_string(&result) {
+                Ok(outcome) if !outcome.is_empty() => break outcome,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read lifeline probe result: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lifeline probe did not publish a result"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(std::fs::read_to_string(&result).unwrap(), "denied");
+        };
+        assert_eq!(outcome, "denied");
         let stopped = Instant::now();
         supervised.stdin.take();
         assert!(supervised.child.wait().unwrap().success());
