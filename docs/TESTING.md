@@ -11,7 +11,7 @@ T-Hub has layered local test profiles so normal iteration does not pay the cost 
 | `pnpm test:backend` | Standard Rust and CLI lanes | About 1 minute |
 | `pnpm test:frontend` | Typecheck, Vitest, and the production bundle | Under 1 minute |
 | `pnpm test:browser` | Production bundle and Playwright | Under 1 minute |
-| `pnpm test:contracts` | Portable repository, voice-gate, performance, and skill contracts | About 30 seconds |
+| `pnpm test:contracts` | Version, voice-gate, performance, test-profile, workflow-pinning, and skill contracts | About 30 seconds |
 | `pnpm test:host-contracts` | Real Codex and Claude provisioning and installation contracts | About 7 minutes |
 | `pnpm test:process` | Real control and tmux process lifecycle tests | About 4 to 5 minutes |
 | `pnpm test:full` | Complete Rust, CLI, frontend, browser, bundle, and portable contracts | About 4 to 6 minutes |

@@ -27,7 +27,7 @@ Legacy Powder registry fields remain readable as inert compatibility data.
 - **MCP control channel:** the `t-hub-mcp` server forwards `tools/call` to the running app over a local control socket.
 The catalog includes `start_agent`, `list_agents`, `get_agent`, `agent_checkpoint`, and `agent_events` alongside terminal, workspace, and Captain operations.
 Retired Powder tools are not advertised.
-- **~58 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
+- **Tauri commands** across the backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production - see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
 - **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL).
 Run `pnpm test` for the fast local profile, `pnpm test:standard` for the approximately one-minute cross-target profile, and `pnpm test:full` for the complete process and browser profile.
 See [docs/TESTING.md](./docs/TESTING.md) for backend, frontend, browser, contract, host-contract, and process-only commands, measured costs, and release guidance.

@@ -992,15 +992,15 @@ Packaged acceptance passed the static HTTP and confinement matrix, stale-run own
 The Preview exit-gate requirement for representative Vite, Next.js, and static projects is complete.
 Framework-aware generic Vite arguments and stale WSL-address recovery remain open follow-up hardening.
 History items 11 through 13 are governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
-The existing Recent implementation is Claude-only, keyed and filtered by cwd, archives an entire Claude project transcript directory, and hardcodes Claude resume behavior.
-Codex rows must not be added to that legacy contract because doing so would collapse same-cwd conversations and resume them through the wrong Harness.
+The former Recent implementation was Claude-only, keyed and filtered by cwd, archived an entire Claude project transcript directory, and hardcoded Claude resume behavior.
+Codex rows could not be added to that legacy contract because doing so would have collapsed same-cwd conversations and resumed them through the wrong Harness.
 Source `0.3.97` at commit `4759df0` preserves a partial Codex session window when the same provider snapshot also contains a recognized weekly window.
 It also advances the retained authoritative snapshot across an expired reset boundary before merging a later partial poll, so an old session percentage cannot reappear.
 The focused regression suite, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
 That fix is included in installed `0.3.100` from exact detached source `8635374`.
 Source `0.3.98` at commit `4e264f0` adds the backend-only provider-neutral History identity and transcript parser foundation.
 It locks exact Harness-plus-conversation digests, preserves same-cwd and cross-Harness separation, selects filename-matching Codex child metadata, reads the real Codex `model_provider`, normalizes valid timestamps to UTC, degrades malformed records, filters wrapper text, and represents legacy Claude archive entries per conversation.
-The foundation exposes no command or UI, leaves Claude-only Recent byte-for-byte unchanged, and marks every not-yet-connected action unavailable.
+At that point, the foundation exposed no command or UI, left Claude-only Recent byte-for-byte unchanged, and marked every not-yet-connected action unavailable.
 Its 16 focused tests, full Rust workspace, MCP end-to-end, strict all-feature Clippy, all 480 frontend tests, TypeScript, production build, version consistency, diff checks, and independent review passed.
 Source `0.3.99` at commit `3afb521` repairs the reproduced Codex Captain commissioning failure.
 Installed `0.3.94` passed the exec-only `--skip-git-repo-check` flag to interactive Codex `0.144.4`, which exited immediately, while the graphical control client timed out before the backend returned its structured rollback error.
@@ -1014,7 +1014,8 @@ The NSIS upgrade installed `0.3.100` successfully, and the installed executable 
 All five pre-install tmux session names and pane PIDs survived unchanged.
 A 50-second process sample spanning more than three Powder event intervals observed zero PowerShell or cmd children owned by T-Hub PID `14868`.
 The preserved Project still requires one trusted graphical Create Captain retry before the Captain and Crew acceptance sequence can continue.
-The next History slice must add bounded fair discovery, source statuses, collision handling, durable exact joins, complete revision semantics, and only then expose the versioned `history_list` catalog across control, MCP, CLI, and frontend IPC.
+Subsequent slices replaced Recent with the provider-neutral catalog and resume flow.
+The current behavior and remaining constraints are owned by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
 
 ### Tests and Evidence
 

@@ -90,7 +90,9 @@ or General authority.
 ## Lifecycle hooks
 
 Settings owns consent-gated install, health, repair, and uninstall actions for T-Hub entries in `$CODEX_HOME/hooks.json`.
-The installer requires a capability-compatible `t-hub-agent`, preserves unrelated user, project, plugin, and centrally managed hook configuration, and never fabricates Codex trust approval.
+On packaged Windows builds, health checks, installation, and repair first deploy and digest-verify the exact bundled `t-hub-agent` described in [SESSION_AWARENESS.md](./SESSION_AWARENESS.md); failure leaves the hook operation closed.
+Uninstall remains available without that helper so stale managed entries can always be removed.
+The installer also requires the deployed helper to advertise native Codex-hook capability, preserves unrelated user, project, plugin, and centrally managed hook configuration, and never fabricates Codex trust approval.
 Codex hook enablement remains controlled by its feature configuration, while command trust and per-handler enablement remain reviewable through Codex's own `/hooks` surface.
 The managed `PreToolUse` and `PostToolUse` handlers match only `request_user_input`; prompt, question, option, and response content is not persisted, and hook-supplied transcript and working-directory paths are ignored.
 
