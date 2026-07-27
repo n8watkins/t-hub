@@ -188,7 +188,18 @@ export function rebaseStartupWorkspaceTabs(
   authoritativeTabs: TabReport[],
   baselineTabs: TabReport[],
   localTabs: TabReport[],
+  eligibleTileIds?: ReadonlySet<string>,
 ): TabReport[] {
+  const allowedTileIds =
+    eligibleTileIds ??
+    new Set([
+      ...authoritativeTabs.flatMap((tab) => tab.tileIds),
+      ...localTabs.flatMap((tab) =>
+        tab.tileIds.filter(
+          (id) => !baselineTabs.some((baseline) => baseline.tileIds.includes(id)),
+        ),
+      ),
+    ]);
   const baselineById = new Map(baselineTabs.map((tab) => [tab.id, tab]));
   const localById = new Map(localTabs.map((tab) => [tab.id, tab]));
   const removedTabIds = new Set(
@@ -286,7 +297,7 @@ export function rebaseStartupWorkspaceTabs(
     const target = rebased.find((tab) => tab.id === local.id);
     if (!target) continue;
     for (const id of local.tileIds) {
-      if (changedTileIds.has(id)) {
+      if (changedTileIds.has(id) && allowedTileIds.has(id)) {
         insertByLocalOrder(target.tileIds, id, local.tileIds, (value) => value);
       }
     }
@@ -298,9 +309,25 @@ export function rebaseStartupWorkspaceDeltas(
   authoritativeTabs: TabReport[],
   deltas: StartupWorkspaceDelta[],
 ): TabReport[] {
+  const eligibleTileIds = new Set(
+    authoritativeTabs.flatMap((tab) => tab.tileIds),
+  );
+  for (const { baselineTabs, localTabs } of deltas) {
+    const baselineTileIds = new Set(
+      baselineTabs.flatMap((tab) => tab.tileIds),
+    );
+    for (const id of localTabs.flatMap((tab) => tab.tileIds)) {
+      if (!baselineTileIds.has(id)) eligibleTileIds.add(id);
+    }
+  }
   return deltas.reduce(
     (tabs, delta) =>
-      rebaseStartupWorkspaceTabs(tabs, delta.baselineTabs, delta.localTabs),
+      rebaseStartupWorkspaceTabs(
+        tabs,
+        delta.baselineTabs,
+        delta.localTabs,
+        eligibleTileIds,
+      ),
     authoritativeTabs,
   );
 }

@@ -358,4 +358,39 @@ describe("workspace registry bootstrap", () => {
       tileIds: ["term-existing", "term-new", "term-remote"],
     });
   });
+
+  it("does not restore a dead persisted terminal moved during startup", () => {
+    const baseline = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-dead", "term-live"],
+      },
+      {
+        id: "work-2",
+        name: "Workspace 2",
+        kind: "work" as const,
+        tileIds: [],
+      },
+    ];
+    const local = baseline.map((tab) =>
+      tab.id === "work-1"
+        ? { ...tab, tileIds: ["term-live"] }
+        : { ...tab, tileIds: ["term-dead"] },
+    );
+
+    const rebased = rebaseStartupWorkspaceDeltas(
+      [
+        { ...baseline[0], tileIds: ["term-live"] },
+        baseline[1],
+      ],
+      [{ baselineTabs: baseline, localTabs: local }],
+    );
+
+    expect(rebased.find((tab) => tab.id === "work-1")?.tileIds).toEqual([
+      "term-live",
+    ]);
+    expect(rebased.find((tab) => tab.id === "work-2")?.tileIds).toEqual([]);
+  });
 });
