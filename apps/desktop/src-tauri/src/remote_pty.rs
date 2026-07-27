@@ -538,11 +538,13 @@ const MAX_BATCH_BYTES: usize = 256 * 1024;
 /// `AppHandle::emit` queues work onto the Windows host event loop without
 /// backpressure. A continuous PTY firehose could therefore enqueue roughly 100
 /// quarter-megabyte events per second, starving the window pump for 5-20 seconds
-/// even though each reader already coalesced its own socket frames. Reserving one
-/// process-wide slot every 20 ms keeps the host below that measured saturation
-/// point and naturally backpressures the reader sockets. The first event after an
-/// idle period remains immediate, so normal typing does not inherit a fixed delay.
-const OUTPUT_EMIT_PERIOD: Duration = Duration::from_millis(20);
+/// even though each reader already coalesced its own socket frames. Live Windows
+/// verification showed that 50 events per second could still starve the pump
+/// during a multi-terminal attach. Reserving one process-wide slot every 100 ms
+/// keeps sustained dispatch at 10 events per second and naturally backpressures
+/// the reader sockets. The first event after an idle period remains immediate,
+/// so normal typing does not inherit a fixed delay.
+const OUTPUT_EMIT_PERIOD: Duration = Duration::from_millis(100);
 static NEXT_OUTPUT_EMIT: std::sync::LazyLock<StdMutex<Instant>> =
     std::sync::LazyLock::new(|| StdMutex::new(Instant::now()));
 /// Raw socket read size. A single read can carry several NDJSON frames, which the
