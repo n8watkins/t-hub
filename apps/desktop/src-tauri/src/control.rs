@@ -8508,7 +8508,7 @@ fn authorize_inflight_cortana_bootstrap(
         "claude" => Harness::Claude,
         _ => return Err("cortana_bootstrap: in-flight Harness is unsupported".into()),
     };
-    let observed = crate::harness::observe_scoped_harness_process(
+    let observed = observe_cortana_harness_process_with_retry(
         &launch.tmux_target,
         harness,
         expected,
@@ -9746,7 +9746,7 @@ fn observe_cortana_harness_process(
     owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
 ) -> Result<crate::harness::HarnessProcessIdentity, String> {
     let (harness, expected, secret) = cortana_harness_attestation_scope(ctx, launch)?;
-    crate::harness::observe_scoped_harness_process(
+    observe_cortana_harness_process_with_retry(
         &launch.tmux_target,
         harness,
         expected,
@@ -9762,6 +9762,49 @@ fn observe_cortana_harness_process(
             error,
         )
     })
+}
+
+fn observe_cortana_harness_process_with_retry(
+    tmux_target: &str,
+    harness: Harness,
+    expected: &crate::harness::ExpectedHarnessLaunchProvenance,
+    identity_id: &str,
+    session_token: &str,
+    cgroup_path: &str,
+    pane_start_ticks: u64,
+    deadline: Instant,
+) -> Result<crate::harness::HarnessProcessIdentity, crate::harness::LaunchAttestationError> {
+    retry_unreadable_cortana_observation(deadline, |deadline| {
+        crate::harness::observe_scoped_harness_process(
+            tmux_target,
+            harness,
+            expected,
+            identity_id,
+            session_token,
+            cgroup_path,
+            pane_start_ticks,
+            deadline,
+        )
+    })
+}
+
+fn retry_unreadable_cortana_observation<T>(
+    deadline: Instant,
+    mut observe: impl FnMut(Instant) -> Result<T, crate::harness::LaunchAttestationError>,
+) -> Result<T, crate::harness::LaunchAttestationError> {
+    const RETRY_INTERVAL: Duration = Duration::from_millis(20);
+    loop {
+        match observe(deadline) {
+            Err(crate::harness::LaunchAttestationError::UnreadableEvidence)
+                if Instant::now() < deadline =>
+            {
+                std::thread::sleep(
+                    RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
+        }
+    }
 }
 
 fn revalidate_cortana_managed_owner_after_process_observation(
@@ -10047,7 +10090,7 @@ fn revalidate_active_cortana_authority(
     tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
         |error| cortana_tmux_observation_error("active Cortana managed owner changed", error),
     )?;
-    let observed = crate::harness::observe_scoped_harness_process(
+    let observed = observe_cortana_harness_process_with_retry(
         &target,
         harness,
         &attestation.expected_launch_provenance,
@@ -10103,7 +10146,7 @@ fn revalidate_unresolved_cortana_attestation(
         })?
         .filter(|bearer| !bearer.is_empty())
         .ok_or("unresolved Cortana runtime has no retained session bearer")?;
-    let observed = crate::harness::observe_scoped_harness_process(
+    let observed = observe_cortana_harness_process_with_retry(
         &target,
         harness,
         &attestation.expected_launch_provenance,
@@ -10161,7 +10204,7 @@ fn observe_live_cortana_with_expected_provenance(
     tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
         |error| cortana_tmux_observation_error("live Cortana managed owner changed", error),
     )?;
-    crate::harness::observe_scoped_harness_process(
+    observe_cortana_harness_process_with_retry(
         &target,
         harness,
         expected,

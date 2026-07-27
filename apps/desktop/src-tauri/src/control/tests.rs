@@ -44,6 +44,36 @@ use std::thread;
 const TEST_ASYNC_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
+fn cortana_observation_retries_only_transient_unreadable_evidence() {
+    let mut attempts = 0;
+    let observed =
+        retry_unreadable_cortana_observation(Instant::now() + Duration::from_secs(1), |_| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(crate::harness::LaunchAttestationError::UnreadableEvidence)
+            } else {
+                Ok("stable")
+            }
+        })
+        .unwrap();
+    assert_eq!(observed, "stable");
+    assert_eq!(attempts, 3);
+
+    let mut mismatch_attempts = 0;
+    let error =
+        retry_unreadable_cortana_observation::<()>(Instant::now() + Duration::from_secs(1), |_| {
+            mismatch_attempts += 1;
+            Err(crate::harness::LaunchAttestationError::ProcessChanged)
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        crate::harness::LaunchAttestationError::ProcessChanged
+    );
+    assert_eq!(mismatch_attempts, 1);
+}
+
+#[test]
 fn control_request_debug_redacts_all_credential_and_argument_values() {
     let request = ControlRequest {
         token: "global-control-secret".into(),
