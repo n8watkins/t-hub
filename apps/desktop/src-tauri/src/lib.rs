@@ -139,8 +139,7 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
         .spawn(move || {
             #[cfg(windows)]
             {
-                let has_developer_override =
-                    std::env::var_os("T_HUB_AGENT_BIN").is_some_and(|value| !value.is_empty());
+                let has_developer_override = agent::agent_bin_override().is_some();
                 match prepare_packaged_agent(
                     has_developer_override,
                     bundled_agent.as_deref(),

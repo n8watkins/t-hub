@@ -76,11 +76,11 @@ use emit::{
 /// tree and stdio is wired straight through. `$HOME` is expanded by WSL's bash,
 /// keeping the native Windows process independent of the distro home path.
 ///
-/// The `T_HUB_AGENT_BIN` escape hatch (honored here on Windows and in
-/// [`connection::spawn_child`] on every platform) bypasses the login-shell hop
-/// entirely: when set, its value is used **verbatim** as the program to spawn,
-/// so a developer can point the bridge at an arbitrary binary without touching
-/// PATH or the distro.
+/// The `T_HUB_AGENT_BIN` escape hatch is honored on unix, Windows dev builds,
+/// and in tests. It bypasses the login-shell hop entirely: when set, its value
+/// is used **verbatim** as the program to spawn, so a developer can point the
+/// bridge at an arbitrary binary without touching PATH or the distro. Packaged
+/// Windows builds ignore it and always launch the deployed, verified helper.
 ///
 /// Called by SUBAGENT(agent-bridge)'s transport when it spawns the child.
 fn direct_agent_argv(program: &str, journal_dir: Option<&str>) -> Vec<String> {
@@ -129,10 +129,7 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         // Escape hatch: if T_HUB_AGENT_BIN is set, spawn it verbatim (no
         // wsl.exe / login-shell hop). This keeps the override usable on Windows
         // where it would otherwise be misapplied as wsl.exe's argv[0].
-        if let Some(bin) = std::env::var("T_HUB_AGENT_BIN")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(bin) = agent_bin_override() {
             return direct_agent_argv(&bin, journal_dir.as_deref());
         }
         // Launch the exact path that packaged startup deployed and verified.
@@ -145,6 +142,19 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         let _ = distro; // distro is irrelevant when launching directly.
         let _ = journal_dir; // inherited env resolves a relative path against HOME.
         direct_agent_argv("t-hub-agent", None)
+    }
+}
+
+pub(crate) fn agent_bin_override() -> Option<String> {
+    #[cfg(any(not(windows), test, feature = "devbuild"))]
+    {
+        std::env::var("T_HUB_AGENT_BIN")
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(all(windows, not(test), not(feature = "devbuild")))]
+    {
+        None
     }
 }
 
@@ -425,9 +435,9 @@ impl AgentBridge {
     /// sends `ReplayJournal` and waits for `ReplayComplete` before setting the
     /// state to `Live`.
     ///
-    /// The `T_HUB_AGENT_BIN` developer escape hatch bypasses the packaged WSL
-    /// launch on Windows and overrides the child program on unix
-    /// (see [`launch_argv`] and [`connection::spawn_child`]).
+    /// The `T_HUB_AGENT_BIN` developer escape hatch is limited to Windows dev
+    /// builds and tests, and overrides the child program on unix (see
+    /// [`launch_argv`] and [`connection::spawn_child`]).
     pub fn connect(&self, distro: &str) -> Result<(), String> {
         self.connect_with_timeouts(
             distro,
@@ -457,7 +467,7 @@ impl AgentBridge {
         }
 
         #[cfg(windows)]
-        if !std::env::var_os("T_HUB_AGENT_BIN").is_some_and(|value| !value.is_empty()) {
+        if agent_bin_override().is_none() {
             match self.deploy_packaged_agent(distro) {
                 Ok(DeployOutcome::AlreadyCurrent) => {
                     eprintln!("t-hub: bundled WSL helper verified");
@@ -605,7 +615,7 @@ impl AgentBridge {
         let cursor = self.journal_cursor();
         let replayed = journal_head_seq > cursor;
         if replayed {
-            journal_flow.begin_replay(self, cursor);
+            journal_flow.begin_replay(cursor);
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
@@ -624,8 +634,8 @@ impl AgentBridge {
                 ));
             }
 
-            let last_seq = match replay_done_rx.recv_timeout(replay_timeout) {
-                Ok(Ok(last_seq)) => last_seq,
+            match replay_done_rx.recv_timeout(replay_timeout) {
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     return Err(self.fail_connection(
                         &handles,
@@ -640,19 +650,14 @@ impl AgentBridge {
                         "timed out waiting for ReplayComplete from agent".to_string(),
                     ));
                 }
-            };
-            if last_seq < journal_head_seq {
+            }
+            if let Err(error) = journal_flow.complete_replay(self, journal_head_seq) {
                 return Err(self.fail_connection(
                     &handles,
                     &journal_flow,
-                    format!(
-                        "incomplete journal replay: agent completed at sequence {last_seq}, \
-                         below advertised head {journal_head_seq}"
-                    ),
+                    format!("invalid journal replay: {error}"),
                 ));
             }
-            self.advance_cursor(last_seq);
-            journal_flow.complete_replay(self);
         } else {
             journal_flow.complete_without_replay(self);
         }
@@ -1975,6 +1980,7 @@ while IFS= read -r _; do :; done
 IFS= read -r _
 printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
 IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"journal","seq":1,"entry":{{"seq":1,"timestamp_ms":1,"source":"agent","entity_id":"failed-session","event_type":"user_prompt_submit","payload":{{"session_id":"failed-session","prompt":"Must not commit"}}}},"replayed":true}}'
 printf '%s\n' '{{malformed'
 printf '%s\n' '{{"channel":"control","type":"replay_boundary","last_seq":1}}'
 printf '%s\n' '{{"channel":"control","type":"replay_complete","last_seq":1}}'
@@ -2004,6 +2010,10 @@ while IFS= read -r _; do :; done
 
         assert!(error.contains("incomplete journal replay: malformed agent frame"));
         assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("failed-session"))
+            .is_none());
         assert!(bridge.inner.transport.lock().is_none());
         std::fs::remove_dir_all(temp_dir).ok();
     }
@@ -2448,7 +2458,7 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge, 0);
+        journal_flow.begin_replay(0);
 
         journal_flow.ingest(
             &bridge,
@@ -2487,10 +2497,12 @@ while IFS= read -r _; do :; done
             true,
         );
 
-        assert_eq!(bridge.journal_cursor(), 1);
+        assert_eq!(bridge.journal_cursor(), 0);
         assert!(rec.events.lock().is_empty());
 
-        journal_flow.complete_replay(&bridge);
+        journal_flow.observe_replay_boundary(1);
+        assert_eq!(journal_flow.finish_replay(1), Ok(1));
+        journal_flow.complete_replay(&bridge, 1).unwrap();
 
         let titles = rec
             .events
@@ -2505,13 +2517,13 @@ while IFS= read -r _; do :; done
     }
 
     #[test]
-    fn replay_reduces_history_incrementally_and_buffers_only_live_entries() {
+    fn replay_buffers_all_effects_until_verification() {
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge, 0);
+        journal_flow.begin_replay(0);
 
         journal_flow.ingest(
             &bridge,
@@ -2531,7 +2543,7 @@ while IFS= read -r _; do :; done
             },
             true,
         );
-        assert_eq!(bridge.journal_cursor(), 1);
+        assert_eq!(bridge.journal_cursor(), 0);
         assert!(rec.events.lock().is_empty());
 
         journal_flow.ingest(
@@ -2552,9 +2564,14 @@ while IFS= read -r _; do :; done
             },
             false,
         );
-        assert_eq!(bridge.journal_cursor(), 1);
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("session-1"))
+            .is_none());
 
-        journal_flow.complete_replay(&bridge);
+        journal_flow.observe_replay_boundary(1);
+        assert_eq!(journal_flow.finish_replay(1), Ok(1));
+        journal_flow.complete_replay(&bridge, 1).unwrap();
 
         let titles = rec
             .events
@@ -2574,7 +2591,7 @@ while IFS= read -r _; do :; done
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge, 0);
+        journal_flow.begin_replay(0);
         bridge.set_state(ConnectionState::Replaying);
 
         journal_flow.ingest(
@@ -2598,9 +2615,13 @@ while IFS= read -r _; do :; done
 
         assert!(journal_flow.cancel());
         bridge.set_state(ConnectionState::Failed);
-        journal_flow.complete_replay(&bridge);
+        assert!(journal_flow.complete_replay(&bridge, 1).is_err());
 
         assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("session-1"))
+            .is_none());
         assert!(rec
             .events
             .lock()
@@ -2612,9 +2633,11 @@ while IFS= read -r _; do :; done
     fn completed_replay_wins_a_simultaneous_timeout_check() {
         let bridge = AgentBridge::new();
         let journal_flow = ReaderJournalFlow::new();
-        journal_flow.begin_replay(&bridge, 0);
+        journal_flow.begin_replay(0);
 
-        journal_flow.complete_replay(&bridge);
+        journal_flow.observe_replay_boundary(0);
+        assert_eq!(journal_flow.finish_replay(0), Ok(0));
+        journal_flow.complete_replay(&bridge, 0).unwrap();
 
         assert!(!journal_flow.cancel());
         assert_eq!(bridge.state(), ConnectionState::Live);

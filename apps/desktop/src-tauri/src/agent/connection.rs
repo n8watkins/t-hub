@@ -31,11 +31,11 @@
 //!
 //! ## T_HUB_AGENT_BIN escape hatch
 //!
-//! On Windows, [`super::launch_argv`] consumes `T_HUB_AGENT_BIN` and returns a
-//! direct agent invocation instead of the packaged WSL launch. On unix and in
-//! tests, [`spawn_child`] also honors the value as an argv[0] override. This
-//! lets developers and tests point at a freshly built binary (for example,
-//! `target/debug/t-hub-agent`) without changing `PATH`.
+//! On Windows dev builds and in tests, [`super::launch_argv`] consumes
+//! `T_HUB_AGENT_BIN` and returns a direct agent invocation instead of the
+//! packaged WSL launch. On unix, [`spawn_child`] also honors the value as an
+//! argv[0] override. This lets developers and tests point at a freshly built
+//! binary (for example, `target/debug/t-hub-agent`) without changing `PATH`.
 //!
 //! ## Channel / Priority note
 //!
@@ -72,9 +72,11 @@ pub(crate) struct ReaderJournalFlow {
 enum ReaderJournalState {
     Buffering(Vec<BufferedJournal>),
     Replaying {
+        replay_entries: Vec<BufferedJournal>,
         live_entries: Vec<BufferedJournal>,
         verified_seq: u64,
         boundary_received: bool,
+        completion_received: bool,
         protocol_error: Option<String>,
     },
     Live,
@@ -94,20 +96,22 @@ impl ReaderJournalFlow {
         })
     }
 
-    pub(crate) fn begin_replay(&self, bridge: &AgentBridge, after_seq: u64) {
+    pub(crate) fn begin_replay(&self, after_seq: u64) {
         let mut state = self.state.lock();
         if let ReaderJournalState::Buffering(entries) = &mut *state {
             let entries = std::mem::take(entries);
             let (replayed, live_entries): (Vec<_>, Vec<_>) =
                 entries.into_iter().partition(|entry| entry.replayed);
             *state = ReaderJournalState::Replaying {
+                replay_entries: Vec::new(),
                 live_entries,
                 verified_seq: after_seq,
                 boundary_received: false,
+                completion_received: false,
                 protocol_error: None,
             };
             for buffered in sorted_entries(replayed) {
-                Self::ingest_replayed(&mut state, bridge, buffered.seq, buffered.entry);
+                Self::ingest_replayed(&mut state, buffered.seq, buffered.entry);
             }
         }
     }
@@ -127,19 +131,53 @@ impl ReaderJournalFlow {
         }
     }
 
-    pub(crate) fn complete_replay(&self, bridge: &AgentBridge) {
+    pub(crate) fn complete_replay(
+        &self,
+        bridge: &AgentBridge,
+        expected_head: u64,
+    ) -> Result<(), String> {
         let mut state = self.state.lock();
-        let ReaderJournalState::Replaying { live_entries, .. } =
-            std::mem::replace(&mut *state, ReaderJournalState::Live)
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            completion_received,
+            protocol_error,
+            ..
+        } = &*state
         else {
-            return;
+            return Err("replay commit requested outside an active replay".to_string());
+        };
+        if let Some(error) = protocol_error {
+            return Err(error.clone());
+        }
+        if !boundary_received || !completion_received {
+            return Err("replay commit requested before verified completion".to_string());
+        }
+        if *verified_seq != expected_head {
+            return Err(format!(
+                "agent completed at sequence {verified_seq}, expected advertised head {expected_head}"
+            ));
+        }
+
+        let ReaderJournalState::Replaying {
+            replay_entries,
+            live_entries,
+            ..
+        } = std::mem::replace(&mut *state, ReaderJournalState::Live)
+        else {
+            return Err("replay state changed before commit".to_string());
         };
 
+        for buffered in sorted_entries(replay_entries) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
+        }
+        bridge.advance_cursor(expected_head);
         bridge.flush_replay();
         bridge.set_state(ConnectionState::Live);
         for buffered in sorted_entries(live_entries) {
             bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
         }
+        Ok(())
     }
 
     pub(crate) fn cancel(&self) -> bool {
@@ -189,7 +227,7 @@ impl ReaderJournalFlow {
                 });
             }
             ReaderJournalState::Replaying { .. } if replayed => {
-                Self::ingest_replayed(&mut state, bridge, seq, entry);
+                Self::ingest_replayed(&mut state, seq, entry);
             }
             ReaderJournalState::Replaying { live_entries, .. } => {
                 live_entries.push(BufferedJournal {
@@ -207,13 +245,14 @@ impl ReaderJournalFlow {
 
     fn ingest_replayed(
         state: &mut ReaderJournalState,
-        bridge: &AgentBridge,
         seq: u64,
         entry: EventJournalEntry,
     ) {
         let ReaderJournalState::Replaying {
+            replay_entries,
             verified_seq,
             boundary_received,
+            completion_received,
             protocol_error,
             ..
         } = state
@@ -223,7 +262,9 @@ impl ReaderJournalFlow {
         if protocol_error.is_some() {
             return;
         }
-        if *boundary_received {
+        if *completion_received {
+            *protocol_error = Some("journal replay entry received after completion".to_string());
+        } else if *boundary_received {
             *protocol_error = Some("journal entry received after replay boundary".to_string());
         } else if seq != entry.seq {
             *protocol_error = Some(format!(
@@ -236,7 +277,11 @@ impl ReaderJournalFlow {
             ));
         } else {
             *verified_seq = seq;
-            bridge.consume_journal_entry_with_provenance(&entry, true);
+            replay_entries.push(BufferedJournal {
+                seq,
+                entry,
+                replayed: true,
+            });
         }
     }
 
@@ -245,6 +290,7 @@ impl ReaderJournalFlow {
         let ReaderJournalState::Replaying {
             verified_seq,
             boundary_received,
+            completion_received,
             protocol_error,
             ..
         } = &mut *state
@@ -254,7 +300,9 @@ impl ReaderJournalFlow {
         if protocol_error.is_some() {
             return;
         }
-        if *boundary_received {
+        if *completion_received {
+            *protocol_error = Some("replay boundary received after completion".to_string());
+        } else if *boundary_received {
             *protocol_error = Some("duplicate replay boundary".to_string());
         } else if last_seq < *verified_seq {
             *protocol_error = Some(format!(
@@ -267,27 +315,32 @@ impl ReaderJournalFlow {
     }
 
     pub(crate) fn finish_replay(&self, last_seq: u64) -> Result<u64, String> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         let ReaderJournalState::Replaying {
             verified_seq,
             boundary_received,
+            completion_received,
             protocol_error,
             ..
-        } = &*state
+        } = &mut *state
         else {
             return Err("replay completed outside an active replay".to_string());
         };
         if let Some(error) = protocol_error {
             return Err(error.clone());
         }
-        if !boundary_received {
+        if !*boundary_received {
             return Err("replay completed without a durable boundary".to_string());
+        }
+        if *completion_received {
+            return Err("duplicate replay completion".to_string());
         }
         if last_seq != *verified_seq {
             return Err(format!(
                 "replay completion sequence {last_seq} does not match verified boundary {verified_seq}"
             ));
         }
+        *completion_received = true;
         Ok(*verified_seq)
     }
 }
@@ -390,10 +443,10 @@ pub(crate) fn write_frame(w: &mut impl Write, frame: &CoreFrame) -> std::io::Res
 
 /// Resolve the program to exec and the remaining arguments from `argv`.
 ///
-/// If `T_HUB_AGENT_BIN` is set, its value replaces `argv[0]`.
-/// Windows [`super::launch_argv`] has already reduced an override to the direct
-/// agent argument shape, while this fallback also supports unix development and
-/// tests.
+/// If an allowed `T_HUB_AGENT_BIN` override is set, its value replaces
+/// `argv[0]`. Windows [`super::launch_argv`] has already reduced an override to
+/// the direct agent argument shape, while this fallback also supports unix
+/// development and tests.
 /// This lets tests and developers point at a freshly built binary without
 /// touching `PATH`:
 ///
@@ -409,10 +462,7 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
     }
 
     // T_HUB_AGENT_BIN: optional override for argv[0], documented above.
-    let program = std::env::var("T_HUB_AGENT_BIN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| argv[0].clone());
+    let program = super::agent_bin_override().unwrap_or_else(|| argv[0].clone());
 
     let args = &argv[1..];
 
