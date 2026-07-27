@@ -818,6 +818,19 @@ export async function bootstrapCaptains(): Promise<boolean> {
   }
 }
 
+/**
+ * Gate one Captain reconciliation attempt on an authoritative workspace
+ * bootstrap. This remains a small exported coordination seam so callers and
+ * tests cannot accidentally validate persisted Captain pins against stale
+ * local workspace tiles.
+ */
+export async function bootstrapCaptainsAfterWorkspace(
+  workspaceBootstrap: Promise<boolean>,
+): Promise<boolean> {
+  if (!(await workspaceBootstrap)) return false;
+  return bootstrapCaptains();
+}
+
 function startCaptainsBootstrap(): void {
   const reconcile = (): void => {
     void bootstrapCaptains().then((authoritative) => {
