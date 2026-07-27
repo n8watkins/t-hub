@@ -299,7 +299,7 @@ fn run_authorized_ui_spawn<T>(
     let args = serde_json::to_value(opts)
         .map_err(|error| format!("spawn_terminal: audit arguments are invalid: {error}"))?;
     let cwd = resolve_cwd(opts);
-    admission_context.ensure_worktree_available(&cwd, "spawn_terminal")?;
+    let _worktree_admission = admission_context.admit_worktree_activity(&cwd, "spawn_terminal")?;
     let _admission = admission_context.authorize_ui_spawn(provider_lanes, &args)?;
     spawn()
 }

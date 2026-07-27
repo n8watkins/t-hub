@@ -2684,12 +2684,12 @@ impl ControlContext {
         Ok(admission)
     }
 
-    pub(crate) fn ensure_worktree_available(
+    pub(crate) fn admit_worktree_activity(
         &self,
         path: &str,
         operation: &str,
-    ) -> Result<(), String> {
-        self.worktrees.ensure_available(path, operation)
+    ) -> Result<crate::worktree_coordinator::WorktreeAdmissionGuard<'_>, String> {
+        self.worktrees.admit_activity(path, operation)
     }
 }
 
