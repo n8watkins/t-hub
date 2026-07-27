@@ -145,7 +145,7 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
         Ok(RuntimePaths {
             codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
             requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
-            agent_bin: resolved_wsl_agent_bin(resolve_wsl_agent_bin(&distro)),
+            agent_bin: PathBuf::from(deployed_wsl_agent_bin(&home)?),
             hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
         })
     }
@@ -201,10 +201,9 @@ fn resolve_unix_agent_bin_from(
 }
 
 #[cfg(any(windows, test))]
-fn resolved_wsl_agent_bin(result: Result<String>) -> PathBuf {
-    result
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("t-hub-agent"))
+fn deployed_wsl_agent_bin(home: &str) -> Result<String> {
+    validate_canonical_absolute_posix(home)?;
+    Ok(format!("{home}/.local/bin/t-hub-agent"))
 }
 
 #[cfg(windows)]
@@ -340,25 +339,30 @@ fn wsl_home(distro: &str) -> Result<String> {
 fn resolve_wsl_agent_bin(distro: &str) -> Result<String> {
     use std::os::windows::process::CommandExt;
 
+    let agent_bin = deployed_wsl_agent_bin(&wsl_home(distro)?)?;
     let mut command = std::process::Command::new("wsl.exe");
     command
         .arg("-d")
         .arg(distro)
         .arg("--")
         .arg("bash")
-        .arg("-lc")
-        .arg("command -v t-hub-agent")
+        .arg("-c")
+        .arg("test -x \"$1\"")
+        .arg("t-hub-agent")
+        .arg(&agent_bin)
         .creation_flags(0x0800_0000);
     let output =
         crate::bounded_exec::output_with_timeout(command, crate::bounded_exec::WSL_PROBE_TIMEOUT)
-            .with_context(|| format!("resolving t-hub-agent inside WSL distribution {distro}"))?;
+            .context(format!(
+            "checking deployed t-hub-agent inside WSL distribution {distro}"
+        ))?;
     if !output.status.success() {
         bail!(
-            "could not find t-hub-agent inside WSL distribution {distro}: {}",
+            "deployed t-hub-agent is unavailable at {agent_bin} inside WSL distribution {distro}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    normalize_wsl_executable(&output.stdout)
+    Ok(agent_bin)
 }
 
 struct ConfigLock {
@@ -1698,16 +1702,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_runtime_paths_do_not_require_the_agent_to_resolve() {
-        let resolved =
-            resolved_wsl_agent_bin(Ok("/home/natkins/.local/bin/t-hub-agent".to_string()));
-        let missing = resolved_wsl_agent_bin(Err(anyhow!("agent is missing")));
-
-        assert_eq!(
-            resolved,
-            PathBuf::from("/home/natkins/.local/bin/t-hub-agent")
-        );
-        assert_eq!(missing, PathBuf::from("t-hub-agent"));
+    fn windows_runtime_agent_path_is_deterministic_without_path_lookup() {
+        let resolved = deployed_wsl_agent_bin("/home/natkins").unwrap();
+        assert_eq!(resolved, "/home/natkins/.local/bin/t-hub-agent");
+        assert!(deployed_wsl_agent_bin("relative/home").is_err());
     }
 
     #[test]
