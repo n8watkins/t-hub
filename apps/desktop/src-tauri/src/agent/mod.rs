@@ -407,14 +407,49 @@ impl AgentBridge {
     /// The `T_HUB_AGENT_BIN` env var overrides argv[0] for tests / dev
     /// (see [`connection::spawn_child`]).
     pub fn connect(&self, distro: &str) -> Result<(), String> {
+        self.connect_with_timeouts(
+            distro,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    fn connect_with_timeouts(
+        &self,
+        distro: &str,
+        ready_timeout: std::time::Duration,
+        replay_timeout: std::time::Duration,
+    ) -> Result<(), String> {
         // Build argv and spawn child.
         let argv = launch_argv(distro);
-        let mut child = spawn_child(argv).map_err(|e| format!("failed to spawn agent: {e}"))?;
+        let mut child = match spawn_child(argv) {
+            Ok(child) => child,
+            Err(error) => {
+                self.set_state(ConnectionState::Failed);
+                return Err(format!("failed to spawn agent: {error}"));
+            }
+        };
 
         // Take ownership of the stdio handles before the child handle moves
         // into TransportHandles.
-        let child_stdin = child.stdin.take().ok_or("child has no stdin pipe")?;
-        let child_stdout = child.stdout.take().ok_or("child has no stdout pipe")?;
+        let child_stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_state(ConnectionState::Failed);
+                return Err("child has no stdin pipe".to_string());
+            }
+        };
+        let child_stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_state(ConnectionState::Failed);
+                return Err("child has no stdout pipe".to_string());
+            }
+        };
 
         // Build the shared correlation map and next-id counter.
         let pending = Arc::new(connection::CorrelationMap::new(
@@ -459,18 +494,29 @@ impl AgentBridge {
                     core_version: format!("t-hub {}", env!("CARGO_PKG_VERSION")),
                 }),
             };
-            let mut stdin_guard = handles.stdin.lock();
-            write_frame(&mut *stdin_guard, &hello)
-                .map_err(|e| format!("failed to write Hello: {e}"))?;
+            let write_result = {
+                let mut stdin_guard = handles.stdin.lock();
+                write_frame(&mut *stdin_guard, &hello)
+            };
+            if let Err(error) = write_result {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("failed to write Hello: {error}"),
+                ));
+            }
         }
 
         // Wait for Ready (10 s timeout). On failure, mark Failed (and emit) so
         // the UI shows the dead connection rather than a stuck "handshaking".
-        let journal_head_seq = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        let journal_head_seq = match ready_rx.recv_timeout(ready_timeout) {
             Ok(seq) => seq,
             Err(_) => {
-                self.set_state(ConnectionState::Failed);
-                return Err("timed out waiting for Ready from agent".to_string());
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    "timed out waiting for Ready from agent".to_string(),
+                ));
             }
         };
 
@@ -485,26 +531,53 @@ impl AgentBridge {
                 channel: Channel::Control,
                 msg: CoreToAgent::ReplayJournal { after_seq: cursor },
             };
-            {
+            let write_result = {
                 let mut stdin_guard = handles.stdin.lock();
                 write_frame(&mut *stdin_guard, &replay_frame)
-                    .map_err(|e| format!("failed to write ReplayJournal: {e}"))?;
+            };
+            if let Err(error) = write_result {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("failed to write ReplayJournal: {error}"),
+                ));
             }
 
             // Wait for ReplayComplete (30 s — replay can be large).
-            if replay_done_rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .is_err()
-                && journal_flow.cancel_replay()
+            if replay_done_rx.recv_timeout(replay_timeout).is_err() && journal_flow.cancel()
             {
-                self.set_state(ConnectionState::Failed);
-                return Err("timed out waiting for ReplayComplete from agent".to_string());
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    "timed out waiting for ReplayComplete from agent".to_string(),
+                ));
             }
         } else {
             journal_flow.complete_without_replay(self);
         }
 
         Ok(())
+    }
+
+    fn fail_connection(
+        &self,
+        handles: &Arc<TransportHandles>,
+        journal_flow: &ReaderJournalFlow,
+        error: String,
+    ) -> String {
+        journal_flow.cancel();
+        {
+            let mut transport = self.inner.transport.lock();
+            if transport
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, handles))
+            {
+                transport.take();
+            }
+        }
+        handles.shutdown();
+        self.set_state(ConnectionState::Failed);
+        error
     }
 
     /// Tear down the live connection so a fresh [`connect`](Self::connect) can't
@@ -544,18 +617,7 @@ impl AgentBridge {
             return;
         };
 
-        // 2. Clear pending correlations: dropping the senders unblocks any waiting
-        //    request() callers (recv_timeout -> Err) instead of orphaning them.
-        handles.pending.lock().clear();
-
-        // 3. Kill + reap the child so its stdout closes and the detached reader
-        //    thread hits EOF and exits. Best-effort: a kill on an already-dead
-        //    child is a benign error.
-        {
-            let mut child = handles.child.lock();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        handles.shutdown();
 
         // Drop this Arc reference. If a concurrent request() still holds a clone,
         // the struct's memory outlives this call, but the child is already killed
@@ -1391,6 +1453,56 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ready_timeout_terminates_helper_and_discards_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-stalled-agent-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("stalled-agent");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$T_HUB_TEST_PID_FILE\"\nwhile IFS= read -r _; do :; done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        let error = bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap_err();
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(error.contains("timed out waiting for Ready"));
+        assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert!(bridge.inner.transport.lock().is_none());
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "stalled helper process {pid} survived the failed handshake"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
     #[test]
     fn git_info_response_reports_unsupported_agent_capability() {
         let error = super::map_git_info_response(AgentResponse::Error {
@@ -1974,7 +2086,7 @@ mod tests {
             true,
         );
 
-        assert!(journal_flow.cancel_replay());
+        assert!(journal_flow.cancel());
         bridge.set_state(ConnectionState::Failed);
         journal_flow.complete_replay(&bridge);
 
@@ -1994,7 +2106,7 @@ mod tests {
 
         journal_flow.complete_replay(&bridge);
 
-        assert!(!journal_flow.cancel_replay());
+        assert!(!journal_flow.cancel());
         assert_eq!(bridge.state(), ConnectionState::Live);
     }
 

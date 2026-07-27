@@ -129,13 +129,14 @@ impl ReaderJournalFlow {
         }
     }
 
-    pub(crate) fn cancel_replay(&self) -> bool {
+    pub(crate) fn cancel(&self) -> bool {
         let mut state = self.state.lock();
-        if matches!(*state, ReaderJournalState::Replaying { .. }) {
-            *state = ReaderJournalState::Cancelled;
-            true
-        } else {
-            false
+        match *state {
+            ReaderJournalState::Buffering(_) | ReaderJournalState::Replaying { .. } => {
+                *state = ReaderJournalState::Cancelled;
+                true
+            }
+            ReaderJournalState::Live | ReaderJournalState::Cancelled => false,
         }
     }
 
@@ -214,6 +215,15 @@ pub(crate) struct TransportHandles {
     /// The child handle, kept alive so the process isn't reaped.
     #[allow(dead_code)]
     pub(crate) child: Mutex<Child>,
+}
+
+impl TransportHandles {
+    pub(crate) fn shutdown(&self) {
+        self.pending.lock().clear();
+        let mut child = self.child.lock();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 // ---------------------------------------------------------------------------
