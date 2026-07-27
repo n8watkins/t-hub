@@ -110,6 +110,22 @@ fn default_distro() -> String {
     std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
+#[cfg(any(windows, test))]
+fn prepare_packaged_agent(
+    has_developer_override: bool,
+    bundled_agent: Option<&std::path::Path>,
+    deploy: impl FnOnce(&std::path::Path) -> Result<agent::DeployOutcome, String>,
+) -> Result<Option<(std::path::PathBuf, agent::DeployOutcome)>, String> {
+    if has_developer_override {
+        return Ok(None);
+    }
+
+    let resource = bundled_agent
+        .ok_or_else(|| "bundled WSL helper resource path is unavailable".to_string())?;
+    let outcome = deploy(resource)?;
+    Ok(Some((resource.to_path_buf(), outcome)))
+}
+
 /// Connect the agent bridge on startup, off the main thread so app launch is
 /// never blocked on the WSL hop / handshake. A connect failure is logged (the
 /// UI shows the connection state); it does not abort startup. The bridge owns
@@ -121,32 +137,37 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
         .name("t-hub-agent-connect".into())
         .spawn(move || {
             #[cfg(windows)]
-            if std::env::var_os("T_HUB_AGENT_BIN").is_none() {
-                match bundled_agent.as_deref() {
-                    Some(resource) => match agent::deploy_bundled_agent(&distro, resource) {
-                        Ok(agent::DeployOutcome::AlreadyCurrent) => {
-                            eprintln!(
-                                "t-hub: bundled WSL helper already current ({})",
-                                resource.display()
-                            );
-                        }
-                        Ok(agent::DeployOutcome::Installed) => {
-                            eprintln!(
-                                "t-hub: installed bundled WSL helper ({})",
-                                resource.display()
-                            );
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "t-hub: bundled WSL helper deployment failed; trying the \
-                                 existing helper: {error:#}"
-                            );
-                        }
+            {
+                let has_developer_override =
+                    std::env::var_os("T_HUB_AGENT_BIN").is_some_and(|value| !value.is_empty());
+                match prepare_packaged_agent(
+                    has_developer_override,
+                    bundled_agent.as_deref(),
+                    |resource| {
+                        agent::deploy_bundled_agent(&distro, resource)
+                            .map_err(|error| format!("{error:#}"))
                     },
-                    None => eprintln!(
-                        "t-hub: bundled WSL helper resource path unavailable; trying the \
-                         existing helper"
-                    ),
+                ) {
+                    Ok(None) => {}
+                    Ok(Some((resource, agent::DeployOutcome::AlreadyCurrent))) => {
+                        eprintln!(
+                            "t-hub: bundled WSL helper already current ({})",
+                            resource.display()
+                        );
+                    }
+                    Ok(Some((resource, agent::DeployOutcome::Installed))) => {
+                        eprintln!(
+                            "t-hub: installed bundled WSL helper ({})",
+                            resource.display()
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "t-hub: bundled WSL helper deployment failed; refusing to connect \
+                             with an unverified helper: {error}"
+                        );
+                        return;
+                    }
                 }
             }
             #[cfg(not(windows))]
@@ -155,9 +176,9 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
             // Log the resolved launch argv up front so a missing/unresolvable
             // agent binary is diagnosable from the core's stderr. On Windows
             // this is the `wsl.exe -d <distro> --cd ~ -e bash -lc "exec
-            // t-hub-agent --stdio"` login-shell form — `-e` execs REAL bash, not
-            // the default login shell (zsh); see agent::launch_argv. (Or the
-            // verbatim T_HUB_AGENT_BIN override.) On unix it's the direct spawn.
+            // $HOME/.local/bin/t-hub-agent --stdio"` form. `-e` execs real bash,
+            // not the default login shell; see agent::launch_argv. The
+            // T_HUB_AGENT_BIN override remains verbatim. On unix it is a direct spawn.
             let argv = agent::launch_argv(&distro);
             eprintln!("t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}");
             if let Err(e) = bridge.connect(&distro) {
@@ -167,12 +188,56 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
                 // (install it to ~/.local/bin) — surface that hint.
                 eprintln!(
                     "t-hub: agent bridge connect failed: {e} \
-                     (is `t-hub-agent` installed to ~/.local/bin inside the \
-                     distro, or T_HUB_AGENT_BIN set?)"
+                     (is the verified helper executable at ~/.local/bin/t-hub-agent \
+                     inside the distro, or is T_HUB_AGENT_BIN set?)"
                 );
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod packaged_agent_startup_tests {
+    use super::prepare_packaged_agent;
+    use crate::agent::DeployOutcome;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn developer_override_bypasses_packaged_deployment() {
+        let outcome = prepare_packaged_agent(true, None, |_| {
+            panic!("developer override must not deploy the packaged helper")
+        })
+        .unwrap();
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn packaged_startup_fails_closed_without_a_resource() {
+        let error = prepare_packaged_agent(false, None, |_| {
+            panic!("a missing resource must not attempt deployment")
+        })
+        .unwrap_err();
+        assert!(error.contains("resource path is unavailable"), "{error}");
+    }
+
+    #[test]
+    fn packaged_startup_fails_closed_when_deployment_fails() {
+        let resource = Path::new("C:/Program Files/T-Hub/resources/t-hub-agent");
+        let error = prepare_packaged_agent(false, Some(resource), |_| {
+            Err("installed digest mismatch".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "installed digest mismatch");
+    }
+
+    #[test]
+    fn packaged_startup_preserves_the_verified_resource_and_outcome() {
+        let resource = Path::new("C:/Program Files/T-Hub/resources/t-hub-agent");
+        for expected in [DeployOutcome::AlreadyCurrent, DeployOutcome::Installed] {
+            let outcome = prepare_packaged_agent(false, Some(resource), |_| Ok(expected)).unwrap();
+            assert_eq!(outcome, Some((PathBuf::from(resource), expected)));
+        }
+    }
 }
 
 /// Best-effort, off-the-main-path startup reconcile of Claude hooks. Mirrors

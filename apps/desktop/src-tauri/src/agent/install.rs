@@ -83,7 +83,7 @@ fi
 printf '%s\n' "$final_digest"
 "#;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeployOutcome {
     AlreadyCurrent,

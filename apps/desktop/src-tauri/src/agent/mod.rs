@@ -30,7 +30,9 @@ pub use connection::ConnectionState;
 pub use emit::EventEmitter;
 pub(crate) use install::bundled_agent_path;
 #[cfg(windows)]
-pub(crate) use install::{deploy_bundled_agent, DeployOutcome};
+pub(crate) use install::deploy_bundled_agent;
+#[cfg(any(windows, test))]
+pub(crate) use install::DeployOutcome;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -60,20 +62,19 @@ use emit::{
 /// ## Windows agent resolution
 ///
 /// The bundled `t-hub-agent` is installed to `~/.local/bin/t-hub-agent`
-/// inside the distro. A bare `wsl.exe -d <distro> -- t-hub-agent` runs a
-/// **non-login, non-interactive** shell, so the user's profile is never sourced
-/// and `~/.local/bin` is *not* on `PATH` — the spawn fails and no live WSL
-/// health / agent state ever reaches the sidebar. To make resolution robust we
-/// launch through a **login shell** (`bash -lc`), which sources the profile and
-/// puts `~/.local/bin` on `PATH`:
+/// inside the distro. The packaged app deploys and hash-verifies that exact
+/// path before connecting. Launching a bare `t-hub-agent` through `PATH` could
+/// select an older helper elsewhere in the user's profile, so the bridge
+/// executes the installed path directly:
 ///
 /// ```text
-/// wsl.exe -d <distro> --cd ~ -e bash -lc "exec t-hub-agent --stdio"
+/// wsl.exe -d <distro> --cd ~ -e bash -lc \
+///     "exec $HOME/.local/bin/t-hub-agent --stdio"
 /// ```
 ///
-/// `exec` replaces the login shell with the agent so there's no extra process
-/// in the tree and stdio is wired straight through. The `--cd ~` lands the
-/// child in the user's home, matching the profile-relative `~/.local/bin`.
+/// `exec` replaces the shell with the agent so there is no extra process in the
+/// tree and stdio is wired straight through. `$HOME` is expanded by WSL's bash,
+/// keeping the native Windows process independent of the distro home path.
 ///
 /// The `T_HUB_AGENT_BIN` escape hatch (honored here on Windows and in
 /// [`connection::spawn_child`] on every platform) bypasses the login-shell hop
@@ -108,12 +109,12 @@ fn windows_agent_argv(distro: &str, journal_dir: Option<&str>) -> Vec<String> {
         // The value is passed as a positional argument rather than interpolated
         // into shell source, so spaces and shell metacharacters remain inert.
         argv.extend([
-            "exec t-hub-agent --journal-dir \"$1\" --stdio".to_string(),
+            "exec $HOME/.local/bin/t-hub-agent --journal-dir \"$1\" --stdio".to_string(),
             "t-hub-agent".to_string(),
             dir.to_string(),
         ]);
     } else {
-        argv.push("exec t-hub-agent --stdio".to_string());
+        argv.push("exec $HOME/.local/bin/t-hub-agent --stdio".to_string());
     }
     argv
 }
@@ -134,13 +135,9 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         {
             return direct_agent_argv(&bin, journal_dir.as_deref());
         }
-        // Login shell so the user's profile is sourced and `~/.local/bin`
-        // (where the orchestrator installs the agent) is on PATH. `exec` so the
-        // agent replaces the shell rather than running as a child of it. `-e`
-        // makes wsl.exe exec bash DIRECTLY — a bare `--` routes the command through
-        // the user's DEFAULT login shell (zsh here), NOT bash (see the note on
-        // tmux.rs::pane_info_command). bash's login PATH also has ~/.local/bin, so
-        // the agent still resolves; `-e` just keeps us in the shell we intend.
+        // Launch the exact path that packaged startup deployed and verified.
+        // `-e` makes wsl.exe exec bash directly; a bare `--` routes the command
+        // through the user's default login shell instead.
         windows_agent_argv(distro, journal_dir.as_deref())
     }
     #[cfg(unix)]
@@ -1325,7 +1322,7 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // Default Windows path: a login shell so `~/.local/bin` is on PATH.
+            // Default Windows path: execute the deployed helper directly.
             std::env::remove_var("T_HUB_AGENT_BIN");
             let argv = launch_argv("Ubuntu-24.04");
             assert_eq!(
@@ -1339,7 +1336,7 @@ mod tests {
                     "-e",
                     "bash",
                     "-lc",
-                    "exec t-hub-agent --stdio",
+                    "exec $HOME/.local/bin/t-hub-agent --stdio",
                 ]
             );
 
@@ -1373,7 +1370,7 @@ mod tests {
                 "-e",
                 "bash",
                 "-lc",
-                "exec t-hub-agent --journal-dir \"$1\" --stdio",
+                "exec $HOME/.local/bin/t-hub-agent --journal-dir \"$1\" --stdio",
                 "t-hub-agent",
                 ".t-hub-dev/journal dir",
             ]
