@@ -701,9 +701,13 @@ fn process_permission_attestation(
     ));
     std::fs::create_dir_all(&fixture_dir).unwrap();
     let executable = fixture_dir.join(executable_name);
+    let invocation = fixture_dir.join("invoked");
     std::fs::write(
         &executable,
-        "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+        format!(
+            "#!/usr/bin/env node\nrequire('fs').writeFileSync({}, 'invoked');\nsetInterval(() => {{}}, 1000);\n",
+            serde_json::to_string(&invocation).unwrap()
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -720,7 +724,13 @@ fn process_permission_attestation(
     tmux::send_text(&target, &command, true).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut next_retry = Instant::now() + Duration::from_secs(1);
+    while !invocation.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fake Harness did not start its provider process"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let result = loop {
         if let Ok(after) = observe_harness_process(&target) {
             match attest_launch_permissions(
@@ -729,16 +739,15 @@ fn process_permission_attestation(
                 &after,
                 PermMode::BypassPermissions,
             ) {
-                Err(crate::harness::LaunchAttestationError::StaleEvidence) => {
-                    let now = Instant::now();
+                Err(error)
+                    if error == crate::harness::LaunchAttestationError::StaleEvidence
+                        || (error == crate::harness::LaunchAttestationError::WrapperObscured
+                            && executable_name != "wrapper") =>
+                {
                     assert!(
-                        now < deadline,
+                        Instant::now() < deadline,
                         "fake Harness did not produce process evidence"
                     );
-                    if now >= next_retry {
-                        tmux::send_text(&target, &command, true).unwrap();
-                        next_retry = now + Duration::from_secs(1);
-                    }
                 }
                 result => break result,
             }
