@@ -24,9 +24,13 @@
 
 mod connection;
 pub mod emit;
+mod install;
 
 pub use connection::ConnectionState;
 pub use emit::EventEmitter;
+pub(crate) use install::bundled_agent_path;
+#[cfg(windows)]
+pub(crate) use install::{deploy_bundled_agent, DeployOutcome};
 
 use std::sync::{mpsc, Arc, LazyLock, Weak};
 

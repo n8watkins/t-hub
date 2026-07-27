@@ -114,12 +114,44 @@ fn default_distro() -> String {
 /// never blocked on the WSL hop / handshake. A connect failure is logged (the
 /// UI shows the connection state); it does not abort startup. The bridge owns
 /// reconnect behavior internally.
-fn spawn_agent_connect(state: &AppState) {
+fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBuf>) {
     let bridge = state.agent.clone();
     let distro = default_distro();
     std::thread::Builder::new()
         .name("t-hub-agent-connect".into())
         .spawn(move || {
+            #[cfg(windows)]
+            if std::env::var_os("T_HUB_AGENT_BIN").is_none() {
+                match bundled_agent.as_deref() {
+                    Some(resource) => match agent::deploy_bundled_agent(&distro, resource) {
+                        Ok(agent::DeployOutcome::AlreadyCurrent) => {
+                            eprintln!(
+                                "t-hub: bundled WSL helper already current ({})",
+                                resource.display()
+                            );
+                        }
+                        Ok(agent::DeployOutcome::Installed) => {
+                            eprintln!(
+                                "t-hub: installed bundled WSL helper ({})",
+                                resource.display()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "t-hub: bundled WSL helper deployment failed; trying the \
+                                 existing helper: {error:#}"
+                            );
+                        }
+                    },
+                    None => eprintln!(
+                        "t-hub: bundled WSL helper resource path unavailable; trying the \
+                         existing helper"
+                    ),
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = bundled_agent;
+
             // Log the resolved launch argv up front so a missing/unresolvable
             // agent binary is diagnosable from the core's stderr. On Windows
             // this is the `wsl.exe -d <distro> --cd ~ -e bash -lc "exec
@@ -681,7 +713,12 @@ pub fn run() {
             // the resolved path; diagnoses "app runs but diag is stale").
             diag::log_startup();
             // Kick off the agent connection in the background once state exists.
-            spawn_agent_connect(&state);
+            let bundled_agent = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|resource_dir| agent::bundled_agent_path(&resource_dir));
+            spawn_agent_connect(&state, bundled_agent);
 
             // Managed TTS-engine lifecycle (proposal /tmp/flap-probe/
             // LIFECYCLE-PROPOSAL.md). The status snapshot is ALWAYS managed as
