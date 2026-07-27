@@ -360,6 +360,91 @@ describe("workspace registry bootstrap", () => {
     expect(state.activeTabId).toBe(addedTabId);
   });
 
+  it("drops an unacknowledged terminal that died before restart", async () => {
+    seed([
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        order: ["term-existing", "term-dead"],
+      },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 4,
+      activeTabId: "work-1",
+      tabs: [
+        {
+          id: "work-1",
+          name: "Workspace 1",
+          kind: "work",
+          tileIds: ["term-existing"],
+        },
+        { id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] },
+      ],
+    });
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_terminals") {
+        return Promise.resolve([{ id: "term-existing" }]);
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${command}`));
+    });
+    const baseline = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-existing"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain" as const,
+        tileIds: [],
+      },
+    ];
+    const local = [
+      { ...baseline[0], tileIds: ["term-existing", "term-dead"] },
+      baseline[1],
+    ];
+
+    await expect(
+      bootstrapWorkspaceTabs((tabs) =>
+        rebaseStartupWorkspaceDeltas(tabs, [
+          { baselineTabs: baseline, localTabs: local },
+        ]),
+      ),
+    ).resolves.toBe(true);
+
+    expect(
+      useWorkspace.getState().tabs.find((tab) => tab.id === "work-1")?.order,
+    ).toEqual(["term-existing"]);
+  });
+
+  it("retries when the startup terminal inventory is indeterminate", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-existing"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 4,
+      activeTabId: "work-1",
+      tabs: [
+        {
+          id: "work-1",
+          name: "Workspace 1",
+          kind: "work",
+          tileIds: ["term-existing"],
+        },
+        { id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] },
+      ],
+    });
+    invoke.mockRejectedValue(new Error("terminal inventory unavailable"));
+
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
+
+    expect(useWorkspace.getState().registryAdopted).toBe(false);
+  });
+
   it("retains startup deltas across consecutive stale server snapshots", () => {
     const initial = [
       {

@@ -395,6 +395,7 @@ export function rebaseStartupWorkspaceTabs(
 export function rebaseStartupWorkspaceDeltas(
   authoritativeTabs: TabReport[],
   deltas: StartupWorkspaceDelta[],
+  liveTerminalIds?: ReadonlySet<string>,
 ): TabReport[] {
   const eligibleTileIds = new Set(
     authoritativeTabs.flatMap((tab) => tab.tileIds),
@@ -404,7 +405,12 @@ export function rebaseStartupWorkspaceDeltas(
       baselineTabs.flatMap((tab) => tab.tileIds),
     );
     for (const id of localTabs.flatMap((tab) => tab.tileIds)) {
-      if (!baselineTileIds.has(id)) eligibleTileIds.add(id);
+      if (
+        !baselineTileIds.has(id) &&
+        (!liveTerminalIds || liveTerminalIds.has(id))
+      ) {
+        eligibleTileIds.add(id);
+      }
     }
   }
   return deltas.reduce(
@@ -450,7 +456,11 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
  * control request is still in flight.
  */
 export async function bootstrapWorkspaceTabs(
-  reconcileTabs: (tabs: TabReport[], seq: number) => TabReport[] = (tabs) => tabs,
+  reconcileTabs: (
+    tabs: TabReport[],
+    seq: number,
+    liveTerminalIds: ReadonlySet<string>,
+  ) => TabReport[] = (tabs) => tabs,
 ): Promise<boolean> {
   try {
     const res = (await controlRequest("list_tabs")) as {
@@ -469,6 +479,26 @@ export async function bootstrapWorkspaceTabs(
     }
 
     const serverTabs = res.tabs as TabReport[];
+    const { listTerminals, reportWorkspaceTabs } = await import("./client");
+    const liveTerminalIds = new Set(
+      (await listTerminals()).map((terminal) => terminal.id),
+    );
+    const reconcileWithTerminalInventory = (
+      tabs: TabReport[],
+      seq: number,
+    ): TabReport[] => {
+      const authoritativeTileIds = new Set(
+        tabs.flatMap((tab) => tab.tileIds),
+      );
+      return reconcileTabs(tabs, seq, liveTerminalIds).map((tab) => ({
+        ...tab,
+        tileIds: tab.tileIds.filter(
+          (terminalId) =>
+            authoritativeTileIds.has(terminalId) ||
+            liveTerminalIds.has(terminalId),
+        ),
+      }));
+    };
     lastSeq = res.seq;
     const local = useWorkspace.getState();
     const localWork = local.tabs.filter((tab) => tab.id !== "captains-reserved");
@@ -493,12 +523,12 @@ export async function bootstrapWorkspaceTabs(
         useWorkspace.getState().addTab();
         repairedLocal = useWorkspace.getState();
       }
-      const { listTerminals, reportWorkspaceTabs } = await import("./client");
-      const liveTerminalIds = new Set((await listTerminals()).map((terminal) => terminal.id));
-      const repairTabs = reconcileTabs(
+      const repairTabs = reconcileWithTerminalInventory(
         tabReports(repairedLocal.tabs).map((tab) => ({
           ...tab,
-          tileIds: tab.tileIds.filter((terminalId) => liveTerminalIds.has(terminalId)),
+          tileIds: tab.tileIds.filter((terminalId) =>
+            liveTerminalIds.has(terminalId),
+          ),
         })),
         res.seq,
       );
@@ -513,12 +543,16 @@ export async function bootstrapWorkspaceTabs(
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
       if (repaired.stale && Array.isArray(repaired.tabs)) {
-        return adoptAuthoritativeTabs(reconcileTabs(repaired.tabs, repaired.seq));
+        return adoptAuthoritativeTabs(
+          reconcileWithTerminalInventory(repaired.tabs, repaired.seq),
+        );
       }
       return adoptAuthoritativeTabs(repairTabs);
     }
 
-    return adoptAuthoritativeTabs(reconcileTabs(serverTabs, res.seq));
+    return adoptAuthoritativeTabs(
+      reconcileWithTerminalInventory(serverTabs, res.seq),
+    );
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
     if (!isRetryableControlError(error)) {
@@ -964,6 +998,7 @@ function startTabReporter(): void {
       localTabs: startupLocal.tabs,
     },
   ];
+  let startupLiveTerminalIds = new Set<string>();
 
   const report = (): void => {
     if (adoptingRegistry) return; // never echo a server-applied snapshot back up
@@ -992,6 +1027,7 @@ function startTabReporter(): void {
             const rebasedTabs = rebaseStartupWorkspaceDeltas(
               res.tabs,
               startupDeltas,
+              startupLiveTerminalIds,
             );
             adoptAuthoritativeTabs(rebasedTabs);
             if (startupDeltas.length > 0) {
@@ -1047,9 +1083,14 @@ function startTabReporter(): void {
   // after that same workspace boundary, so a persisted pin cannot validate
   // itself against a stale local tab during a race.
   const reconcile = (): void => {
-    void bootstrapWorkspaceTabs((tabs) =>
-      rebaseStartupWorkspaceDeltas(tabs, startupDeltas),
-    ).then((authoritative) => {
+    void bootstrapWorkspaceTabs((tabs, _seq, liveTerminalIds) => {
+      startupLiveTerminalIds = new Set(liveTerminalIds);
+      return rebaseStartupWorkspaceDeltas(
+        tabs,
+        startupDeltas,
+        startupLiveTerminalIds,
+      );
+    }).then((authoritative) => {
       if (!authoritative) {
         window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
         return;
