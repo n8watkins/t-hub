@@ -45,6 +45,7 @@ generation = sys.argv[2]
 timeout = int(sys.argv[3])
 unit = sys.argv[4]
 output_limit = int(sys.argv[5])
+terminator_script = sys.argv[6]
 if (
     not command
     or len(generation) != 32
@@ -85,6 +86,35 @@ try:
         "cgroupInode": os.fstat(directory).st_ino,
     }
     print(json.dumps({"kind": "ready", "identity": identity}, separators=(",", ":")), flush=True)
+
+    def terminate_owned_cgroup_on_parent_loss():
+        terminator_unit = f"t-hub-provider-terminator-{generation}.service"
+        encoded_identity = json.dumps(identity, separators=(",", ":"))
+        while True:
+            try:
+                subprocess.run(
+                    [
+                        "/usr/bin/systemd-run",
+                        "--user",
+                        f"--unit={terminator_unit}",
+                        "--service-type=exec",
+                        "--collect",
+                        "--quiet",
+                        "/usr/bin/python3",
+                        "-c",
+                        terminator_script,
+                        encoded_identity,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.1)
+
     authorization = sys.stdin.buffer.readline(64)
     if authorization != b"start\n":
         raise RuntimeError("provider authorization was not received")
@@ -111,8 +141,7 @@ try:
         for key, _ in selector.select(min(remaining, 0.1)):
             if key.data == "parent":
                 if os.read(sys.stdin.fileno(), 1) == b"":
-                    failure = "provider supervisor lost its parent"
-                    break
+                    terminate_owned_cgroup_on_parent_loss()
                 failure = "provider supervisor received unexpected parent input"
                 break
             chunk = os.read(key.fileobj.fileno(), 8192)
@@ -250,6 +279,44 @@ try:
         if populated != "1" or time.monotonic() >= deadline:
             raise RuntimeError("provider managed cgroup did not terminate")
         time.sleep(0.005)
+finally:
+    os.close(directory)
+"#;
+
+#[cfg(test)]
+const PROBE_PROVIDER_STOPPED_SCRIPT: &str = r#"
+import json
+import os
+import pathlib
+import sys
+
+identity = json.loads(sys.argv[1])
+try:
+    directory = os.open(
+        "/sys/fs/cgroup" + identity["cgroupPath"],
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+except FileNotFoundError:
+    raise SystemExit(0)
+try:
+    if (
+        os.fstat(directory).st_dev != identity["cgroupDevice"]
+        or os.fstat(directory).st_ino != identity["cgroupInode"]
+        or pathlib.Path(identity["cgroupPath"]).name != identity["unit"]
+    ):
+        raise RuntimeError("provider managed cgroup identity is mismatched")
+    descriptor = os.open(
+        "cgroup.events",
+        os.O_RDONLY | os.O_CLOEXEC,
+        dir_fd=directory,
+    )
+    try:
+        raw = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    values = dict(row.split() for row in raw.decode("ascii").splitlines())
+    if len(raw) > 4096 or values.get("populated") != "0":
+        raise RuntimeError("provider managed cgroup remains populated")
 finally:
     os.close(directory)
 "#;
@@ -3125,6 +3192,7 @@ impl PreparedProviderProcess {
             &timeout.as_secs().to_string(),
             &unit,
             &PROVIDER_OUTPUT_LIMIT.to_string(),
+            TERMINATE_PROVIDER_SCRIPT,
         ]);
         command
             .stdin(Stdio::piped())
@@ -3356,6 +3424,32 @@ fn terminate_managed_provider(identity: &ManagedProviderIdentity) -> Result<(), 
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(format!(
             "provider generation termination failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn managed_provider_stopped(identity: &ManagedProviderIdentity) -> Result<(), String> {
+    let identity = serde_json::to_string(identity)
+        .map_err(|error| format!("provider probe identity failed: {error}"))?;
+    let mut command = containment_command();
+    command.args([
+        "/usr/bin/python3",
+        "-c",
+        PROBE_PROVIDER_STOPPED_SCRIPT,
+        &identity,
+    ]);
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        Duration::from_secs(10),
+        CONTAINMENT_EVIDENCE_LIMIT,
+    )
+    .map_err(|error| format!("provider generation probe failed: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "provider generation remains active or ambiguous: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -4928,6 +5022,7 @@ mod tests {
         for script in [
             PROVIDER_SUPERVISOR_SCRIPT,
             TERMINATE_PROVIDER_SCRIPT,
+            PROBE_PROVIDER_STOPPED_SCRIPT,
             ATOMIC_CONTAINMENT_INSPECTION_SCRIPT,
             CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
         ] {
@@ -4982,9 +5077,18 @@ mod tests {
 
     #[test]
     fn cleanup_review_provider_supervisor_terminates_on_parent_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let escaped_pid_path = directory.path().join("escaped.pid");
+        let script = format!(
+            "import pathlib,subprocess,time; \
+             child=subprocess.Popen(['/usr/bin/setsid','/bin/sleep','30']); \
+             pathlib.Path({:?}).write_text(str(child.pid)); \
+             time.sleep(30)",
+            escaped_pid_path.to_str().unwrap()
+        );
         let mut provider = PreparedProviderProcess::spawn_command_with_timeout(
-            vec!["/bin/sleep".into(), "30".into()],
-            Duration::from_secs(5),
+            vec!["/usr/bin/python3".into(), "-c".into(), script],
+            Duration::from_secs(30),
         )
         .unwrap();
         provider
@@ -4994,21 +5098,17 @@ mod tests {
             .write_all(b"start\n")
             .unwrap();
         provider.stdin.as_mut().unwrap().flush().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !escaped_pid_path.is_file() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let escaped_pid = std::fs::read_to_string(&escaped_pid_path).unwrap();
+        let escaped_pid = escaped_pid.trim();
         provider.stdin.take();
-        let message = provider
-            .messages
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            serde_json::from_slice::<ProviderSupervisorMessage>(&message).unwrap(),
-            ProviderSupervisorMessage::Terminated {
-                error: Some(error),
-                ..
-            } if error.contains("lost its parent")
-        ));
-        terminate_managed_provider(&provider.identity).unwrap();
         provider.finish_transport();
+        managed_provider_stopped(&provider.identity).unwrap();
+        assert!(!Path::new(&format!("/proc/{escaped_pid}")).exists());
         provider.finished = true;
     }
 
