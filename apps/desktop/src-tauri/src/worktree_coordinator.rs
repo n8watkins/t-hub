@@ -549,6 +549,14 @@ impl WorktreeCoordinator {
         self: &Arc<Self>,
         record: WorktreeRetirement,
     ) -> Result<bool, String> {
+        self.start_provider_worker_for_state(record, None)
+    }
+
+    fn start_provider_worker_for_state(
+        self: &Arc<Self>,
+        record: WorktreeRetirement,
+        required_state: Option<RetirementState>,
+    ) -> Result<bool, String> {
         {
             let mut workers = self
                 .workers
@@ -556,6 +564,19 @@ impl WorktreeCoordinator {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !workers.insert(record.operation_id.clone()) {
                 return Ok(false);
+            }
+            let snapshot = self.lock();
+            let Some(current) = snapshot
+                .retirements
+                .get(&record.operation_id)
+                .filter(|current| **current == record)
+            else {
+                workers.remove(&record.operation_id);
+                return Err("Cargo cleanup reservation changed before worker ownership".into());
+            };
+            if required_state.is_some_and(|state| current.state != state) {
+                workers.remove(&record.operation_id);
+                return Err("Cargo cleanup reservation is not recoverable".into());
             }
         }
         let coordinator = Arc::clone(self);
@@ -574,6 +595,55 @@ impl WorktreeCoordinator {
             return Err(format!("could not start Cargo cleanup worker: {error}"));
         }
         Ok(true)
+    }
+
+    pub fn recovery_record(
+        &self,
+        operation_id: &str,
+        worktree_path: &str,
+    ) -> Result<WorktreeRetirement, WorktreeCoordinatorError> {
+        let worktree_path = normalize_path(worktree_path);
+        let snapshot = self.lock();
+        let record = snapshot
+            .retirements
+            .get(operation_id)
+            .ok_or_else(|| WorktreeCoordinatorError::UnknownOperation(operation_id.to_string()))?;
+        if record.state != RetirementState::RecoveryRequired
+            || record.worktree_path != worktree_path
+            || record.last_error.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(WorktreeCoordinatorError::Conflict(
+                "cleanup recovery requires one exact recoveryRequired reservation".into(),
+            ));
+        }
+        Ok(record.clone())
+    }
+
+    pub fn validate_recovery_capture(
+        &self,
+        record: &WorktreeRetirement,
+        capture: &RetirementCleanupCapture,
+    ) -> Result<(), String> {
+        if capture.dirty || !capture.merged || !capture.is_linked {
+            return Err(
+                "cleanup recovery requires a clean, merged, linked non-primary worktree".into(),
+            );
+        }
+        let request = read_provider_request(record)?;
+        if request.worktree != capture.worktree || request.targets != capture.targets {
+            return Err(
+                "cleanup recovery target or complete Cargo inventory changed since reservation"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resume_recovery_worker(
+        self: &Arc<Self>,
+        record: WorktreeRetirement,
+    ) -> Result<bool, String> {
+        self.start_provider_worker_for_state(record, Some(RetirementState::RecoveryRequired))
     }
 
     pub fn recover_pending(self: &Arc<Self>) {
@@ -1394,6 +1464,70 @@ mod tests {
             ProviderCompletion::RecoveryRequired(_)
         ));
     }
+
+    #[test]
+    fn recovery_requires_exact_operation_target_request_and_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let request_path = directory.path().join("request.json");
+        let coordinator =
+            WorktreeCoordinator::load(directory.path().join("retirements.json")).unwrap();
+        let record = coordinator
+            .begin_retirement("/repo/worktree", request_path.to_str().unwrap())
+            .unwrap();
+        let capture = RetirementCleanupCapture {
+            worktree: CapturedWorktreeIdentity {
+                path: "/repo/worktree".into(),
+                device: 7,
+                inode: 11,
+                head: "1234567890123456789012345678901234567890".into(),
+                branch: "feature".into(),
+            },
+            targets: vec![CapturedPathIdentity {
+                path: "/repo/worktree/apps/cli/target".into(),
+                device: 7,
+                inode: 12,
+            }],
+            dirty: false,
+            merged: true,
+            is_linked: true,
+        };
+        coordinator
+            .write_provider_request(&record, capture.clone())
+            .unwrap();
+        coordinator
+            .transition(
+                &record.operation_id,
+                RetirementState::RecoveryRequired,
+                Some("ambiguous provider result".into()),
+            )
+            .unwrap();
+
+        assert!(coordinator
+            .recovery_record(&record.operation_id, "/repo/other")
+            .is_err());
+        let recovered = coordinator
+            .recovery_record(&record.operation_id, "/repo/worktree")
+            .unwrap();
+        coordinator
+            .validate_recovery_capture(&recovered, &capture)
+            .unwrap();
+        let mut changed = capture;
+        changed.targets[0].inode += 1;
+        assert!(coordinator
+            .validate_recovery_capture(&recovered, &changed)
+            .is_err());
+
+        let restarted =
+            WorktreeCoordinator::load(directory.path().join("retirements.json")).unwrap();
+        assert_eq!(
+            restarted
+                .recovery_record(&record.operation_id, "/repo/worktree")
+                .unwrap()
+                .state,
+            RetirementState::RecoveryRequired
+        );
+    }
+
 
     #[test]
     fn quarantined_provider_refusal_requires_recovery() {

@@ -4111,7 +4111,8 @@ fn required_tier(command: &str) -> CommandTier {
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
         // process/state-changing and control-gated + audited.
-        | "abort_session" | "plane_admin" | "cleanup_worktree_artifacts" => {
+        | "abort_session" | "plane_admin" | "cleanup_worktree_artifacts"
+        | "recover_worktree_artifacts" => {
             CommandTier::ProcessChanging
         }
         "focus_session" | "history_focus" | "history_list" | "preview_select"
@@ -5526,13 +5527,12 @@ fn governor_gate<'a>(
                 }
             })
         }
-        "close_terminal" | "cleanup_worktree_artifacts" => {
-            ctx.governor
-                .check_destructive(now)
-                .map(|()| GovernorAdmission::Destructive {
-                    governor: &ctx.governor,
-                })
-        }
+        "close_terminal" | "cleanup_worktree_artifacts" | "recover_worktree_artifacts" => ctx
+            .governor
+            .check_destructive(now)
+            .map(|()| GovernorAdmission::Destructive {
+                governor: &ctx.governor,
+            }),
         "send_keys" if keys_are_kill_style(args) => {
             ctx.governor
                 .check_destructive(now)
@@ -6778,6 +6778,9 @@ fn dispatch_with_caller(
         "cleanup_worktree_artifacts" => {
             cleanup_worktree_artifacts(ctx, args, caller, trusted_internal)
         }
+        "recover_worktree_artifacts" => {
+            recover_worktree_artifacts(ctx, args, caller, trusted_internal)
+        }
         // Comms-plane Phase 3: the ABORT/interrupt-subordinate primitive (§2.7 R-H3). A
         // preempt CONTROL signal (an Escape interrupt), NOT a queued input message, so it
         // cannot be typed over or corrupt a draft. Gated by `can_abort` (Cortana->captain,
@@ -7040,6 +7043,7 @@ fn enforce_delegated_admin_command(
             | "create_worktree"
             | "close_terminal"
             | "cleanup_worktree_artifacts"
+            | "recover_worktree_artifacts"
             | "execute_admin_operation"
             | "list_admin_grants"
     ) {

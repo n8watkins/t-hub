@@ -202,6 +202,47 @@ fn exact_worktree_cleanup_is_forwarded_without_source_removal_flags() {
 }
 
 #[test]
+fn exact_worktree_recovery_approval_and_resume_are_operation_bound() {
+    let (output, request) = cli_with_server(&[
+        "admin",
+        "approve-recovery",
+        "grant-1",
+        "/tmp/worktree-1",
+        "operation-1",
+        "--ship",
+        "alpha",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(request["command"], "approve_admin_action");
+    assert_eq!(request["args"]["operation"], "cleanupWorktree");
+    assert_eq!(request["args"]["operationId"], "operation-1");
+    assert_eq!(request["args"]["target"]["worktreeId"], "/tmp/worktree-1");
+
+    let (output, request) = cli_with_server(&[
+        "admin",
+        "recover-worktree",
+        "/tmp/worktree-1",
+        "operation-1",
+        "--approval",
+        "approval-1",
+        "--confirm",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(request["command"], "recover_worktree_artifacts");
+    assert_eq!(
+        request["args"],
+        serde_json::json!({
+            "worktreePath": "/tmp/worktree-1",
+            "operationId": "operation-1",
+            "approvalId": "approval-1",
+            "confirm": true,
+        })
+    );
+}
+
+#[test]
 fn bounded_admin_operations_forward_typed_authoritative_targets() {
     let cases = [
         (
