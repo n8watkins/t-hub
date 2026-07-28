@@ -41,49 +41,191 @@ def unescape_mount(value):
         value = value.replace(encoded, decoded)
     return value
 
-pending = [root_pid]
-seen = set()
-while pending and len(seen) < 256:
-    pid = pending.pop()
-    if pid in seen:
-        continue
-    seen.add(pid)
+def process_identity(pid):
+    fields = pathlib.Path(f"/proc/{pid}/stat").read_text().split()
+    if len(fields) < 22:
+        raise RuntimeError("managed process identity is incomplete")
+    return (pid, fields[21])
+
+def children(pid):
+    values = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+    return [int(value) for value in values]
+
+def process_tree():
+    pending = [root_pid]
+    identities = {}
+    edges = {}
+    while pending:
+        pid = pending.pop()
+        if pid in identities:
+            raise RuntimeError("managed process tree contains a cycle")
+        if len(identities) >= 256:
+            raise RuntimeError("managed process tree exceeds the safe bound")
+        identities[pid] = process_identity(pid)
+        descendants = children(pid)
+        edges[pid] = descendants
+        pending.extend(descendants)
+    return identities, edges
+
+def evidence_for(pid):
+    environ = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    encoded = next(
+        (
+            item.split(b"=", 1)[1]
+            for item in environ
+            if item.startswith(b"T_HUB_WORKTREE_CONTAINMENT=")
+        ),
+        None,
+    )
+    if encoded is None or len(encoded) > 65536:
+        raise RuntimeError("managed process lacks bounded containment evidence")
+    padding = b"=" * (-len(encoded) % 4)
+    evidence = json.loads(base64.urlsafe_b64decode(encoded + padding))
+    if (
+        evidence.get("version") != 1
+        or not isinstance(evidence.get("launchNonce"), str)
+        or len(evidence["launchNonce"]) != 32
+        or target not in evidence.get("blockers", [])
+    ):
+        raise RuntimeError("managed process containment evidence is mismatched")
+    return evidence
+
+def namespace(pid, name):
+    return os.readlink(f"/proc/{pid}/ns/{name}")
+
+def cgroup(pid):
+    value = pathlib.Path(f"/proc/{pid}/cgroup").read_text()
+    if not value or "\n\n" in value:
+        raise RuntimeError("managed process cgroup identity is malformed")
+    return value
+
+def target_is_masked(root):
+    visible = os.stat(root + target["path"])
+    return visible.st_dev != target["device"] or visible.st_ino != target["inode"]
+
+def target_is_unreachable_or_masked(root):
     try:
-        children = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-        pending.extend(int(child) for child in children)
-        environ = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-        encoded = next(
-            (
-                item.split(b"=", 1)[1]
-                for item in environ
-                if item.startswith(b"T_HUB_WORKTREE_CONTAINMENT=")
-            ),
-            None,
-        )
-        if encoded is None or len(encoded) > 65536:
-            continue
-        padding = b"=" * (-len(encoded) % 4)
-        evidence = json.loads(base64.urlsafe_b64decode(encoded + padding))
-        if target not in evidence:
-            continue
-        contained = False
-        for line in pathlib.Path(f"/proc/{pid}/mountinfo").read_text().splitlines():
-            fields = line.split()
-            separator = fields.index("-")
-            if (
-                unescape_mount(fields[4]) == target["path"]
-                and fields[separator + 1] == "tmpfs"
-            ):
-                contained = True
-                break
-        if not contained:
-            continue
-        visible = os.stat(f"/proc/{pid}/root{target['path']}")
-        if visible.st_dev != target["device"] or visible.st_ino != target["inode"]:
-            sys.exit(0)
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return target_is_masked(root)
+    except (FileNotFoundError, PermissionError):
+        return True
+
+def descriptors(pid):
+    result = {}
+    for fd in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            result[fd.name] = os.readlink(fd)
+        except FileNotFoundError:
+            raise RuntimeError("containment supervisor descriptors changed during inspection")
+    return result
+
+before, edges = process_tree()
+root_children = edges[root_pid]
+if len(root_children) != 1:
+    raise RuntimeError("containment supervisor has an ambiguous child set")
+supervisor = pathlib.Path(f"/proc/{root_pid}/exe").stat()
+bwrap = pathlib.Path("/usr/bin/bwrap").stat()
+if (supervisor.st_dev, supervisor.st_ino) != (bwrap.st_dev, bwrap.st_ino):
+    raise RuntimeError("managed process root is not the exact containment supervisor")
+if os.getuid() != pathlib.Path(f"/proc/{root_pid}").stat().st_uid:
+    raise RuntimeError("containment supervisor ownership is mismatched")
+supervisor_cwd = os.readlink(f"/proc/{root_pid}/cwd")
+if supervisor_cwd == target["path"] or supervisor_cwd.startswith(target["path"] + "/"):
+    raise RuntimeError("containment supervisor cwd reaches the target")
+supervisor_descriptors = descriptors(root_pid)
+for destination in supervisor_descriptors.values():
+    if destination == target["path"] or destination.startswith(target["path"] + "/"):
+        raise RuntimeError("containment supervisor retains a target descriptor")
+
+workload = root_children[0]
+expected_evidence = evidence_for(workload)
+expected_mount = namespace(workload, "mnt")
+expected_pid = namespace(workload, "pid")
+expected_cgroup = cgroup(workload)
+if expected_mount == namespace(root_pid, "mnt") or expected_pid == namespace(root_pid, "pid"):
+    raise RuntimeError("managed workload lacks private mount or PID namespaces")
+
+for pid in before:
+    if pid == root_pid:
         continue
-raise RuntimeError("managed process tree lacks exact target containment")
+    if evidence_for(pid) != expected_evidence:
+        raise RuntimeError("managed process containment evidence changed")
+    if namespace(pid, "mnt") != expected_mount or namespace(pid, "pid") != expected_pid:
+        raise RuntimeError("managed process escaped the containment namespaces")
+    if cgroup(pid) != expected_cgroup:
+        raise RuntimeError("managed process escaped the bounded cgroup")
+    if not target_is_masked(f"/proc/{pid}/root"):
+        raise RuntimeError("managed process can access the real target")
+    for alias in (
+        f"/proc/{pid}/root/proc/1/root",
+        f"/proc/{pid}/root/proc/self/root",
+    ):
+        if not target_is_unreachable_or_masked(alias):
+            raise RuntimeError("managed process can access the target through proc root")
+    contained = False
+    for line in pathlib.Path(f"/proc/{pid}/mountinfo").read_text().splitlines():
+        fields = line.split()
+        separator = fields.index("-")
+        if (
+            unescape_mount(fields[4]) == target["path"]
+            and fields[separator + 1] == "tmpfs"
+        ):
+            contained = True
+            break
+    if not contained:
+        raise RuntimeError("managed process lacks the exact target blocker")
+
+after, after_edges = process_tree()
+if (
+    before != after
+    or edges != after_edges
+    or supervisor_descriptors != descriptors(root_pid)
+):
+    raise RuntimeError("managed process tree changed during containment inspection")
+sys.exit(0)
+"#;
+
+const CONTAINMENT_PREFLIGHT_SCRIPT: &str = r#"
+import json
+import os
+import pathlib
+import sys
+
+targets = json.loads(sys.argv[1])
+if not pathlib.Path("/bin/sh").is_file():
+    raise RuntimeError("unrelated filesystem paths are unavailable")
+for target in targets:
+    path = target["path"]
+    expected = (target["device"], target["inode"])
+    parent = str(pathlib.Path(path).parent)
+    name = pathlib.Path(path).name
+    aliases = [
+        path,
+        parent + "/./" + name,
+        path + "/../" + name,
+        "/proc/1/root" + path,
+        "/proc/self/root" + path,
+    ]
+    symlink_alias = pathlib.Path(path, ".t-hub-target-alias")
+    symlink_alias.unlink(missing_ok=True)
+    symlink_alias.symlink_to(path)
+    aliases.append(str(symlink_alias))
+    root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        opened = os.open(path.lstrip("/"), os.O_RDONLY | os.O_DIRECTORY, dir_fd=root)
+        opened_stat = os.fstat(opened)
+        os.close(opened)
+    finally:
+        os.close(root)
+    if (opened_stat.st_dev, opened_stat.st_ino) == expected:
+        raise RuntimeError("openat reached the real target")
+    for alias in aliases:
+        try:
+            os.chdir(alias)
+            visible = os.stat(".")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if (visible.st_dev, visible.st_ino) == expected:
+            raise RuntimeError("namespace alias reached the real target")
 "#;
 
 const INSPECTION_SCRIPT: &str = r#"
@@ -400,18 +542,25 @@ impl WorktreeAdmissionGuard {
         if self.blockers.is_empty() {
             return Ok((command.map(str::to_string), env));
         }
-        require_namespace_containment()?;
-        let evidence = serde_json::to_vec(&self.blockers)
-            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-            .map_err(|error| format!("worktree containment evidence failed: {error}"))?;
+        let evidence = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "launchNonce": uuid::Uuid::new_v4().simple().to_string(),
+            "blockers": &self.blockers,
+        }))
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| format!("worktree containment evidence failed: {error}"))?;
         if evidence.len() > CONTAINMENT_EVIDENCE_LIMIT {
             return Err("worktree containment evidence exceeds the safe bound".into());
         }
+        require_namespace_containment(&self.blockers, &evidence)?;
         env.push(("T_HUB_WORKTREE_CONTAINMENT".into(), evidence.clone()));
         let mut wrapper = vec![
             "exec /usr/bin/bwrap".to_string(),
             "--die-with-parent".into(),
+            "--unshare-pid".into(),
             "--bind / /".into(),
+            "--proc /proc".into(),
+            "--dev /dev".into(),
         ];
         for blocker in &self.blockers {
             wrapper.push(format!("--tmpfs {}", shell_quote(&blocker.path)));
@@ -1217,16 +1366,37 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn require_namespace_containment() -> Result<(), String> {
+fn require_namespace_containment(
+    blockers: &[CapturedWorktreeIdentity],
+    evidence: &str,
+) -> Result<(), String> {
     let mut command = containment_command();
     command.args([
         "/usr/bin/bwrap",
         "--die-with-parent",
+        "--unshare-pid",
         "--bind",
         "/",
         "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+    ]);
+    for blocker in blockers {
+        command.args(["--tmpfs", &blocker.path]);
+    }
+    let targets = serde_json::to_string(blockers)
+        .map_err(|error| format!("worktree containment preflight identity failed: {error}"))?;
+    command.args([
+        "--setenv",
+        "T_HUB_WORKTREE_CONTAINMENT",
+        evidence,
         "--",
-        "/bin/true",
+        "/usr/bin/python3",
+        "-c",
+        CONTAINMENT_PREFLIGHT_SCRIPT,
+        &targets,
     ]);
     let output =
         crate::bounded_exec::output_with_timeout_and_limit(command, Duration::from_secs(5), 4096)
@@ -1912,12 +2082,21 @@ mod tests {
             stat.dev(),
             stat.ino()
         );
+        let proc_probe = format!(
+            "import os; p={:?}; expected=({},{}); \
+             assert (os.stat('/proc/1/root'+p).st_dev,os.stat('/proc/1/root'+p).st_ino)!=expected; \
+             assert (os.stat('/proc/self/root'+p).st_dev,os.stat('/proc/self/root'+p).st_ino)!=expected",
+            worktree.to_str().unwrap(),
+            stat.dev(),
+            stat.ino(),
+        );
         let command = format!(
-            "cd {} && test \"$(stat -c %d:%i .)\" != {}:{} && python3 -c {}",
+            "cd {} && test \"$(stat -c %d:%i .)\" != {}:{} && python3 -c {} && python3 -c {}",
             shell_quote(alias.to_str().unwrap()),
             stat.dev(),
             stat.ino(),
             shell_quote(&direct),
+            shell_quote(&proc_probe),
         );
         let (contained, _) = admission
             .contain_process(Some(&command), Vec::new())
@@ -1934,7 +2113,7 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         let (contained, env) = admission
-            .contain_process(Some("sleep 30"), Vec::new())
+            .contain_process(Some("sleep 30 & wait"), Vec::new())
             .unwrap();
         crate::tmux::new_session_with_env(
             &session,
