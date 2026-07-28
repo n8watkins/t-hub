@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -518,13 +519,21 @@ impl std::error::Error for WorktreeCoordinatorError {}
 pub struct WorktreeCoordinator {
     path: Option<PathBuf>,
     inner: Mutex<WorktreeRetirementSnapshot>,
-    admissions: Mutex<BTreeMap<String, usize>>,
     workers: Mutex<BTreeSet<String>>,
-    boundaries: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    publication: Mutex<()>,
+    boundaries: Mutex<BTreeMap<String, Arc<WorktreeBoundary>>>,
+}
+
+#[derive(Debug)]
+struct WorktreeBoundary {
+    coordination: Mutex<()>,
+    admissions: AtomicUsize,
+    retirement: Mutex<Option<WorktreeRetirement>>,
 }
 
 pub struct WorktreeAdmissionGuard {
     coordinator: Arc<WorktreeCoordinator>,
+    boundary: Arc<WorktreeBoundary>,
     path: String,
     blockers: Vec<CapturedWorktreeIdentity>,
 }
@@ -582,17 +591,26 @@ impl WorktreeAdmissionGuard {
 
 impl Drop for WorktreeAdmissionGuard {
     fn drop(&mut self) {
-        let mut admissions = self
-            .coordinator
-            .admissions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let remove = admissions.get_mut(&self.path).is_some_and(|count| {
-            *count -= 1;
-            *count == 0
-        });
-        if remove {
-            admissions.remove(&self.path);
+        if self.boundary.admissions.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let active = self
+                .boundary
+                .retirement
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_some_and(|record| record.state.is_active());
+            if !active {
+                let mut boundaries = self
+                    .coordinator
+                    .boundaries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if boundaries.get(&self.path).is_some_and(|boundary| {
+                    Arc::ptr_eq(boundary, &self.boundary) && Arc::strong_count(boundary) == 2
+                }) {
+                    boundaries.remove(&self.path);
+                }
+            }
         }
     }
 }
@@ -618,12 +636,27 @@ impl WorktreeCoordinator {
             }
         };
         validate_snapshot(&snapshot)?;
+        let boundaries = snapshot
+            .retirements
+            .values()
+            .filter(|record| record.state.is_active())
+            .map(|record| {
+                (
+                    record.worktree_path.clone(),
+                    Arc::new(WorktreeBoundary {
+                        coordination: Mutex::new(()),
+                        admissions: AtomicUsize::new(0),
+                        retirement: Mutex::new(Some(record.clone())),
+                    }),
+                )
+            })
+            .collect();
         Ok(Self {
             path: Some(path),
             inner: Mutex::new(snapshot),
-            admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
-            boundaries: Mutex::new(BTreeMap::new()),
+            publication: Mutex::new(()),
+            boundaries: Mutex::new(boundaries),
         })
     }
 
@@ -635,10 +668,33 @@ impl WorktreeCoordinator {
         Self {
             path: None,
             inner: Mutex::new(WorktreeRetirementSnapshot::default()),
-            admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
+            publication: Mutex::new(()),
             boundaries: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn boundary_for(&self, path: &str) -> Arc<WorktreeBoundary> {
+        let mut boundaries = self
+            .boundaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(boundaries.entry(path.to_string()).or_insert_with(|| {
+            Arc::new(WorktreeBoundary {
+                coordination: Mutex::new(()),
+                admissions: AtomicUsize::new(0),
+                retirement: Mutex::new(None),
+            })
+        }))
+    }
+
+    fn boundary_snapshot(&self) -> Vec<(String, Arc<WorktreeBoundary>)> {
+        self.boundaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(path, boundary)| (path.clone(), Arc::clone(boundary)))
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, WorktreeRetirementSnapshot> {
@@ -688,40 +744,22 @@ impl WorktreeCoordinator {
             ));
         }
 
-        let mut boundaries = self
-            .boundaries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let boundary = Arc::clone(
-            boundaries
-                .entry(worktree_path.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        );
-        drop(boundaries);
+        let boundary = self.boundary_for(&worktree_path);
         let _boundary = boundary
+            .coordination
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _boundaries = self
-            .boundaries
+        if let Some(record) = boundary
+            .retirement
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let admissions = self
-            .admissions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut snapshot = self.lock();
-        if let Some(record) = matching_active_retirement(&snapshot, &worktree_path) {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|record| record.state.is_active())
+            .cloned()
+        {
             return Err(WorktreeCoordinatorError::Conflict(format!(
                 "worktree '{}' already has active retirement reservation '{}'",
                 record.worktree_path, record.operation_id
-            )));
-        }
-        if admissions
-            .keys()
-            .any(|candidate_path| path_within(candidate_path, &worktree_path))
-        {
-            return Err(WorktreeCoordinatorError::Conflict(format!(
-                "worktree '{worktree_path}' has activity being admitted"
             )));
         }
         let live_activity =
@@ -732,22 +770,55 @@ impl WorktreeCoordinator {
                 live_activity.join(", ")
             )));
         }
-        let previous = snapshot.clone();
         let timestamp = now_ms();
         let record = WorktreeRetirement {
             operation_id: uuid::Uuid::new_v4().simple().to_string(),
-            worktree_path,
+            worktree_path: worktree_path.clone(),
             request_path: request_path.to_string(),
             state: RetirementState::Reserved,
             created_at: timestamp,
             updated_at: timestamp,
             last_error: None,
         };
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .boundary_snapshot()
+            .iter()
+            .any(|(_, boundary)| boundary.admissions.load(Ordering::SeqCst) > 0)
+        {
+            return Err(WorktreeCoordinatorError::Conflict(format!(
+                "worktree '{worktree_path}' has activity being admitted"
+            )));
+        }
+        *boundary
+            .retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(record.clone());
+        drop(_publication);
+        let mut snapshot = self.lock();
+        let previous = snapshot.clone();
         snapshot
             .retirements
             .insert(record.operation_id.clone(), record.clone());
         if let Err(error) = self.persist(&snapshot) {
             *snapshot = previous;
+            let _publication = self
+                .publication
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut retirement = boundary
+                .retirement
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if retirement
+                .as_ref()
+                .is_some_and(|candidate| candidate.operation_id == record.operation_id)
+            {
+                *retirement = None;
+            }
             return Err(error);
         }
         Ok(record)
@@ -773,17 +844,26 @@ impl WorktreeCoordinator {
             *snapshot = previous;
             return Err(error);
         }
+        let boundary = self.boundary_for(&updated.worktree_path);
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *boundary
+            .retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(updated.clone());
         if !state.is_active() {
             let worktree_path = updated.worktree_path.clone();
             drop(snapshot);
+            drop(_publication);
             let mut boundaries = self
                 .boundaries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if boundaries
-                .get(&worktree_path)
-                .is_some_and(|boundary| Arc::strong_count(boundary) == 1)
-            {
+            if boundaries.get(&worktree_path).is_some_and(|boundary| {
+                boundary.admissions.load(Ordering::SeqCst) == 0 && Arc::strong_count(boundary) == 2
+            }) {
                 boundaries.remove(&worktree_path);
             }
         }
@@ -1037,56 +1117,56 @@ impl WorktreeCoordinator {
             .map_err(|error| {
                 format!("{operation}: could not resolve worktree activity: {error}")
             })?;
-        loop {
-            let mut boundaries = self
-                .boundaries
+        let boundary = self.boundary_for(&candidate_path);
+        let records = {
+            let _publication = self
+                .publication
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let snapshot = self.lock();
-            let boundary = matching_active_retirement(&snapshot, &candidate_path).map(|record| {
-                Arc::clone(
-                    boundaries
-                        .entry(record.worktree_path.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(()))),
-                )
-            });
-            drop(snapshot);
-            if let Some(boundary) = boundary {
-                drop(boundaries);
-                let _boundary = boundary
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let snapshot = self.lock();
-                if let Some(record) = matching_active_retirement(&snapshot, &candidate_path) {
-                    return Err(format!(
-                        "{operation}: worktree '{}' is reserved for Cargo cleanup by operation '{}'",
-                        record.worktree_path, record.operation_id
-                    ));
-                }
-                continue;
-            }
-            let mut admissions = self
-                .admissions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let snapshot = self.lock();
-            let blockers = snapshot
-                .retirements
-                .values()
-                .filter(|record| record.state.is_active())
-                .map(read_provider_request)
-                .collect::<Result<Vec<_>, _>>()?
+            boundary.admissions.fetch_add(1, Ordering::SeqCst);
+            self.boundary_snapshot()
+                .into_iter()
+                .filter_map(|(_, boundary)| {
+                    boundary
+                        .retirement
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                        .filter(|record| record.state.is_active())
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(record) = records
+            .iter()
+            .find(|record| path_within(&candidate_path, &record.worktree_path))
+        {
+            boundary.admissions.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!(
+                "{operation}: worktree '{}' is reserved for Cargo cleanup by operation '{}'",
+                record.worktree_path, record.operation_id
+            ));
+        }
+        let blockers = match records
+            .iter()
+            .map(read_provider_request)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(requests) => requests
                 .into_iter()
                 .map(|request| request.worktree)
-                .collect();
-            *admissions.entry(candidate_path.clone()).or_default() += 1;
-            drop(boundaries);
-            return Ok(WorktreeAdmissionGuard {
-                coordinator: Arc::clone(self),
-                path: candidate_path,
-                blockers,
-            });
-        }
+                .collect(),
+            Err(error) => {
+                boundary.admissions.fetch_sub(1, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        Ok(WorktreeAdmissionGuard {
+            coordinator: Arc::clone(self),
+            boundary,
+            path: candidate_path,
+            blockers,
+        })
     }
 
     fn run_provider(
@@ -1094,29 +1174,21 @@ impl WorktreeCoordinator {
         record: &WorktreeRetirement,
         request: &RetirementCleanupRequest,
     ) -> Result<std::process::Output, String> {
-        let boundary = {
-            let mut boundaries = self
-                .boundaries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(
-                boundaries
-                    .entry(record.worktree_path.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
+        let boundary = self.boundary_for(&record.worktree_path);
         let _boundary = boundary
+            .coordination
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
             .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
         verify_process_containment(&panes, &request.worktree)?;
         if self
-            .admissions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .any(|candidate| path_within(candidate, &record.worktree_path))
+            .boundary_snapshot()
+            .iter()
+            .any(|(candidate, boundary)| {
+                path_within(candidate, &record.worktree_path)
+                    && boundary.admissions.load(Ordering::SeqCst) > 0
+            })
         {
             return Err(
                 "Cargo cleanup commit refused because worktree activity is admitted".into(),
@@ -1276,15 +1348,6 @@ pub(crate) fn path_within(candidate: &str, root: &str) -> bool {
     }
 }
 
-fn matching_active_retirement<'a>(
-    snapshot: &'a WorktreeRetirementSnapshot,
-    candidate_path: &str,
-) -> Option<&'a WorktreeRetirement> {
-    snapshot.retirements.values().find(|record| {
-        record.state.is_active() && path_within(candidate_path, &record.worktree_path)
-    })
-}
-
 fn validate_snapshot(
     snapshot: &WorktreeRetirementSnapshot,
 ) -> Result<(), WorktreeCoordinatorError> {
@@ -1294,6 +1357,7 @@ fn validate_snapshot(
             snapshot.schema_version
         )));
     }
+    let mut active_paths = BTreeSet::new();
     for (operation_id, record) in &snapshot.retirements {
         if operation_id.is_empty() || operation_id != &record.operation_id {
             return Err(WorktreeCoordinatorError::CorruptState(
@@ -1313,6 +1377,12 @@ fn validate_snapshot(
         if record.updated_at < record.created_at {
             return Err(WorktreeCoordinatorError::CorruptState(format!(
                 "retirement '{operation_id}' was updated before it was created"
+            )));
+        }
+        if record.state.is_active() && !active_paths.insert(normalize_path(&record.worktree_path)) {
+            return Err(WorktreeCoordinatorError::CorruptState(format!(
+                "worktree '{}' has duplicate active retirements",
+                record.worktree_path
             )));
         }
     }
@@ -2217,9 +2287,10 @@ mod tests {
         );
         drop(boundaries);
         let _first_guard = first
+            .coordination
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(second.try_lock().is_ok());
+        assert!(second.coordination.try_lock().is_ok());
         let (sent, received) = std::sync::mpsc::channel();
         let admitting = Arc::clone(&coordinator);
         let unrelated = unrelated.to_str().unwrap().to_string();
