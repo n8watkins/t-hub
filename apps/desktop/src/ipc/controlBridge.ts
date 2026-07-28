@@ -446,6 +446,25 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
   return true;
 }
 
+function terminalLifecycleFingerprint(): string {
+  return Object.entries(useWorkspace.getState().terminals)
+    .map(([id, terminal]) => `${id}\0${terminal.state}`)
+    .sort()
+    .join("\0");
+}
+
+async function stableLiveTerminalIds(
+  listTerminals: () => Promise<Array<{ id: string }>>,
+): Promise<Set<string>> {
+  for (;;) {
+    const before = terminalLifecycleFingerprint();
+    const terminals = await listTerminals();
+    if (before === terminalLifecycleFingerprint()) {
+      return new Set(terminals.map((terminal) => terminal.id));
+    }
+  }
+}
+
 /**
  * Hydrate the UI from the server registry before the first layout report.
  *
@@ -480,31 +499,20 @@ export async function bootstrapWorkspaceTabs(
 
     const serverTabs = res.tabs as TabReport[];
     const { listTerminals, reportWorkspaceTabs } = await import("./client");
-    const registeredBeforeInventory = new Set(
-      Object.keys(useWorkspace.getState().terminals),
-    );
-    const liveTerminalIds = new Set(
-      (await listTerminals()).map((terminal) => terminal.id),
-    );
     const reconcileWithTerminalInventory = (
       tabs: TabReport[],
       seq: number,
+      liveTerminalIds: ReadonlySet<string>,
     ): TabReport[] => {
-      const eligibleTerminalIds = new Set(liveTerminalIds);
-      for (const terminalId of Object.keys(useWorkspace.getState().terminals)) {
-        if (!registeredBeforeInventory.has(terminalId)) {
-          eligibleTerminalIds.add(terminalId);
-        }
-      }
       const authoritativeTileIds = new Set(
         tabs.flatMap((tab) => tab.tileIds),
       );
-      return reconcileTabs(tabs, seq, eligibleTerminalIds).map((tab) => ({
+      return reconcileTabs(tabs, seq, liveTerminalIds).map((tab) => ({
         ...tab,
         tileIds: tab.tileIds.filter(
           (terminalId) =>
             authoritativeTileIds.has(terminalId) ||
-            eligibleTerminalIds.has(terminalId),
+            liveTerminalIds.has(terminalId),
         ),
       }));
     };
@@ -532,14 +540,16 @@ export async function bootstrapWorkspaceTabs(
         useWorkspace.getState().addTab();
         repairedLocal = useWorkspace.getState();
       }
+      const repairLiveTerminalIds = await stableLiveTerminalIds(listTerminals);
       const repairTabs = reconcileWithTerminalInventory(
         tabReports(repairedLocal.tabs).map((tab) => ({
           ...tab,
           tileIds: tab.tileIds.filter((terminalId) =>
-            liveTerminalIds.has(terminalId),
+            repairLiveTerminalIds.has(terminalId),
           ),
         })),
         res.seq,
+        repairLiveTerminalIds,
       );
       const repaired = await reportWorkspaceTabs(
         repairTabs,
@@ -551,18 +561,28 @@ export async function bootstrapWorkspaceTabs(
         return false;
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
+      const adoptionLiveTerminalIds = await stableLiveTerminalIds(listTerminals);
       if (repaired.stale && Array.isArray(repaired.tabs)) {
         return adoptAuthoritativeTabs(
-          reconcileWithTerminalInventory(repaired.tabs, repaired.seq),
+          reconcileWithTerminalInventory(
+            repaired.tabs,
+            repaired.seq,
+            adoptionLiveTerminalIds,
+          ),
         );
       }
       return adoptAuthoritativeTabs(
-        reconcileWithTerminalInventory(repairTabs, repaired.seq),
+        reconcileWithTerminalInventory(
+          repairTabs,
+          repaired.seq,
+          adoptionLiveTerminalIds,
+        ),
       );
     }
 
+    const liveTerminalIds = await stableLiveTerminalIds(listTerminals);
     return adoptAuthoritativeTabs(
-      reconcileWithTerminalInventory(serverTabs, res.seq),
+      reconcileWithTerminalInventory(serverTabs, res.seq, liveTerminalIds),
     );
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
