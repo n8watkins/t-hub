@@ -2844,10 +2844,25 @@ fn capture_provider_request_identity_with(
     if symlink.file_type().is_symlink() || !symlink.file_type().is_file() {
         return Err("provider request path is not an exact regular file".into());
     }
+    let initial_file = open_provider_request(request_path)?;
+    let initial_metadata = initial_file
+        .metadata()
+        .map_err(|error| format!("could not inspect initial provider request file: {error}"))?;
+    if initial_metadata.file_type().is_symlink() || !initial_metadata.file_type().is_file() {
+        return Err("provider request path did not open as an exact regular file".into());
+    }
+    let initial_file_identity = provider_file_identity(&initial_file, &initial_metadata)?;
     let mut file = open_provider_request(request_path)?;
     let before = file
         .metadata()
         .map_err(|error| format!("could not inspect provider request file: {error}"))?;
+    if before.file_type().is_symlink() || !before.file_type().is_file() {
+        return Err("provider request path did not remain an exact regular file".into());
+    }
+    let before_file_identity = provider_file_identity(&file, &before)?;
+    if initial_file_identity != before_file_identity {
+        return Err("provider request changed while opening exact identity".into());
+    }
     if before.len() > INSPECTION_OUTPUT_LIMIT as u64 {
         return Err("provider request exceeds the safe identity bound".into());
     }
@@ -2858,7 +2873,11 @@ fn capture_provider_request_identity_with(
     let after = file
         .metadata()
         .map_err(|error| format!("could not recheck provider request file: {error}"))?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    let (device, inode, links, volume, file_identity) = provider_file_identity(&file, &after)?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before_file_identity != (device, inode, links, volume, file_identity)
+    {
         return Err("provider request changed while capturing identity".into());
     }
     let modified_nanos = after
@@ -2868,14 +2887,18 @@ fn capture_provider_request_identity_with(
         .map_err(|_| "provider request modification time is invalid".to_string())?
         .as_nanos();
     let digest: [u8; 32] = Sha256::digest(&contents).into();
-    let initial_file_identity = provider_file_identity(&symlink)?;
-    let (device, inode, links, volume, file) = provider_file_identity(&after)?;
     let durable_after = std::fs::symlink_metadata(request_path)
         .map_err(|error| format!("could not recheck provider request path: {error}"))?;
+    let durable_file = open_provider_request(request_path)?;
+    let durable_metadata = durable_file
+        .metadata()
+        .map_err(|error| format!("could not recheck provider request file identity: {error}"))?;
     if durable_after.file_type().is_symlink()
         || !durable_after.file_type().is_file()
-        || initial_file_identity != (device, inode, links, volume, file)
-        || provider_file_identity(&durable_after)? != (device, inode, links, volume, file)
+        || durable_metadata.file_type().is_symlink()
+        || !durable_metadata.file_type().is_file()
+        || provider_file_identity(&durable_file, &durable_metadata)?
+            != (device, inode, links, volume, file_identity)
     {
         return Err("provider request changed while opening exact identity".into());
     }
@@ -2886,7 +2909,7 @@ fn capture_provider_request_identity_with(
             inode,
             links,
             volume,
-            file,
+            file: file_identity,
             length: after.len(),
             modified_nanos,
             digest,
@@ -2998,6 +3021,7 @@ finally:
 
 #[cfg(unix)]
 fn provider_file_identity(
+    _file: &std::fs::File,
     metadata: &std::fs::Metadata,
 ) -> Result<
     (
@@ -3021,7 +3045,8 @@ fn provider_file_identity(
 
 #[cfg(windows)]
 fn provider_file_identity(
-    metadata: &std::fs::Metadata,
+    file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
 ) -> Result<
     (
         Option<u64>,
@@ -3032,22 +3057,23 @@ fn provider_file_identity(
     ),
     String,
 > {
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut identity)
+            .map_err(|error| format!("provider request file identity is unavailable: {error}"))?;
+    }
     Ok((
         None,
         None,
         None,
-        Some(
-            metadata
-                .volume_serial_number()
-                .ok_or_else(|| "provider request volume identity is unavailable".to_string())?
-                as u64,
-        ),
-        Some(
-            metadata
-                .file_index()
-                .ok_or_else(|| "provider request file identity is unavailable".to_string())?,
-        ),
+        Some(identity.dwVolumeSerialNumber as u64),
+        Some((u64::from(identity.nFileIndexHigh) << 32) | u64::from(identity.nFileIndexLow)),
     ))
 }
 
@@ -3144,8 +3170,6 @@ struct WindowsProviderPathTransport;
 #[cfg(windows)]
 impl ProviderPathTransport for WindowsProviderPathTransport {
     fn canonical_native(&self, path: &str) -> Result<(String, ProviderPathIdentity), String> {
-        use std::os::windows::fs::MetadataExt;
-
         let canonical = std::fs::canonicalize(path)
             .map_err(|error| format!("could not canonicalize provider request path: {error}"))?;
         let canonical = canonical
@@ -3192,24 +3216,26 @@ impl ProviderPathTransport for WindowsProviderPathTransport {
     }
 
     fn native_identity(&self, path: &str) -> Result<ProviderPathIdentity, String> {
-        use std::os::windows::fs::MetadataExt;
-
-        let metadata = std::fs::metadata(path)
+        let file = open_provider_request(path)?;
+        let metadata = file
+            .metadata()
             .map_err(|error| format!("could not inspect provider request identity: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err("provider request path is not an exact regular file".into());
+        }
+        let (_, _, _, volume, file_identity) = provider_file_identity(&file, &metadata)?;
         Ok(ProviderPathIdentity {
-            volume: metadata
-                .volume_serial_number()
+            volume: volume
                 .ok_or_else(|| "provider request volume identity is unavailable".to_string())?
                 as u64,
-            file: metadata
-                .file_index()
+            file: file_identity
                 .ok_or_else(|| "provider request file identity is unavailable".to_string())?,
         })
     }
 }
 
 #[cfg(windows)]
-fn bounded_path_output(mut command: Command, context: &str) -> Result<String, String> {
+fn bounded_path_output(command: Command, context: &str) -> Result<String, String> {
     let output = crate::bounded_exec::output_with_timeout_and_limit(
         command,
         crate::bounded_exec::WSL_PROBE_TIMEOUT,
