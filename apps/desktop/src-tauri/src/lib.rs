@@ -413,6 +413,7 @@ fn start_control_listener(
     {
         use tauri::Manager;
         app.manage(std::sync::Arc::new(ctx.clone()));
+        app.manage(worktrees.clone());
     }
     match control::start(ctx) {
         Ok(h) => {

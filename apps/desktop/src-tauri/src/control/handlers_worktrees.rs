@@ -165,7 +165,8 @@ pub(super) fn create_worktree_authorized(
                 .into_owned(),
         )
     };
-    let _worktree_admission = ctx.admit_worktree_activity(&worktree_path, "create_worktree")?;
+    let worktree_admission = ctx.admit_worktree_activity(&worktree_path, "create_worktree")?;
+    let worktree_path = worktree_admission.canonical_path().to_string();
 
     // Create the worktree on disk first (shares git_worktree_add's impl). A git
     // failure short-circuits here — no tab/terminal is spawned for a failed add.

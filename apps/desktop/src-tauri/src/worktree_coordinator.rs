@@ -313,12 +313,18 @@ pub struct WorktreeCoordinator {
     workers: Mutex<BTreeSet<String>>,
 }
 
-pub struct WorktreeAdmissionGuard<'a> {
-    coordinator: &'a WorktreeCoordinator,
+pub struct WorktreeAdmissionGuard {
+    coordinator: Arc<WorktreeCoordinator>,
     path: String,
 }
 
-impl Drop for WorktreeAdmissionGuard<'_> {
+impl WorktreeAdmissionGuard {
+    pub fn canonical_path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for WorktreeAdmissionGuard {
     fn drop(&mut self) {
         let mut admissions = self
             .coordinator
@@ -648,10 +654,10 @@ impl WorktreeCoordinator {
     }
 
     pub fn admit_activity(
-        &self,
+        self: &Arc<Self>,
         candidate_path: &str,
         operation: &str,
-    ) -> Result<WorktreeAdmissionGuard<'_>, String> {
+    ) -> Result<WorktreeAdmissionGuard, String> {
         let candidate_path = crate::files::canonical_posix_path_allow_missing(candidate_path)
             .map(|path| normalize_path(&path))
             .map_err(|error| {
@@ -670,7 +676,7 @@ impl WorktreeCoordinator {
         }
         *admissions.entry(candidate_path.clone()).or_default() += 1;
         Ok(WorktreeAdmissionGuard {
-            coordinator: self,
+            coordinator: Arc::clone(self),
             path: candidate_path,
         })
     }
@@ -1091,7 +1097,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("worktree-retirements.json");
         let operation_id = {
-            let coordinator = WorktreeCoordinator::load(path.clone()).unwrap();
+            let coordinator = Arc::new(WorktreeCoordinator::load(path.clone()).unwrap());
             let record = coordinator
                 .begin_retirement("/repo/worktrees/clean", "/requests/one.json")
                 .unwrap();
@@ -1111,7 +1117,7 @@ mod tests {
 
     #[test]
     fn completed_reservation_no_longer_blocks_activity() {
-        let coordinator = WorktreeCoordinator::ephemeral();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
         let record = coordinator
             .begin_retirement("/repo/worktrees/clean", "/requests/one.json")
             .unwrap();
@@ -1129,7 +1135,7 @@ mod tests {
 
     #[test]
     fn admitted_activity_blocks_retirement_until_runtime_creation_finishes() {
-        let coordinator = WorktreeCoordinator::ephemeral();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
         let admission = coordinator
             .admit_activity("/repo/worktrees/clean/apps/cli", "spawn_terminal")
             .unwrap();
@@ -1147,7 +1153,7 @@ mod tests {
 
     #[test]
     fn live_activity_check_blocks_retirement_before_reservation() {
-        let coordinator = WorktreeCoordinator::ephemeral();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
 
         let error = coordinator
             .begin_retirement_if_idle("/repo/worktrees/clean", "/requests/while-live.json", |_| {
@@ -1195,7 +1201,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir(&worktree).unwrap();
         std::os::unix::fs::symlink(&nested, &alias).unwrap();
-        let coordinator = WorktreeCoordinator::ephemeral();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
         coordinator
             .begin_retirement(worktree.to_str().unwrap(), "/requests/one.json")
             .unwrap();

@@ -2688,7 +2688,7 @@ impl ControlContext {
         &self,
         path: &str,
         operation: &str,
-    ) -> Result<crate::worktree_coordinator::WorktreeAdmissionGuard<'_>, String> {
+    ) -> Result<crate::worktree_coordinator::WorktreeAdmissionGuard, String> {
         self.worktrees.admit_activity(path, operation)
     }
 }
