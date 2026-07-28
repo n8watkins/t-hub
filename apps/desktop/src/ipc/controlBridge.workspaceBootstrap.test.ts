@@ -533,7 +533,7 @@ describe("workspace registry bootstrap", () => {
     expect(
       useWorkspace.getState().tabs.find((tab) => tab.id === "work-1")?.order,
     ).toEqual(["term-existing", "term-new"]);
-    expect(inventoryCalls).toBe(2);
+    expect(inventoryCalls).toBeGreaterThanOrEqual(3);
   });
 
   it("preserves a terminal registered during Captain-only repair", async () => {
@@ -662,7 +662,9 @@ describe("workspace registry bootstrap", () => {
           ),
         }));
       }
-      return [{ id: "term-existing" }];
+      return inventoryCalls === 1
+        ? [{ id: "term-existing" }, { id: "term-dead" }]
+        : [{ id: "term-existing" }];
     });
     const baseline = [
       {
@@ -705,7 +707,7 @@ describe("workspace registry bootstrap", () => {
     expect(
       useWorkspace.getState().tabs.find((tab) => tab.id === "work-1")?.order,
     ).toEqual(["term-existing"]);
-    expect(inventoryCalls).toBe(2);
+    expect(inventoryCalls).toBeGreaterThanOrEqual(3);
   });
 
   it("retains startup deltas across consecutive stale server snapshots", () => {

@@ -446,9 +446,9 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
   return true;
 }
 
-function terminalLifecycleFingerprint(): string {
-  return Object.entries(useWorkspace.getState().terminals)
-    .map(([id, terminal]) => `${id}\0${terminal.state}`)
+function terminalInventoryFingerprint(terminals: Array<{ id: string }>): string {
+  return terminals
+    .map((terminal) => terminal.id)
     .sort()
     .join("\0");
 }
@@ -456,12 +456,48 @@ function terminalLifecycleFingerprint(): string {
 async function stableLiveTerminalIds(
   listTerminals: () => Promise<Array<{ id: string }>>,
 ): Promise<Set<string>> {
+  let previousFingerprint: string | undefined;
   for (;;) {
-    const before = terminalLifecycleFingerprint();
     const terminals = await listTerminals();
-    if (before === terminalLifecycleFingerprint()) {
+    const fingerprint = terminalInventoryFingerprint(terminals);
+    if (fingerprint === previousFingerprint) {
       return new Set(terminals.map((terminal) => terminal.id));
     }
+    previousFingerprint = fingerprint;
+  }
+}
+
+function sameTerminalIds(
+  left: ReadonlySet<string>,
+  right: ReadonlySet<string>,
+): boolean {
+  return (
+    left.size === right.size &&
+    [...left].every((terminalId) => right.has(terminalId))
+  );
+}
+
+async function reconcileAndAdoptAuthoritativeTabs(
+  tabs: TabReport[],
+  seq: number,
+  reconcileTabs: (
+    tabs: TabReport[],
+    seq: number,
+    liveTerminalIds: ReadonlySet<string>,
+  ) => TabReport[],
+  listTerminals: () => Promise<Array<{ id: string }>>,
+): Promise<boolean> {
+  let liveTerminalIds = await stableLiveTerminalIds(listTerminals);
+  for (;;) {
+    if (!adoptAuthoritativeTabs(reconcileTabs(tabs, seq, liveTerminalIds))) {
+      return false;
+    }
+    const verifiedLiveTerminalIds =
+      await stableLiveTerminalIds(listTerminals);
+    if (sameTerminalIds(liveTerminalIds, verifiedLiveTerminalIds)) {
+      return true;
+    }
+    liveTerminalIds = verifiedLiveTerminalIds;
   }
 }
 
@@ -561,28 +597,27 @@ export async function bootstrapWorkspaceTabs(
         return false;
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
-      const adoptionLiveTerminalIds = await stableLiveTerminalIds(listTerminals);
       if (repaired.stale && Array.isArray(repaired.tabs)) {
-        return adoptAuthoritativeTabs(
-          reconcileWithTerminalInventory(
-            repaired.tabs,
-            repaired.seq,
-            adoptionLiveTerminalIds,
-          ),
+        return await reconcileAndAdoptAuthoritativeTabs(
+          repaired.tabs,
+          repaired.seq,
+          reconcileWithTerminalInventory,
+          listTerminals,
         );
       }
-      return adoptAuthoritativeTabs(
-        reconcileWithTerminalInventory(
-          repairTabs,
-          repaired.seq,
-          adoptionLiveTerminalIds,
-        ),
+      return await reconcileAndAdoptAuthoritativeTabs(
+        repairTabs,
+        repaired.seq,
+        reconcileWithTerminalInventory,
+        listTerminals,
       );
     }
 
-    const liveTerminalIds = await stableLiveTerminalIds(listTerminals);
-    return adoptAuthoritativeTabs(
-      reconcileWithTerminalInventory(serverTabs, res.seq, liveTerminalIds),
+    return await reconcileAndAdoptAuthoritativeTabs(
+      serverTabs,
+      res.seq,
+      reconcileWithTerminalInventory,
+      listTerminals,
     );
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
@@ -1029,7 +1064,6 @@ function startTabReporter(): void {
       localTabs: startupLocal.tabs,
     },
   ];
-  let startupLiveTerminalIds = new Set<string>();
 
   const report = (): void => {
     if (adoptingRegistry) return; // never echo a server-applied snapshot back up
@@ -1046,8 +1080,12 @@ function startTabReporter(): void {
     const { tabs, activeTabId } = useWorkspace.getState();
     const payload = tabReports(tabs);
     void import("./client")
-      .then((m) => m.reportWorkspaceTabs(payload, activeTabId, lastSeq))
-      .then((res: TabReportResult | void) => {
+      .then(async (m) => {
+        const res: TabReportResult | void = await m.reportWorkspaceTabs(
+          payload,
+          activeTabId,
+          lastSeq,
+        );
         if (res?.error) {
           throw new Error(res.error);
         }
@@ -1055,12 +1093,20 @@ function startTabReporter(): void {
         if (res && typeof res.seq === "number") {
           lastSeq = res.seq;
           if (res.stale && Array.isArray(res.tabs)) {
-            const rebasedTabs = rebaseStartupWorkspaceDeltas(
+            let rebasedTabs: TabReport[] = [];
+            await reconcileAndAdoptAuthoritativeTabs(
               res.tabs,
-              startupDeltas,
-              startupLiveTerminalIds,
+              res.seq,
+              (tabs, _seq, liveTerminalIds) => {
+                rebasedTabs = rebaseStartupWorkspaceDeltas(
+                  tabs,
+                  startupDeltas,
+                  liveTerminalIds,
+                );
+                return rebasedTabs;
+              },
+              m.listTerminals,
             );
-            adoptAuthoritativeTabs(rebasedTabs);
             if (startupDeltas.length > 0) {
               startupDeltas.push({
                 baselineTabs: rebasedTabs,
@@ -1082,6 +1128,7 @@ function startTabReporter(): void {
             }
           }
         }
+        return res;
       })
       .catch((error) => {
         // Keep the local layout usable, but make a real Tauri failure visible.
@@ -1115,11 +1162,10 @@ function startTabReporter(): void {
   // itself against a stale local tab during a race.
   const reconcile = (): void => {
     void bootstrapWorkspaceTabs((tabs, _seq, liveTerminalIds) => {
-      startupLiveTerminalIds = new Set(liveTerminalIds);
       return rebaseStartupWorkspaceDeltas(
         tabs,
         startupDeltas,
-        startupLiveTerminalIds,
+        liveTerminalIds,
       );
     }).then((authoritative) => {
       if (!authoritative) {
