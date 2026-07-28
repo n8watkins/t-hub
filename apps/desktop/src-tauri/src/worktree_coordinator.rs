@@ -3699,10 +3699,33 @@ mod tests {
     fn restart_preserves_interrupted_commit_for_explicit_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let store = directory.path().join("retirements.json");
+        let request = directory.path().join("request.json");
         let operation_id = {
             let coordinator = WorktreeCoordinator::load(store.clone()).unwrap();
             let record = coordinator
-                .begin_retirement("/repo/worktree", "/requests/one.json")
+                .begin_retirement("/repo/worktree", request.to_str().unwrap())
+                .unwrap();
+            coordinator
+                .write_provider_request(
+                    &record,
+                    RetirementCleanupCapture {
+                        worktree: CapturedWorktreeIdentity {
+                            path: "/repo/worktree".into(),
+                            device: 7,
+                            inode: 11,
+                            head: "1234567890123456789012345678901234567890".into(),
+                            branch: "feature".into(),
+                        },
+                        targets: vec![CapturedPathIdentity {
+                            path: "/repo/worktree/apps/cli/target".into(),
+                            device: 7,
+                            inode: 12,
+                        }],
+                        dirty: false,
+                        merged: true,
+                        is_linked: true,
+                    },
+                )
                 .unwrap();
             coordinator
                 .transition(&record.operation_id, RetirementState::Running, None)
