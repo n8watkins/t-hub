@@ -148,6 +148,14 @@ pub enum AdminTarget {
         #[serde(rename = "worktreeId", alias = "worktree_id")]
         worktree_id: String,
     },
+    WorktreeRetirement {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
+        ship_slug: String,
+        #[serde(rename = "worktreeId", alias = "worktree_id")]
+        worktree_id: String,
+        #[serde(rename = "operationId", alias = "operation_id")]
+        operation_id: String,
+    },
     GeneralReserved {
         action: String,
     },
@@ -166,6 +174,7 @@ impl AdminTarget {
             | Self::Captain { ship_slug, .. }
             | Self::CrewSession { ship_slug, .. }
             | Self::Worktree { ship_slug, .. }
+            | Self::WorktreeRetirement { ship_slug, .. }
             | Self::Implementation { ship_slug, .. } => Some(ship_slug),
             Self::Fleet | Self::GeneralReserved { .. } => None,
         }
@@ -188,6 +197,11 @@ impl AdminTarget {
                 ship_slug,
                 worktree_id,
             } => format!("worktree:{ship_slug}:{worktree_id}"),
+            Self::WorktreeRetirement {
+                ship_slug,
+                worktree_id,
+                operation_id,
+            } => format!("worktreeRetirement:{ship_slug}:{worktree_id}:{operation_id}"),
             Self::GeneralReserved { action } => format!("generalReserved:{action}"),
             Self::Implementation {
                 ship_slug,
@@ -1341,13 +1355,17 @@ fn validate_target(
                         | AdminTarget::Captain { .. }
                         | AdminTarget::CrewSession { .. }
                         | AdminTarget::Worktree { .. }
+                        | AdminTarget::WorktreeRetirement { .. }
                 ),
                 AdminOperation::MaintainSession | AdminOperation::CleanupSession => matches!(
                     target,
                     AdminTarget::Captain { .. } | AdminTarget::CrewSession { .. }
                 ),
                 AdminOperation::MaintainWorktree | AdminOperation::CleanupWorktree => {
-                    matches!(target, AdminTarget::Worktree { .. })
+                    matches!(
+                        target,
+                        AdminTarget::Worktree { .. } | AdminTarget::WorktreeRetirement { .. }
+                    )
                 }
                 AdminOperation::PrepareRetirement => matches!(
                     target,

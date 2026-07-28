@@ -165,6 +165,8 @@ pub(super) fn create_worktree_authorized(
                 .into_owned(),
         )
     };
+    let worktree_admission = ctx.admit_worktree_activity(&worktree_path, "create_worktree")?;
+    let worktree_path = worktree_admission.canonical_path().to_string();
 
     // Create the worktree on disk first (shares git_worktree_add's impl). A git
     // failure short-circuits here — no tab/terminal is spawned for a failed add.
@@ -240,6 +242,31 @@ pub(super) fn create_worktree_authorized(
         // None keeps the prior bare-shell behavior. No `shell` preset for a
         // worktree spawn - the crew boots into the worktree dir running this.
         let pane = crate::commands::pane_command(None, startup_command.as_deref());
+        let (pane, elevation) = match worktree_admission.contain_process(pane.as_deref(), elevation)
+        {
+            Ok(contained) => contained,
+            Err(error) => {
+                let identity_rollback = minted_identity
+                    .as_ref()
+                    .map(|identity| ctx.identity.retire(&identity.id))
+                    .transpose();
+                let primary = format!(
+                    "create_worktree: terminal containment failed: {error}{}",
+                    identity_rollback
+                        .err()
+                        .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                        .unwrap_or_default()
+                );
+                let rollback = rollback_created_worktree_state(
+                    ctx,
+                    &repo_root,
+                    &worktree_path,
+                    &tab_id,
+                    tab_was_created,
+                );
+                return Err(create_worktree_rollback_error(primary, rollback));
+            }
+        };
         match spawn_tmux_terminal(&worktree_path, pane.as_deref(), &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
@@ -674,6 +701,16 @@ pub(super) fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value
             .into_owned()
     };
     require_registered_git_capability(ctx, "list_worktrees", &cwd)?;
-    let list = git::worktree_list(&cwd)?;
+    let list = git::worktree_list(&cwd)?
+        .into_iter()
+        .map(|worktree| {
+            let reservation = ctx.worktrees.reservation_for(&worktree.path);
+            let mut value = serde_json::to_value(worktree)
+                .map_err(|error| format!("list_worktrees: serialization failed: {error}"))?;
+            value["retirementReservation"] = serde_json::to_value(reservation)
+                .map_err(|error| format!("list_worktrees: serialization failed: {error}"))?;
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(json!({ "worktrees": list }))
 }

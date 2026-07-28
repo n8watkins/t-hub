@@ -294,12 +294,14 @@ fn run_authorized_ui_spawn<T>(
     admission_context: &crate::control::ControlContext,
     opts: &SpawnOptions,
     provider_lanes: usize,
-    spawn: impl FnOnce() -> Result<T, String>,
+    spawn: impl FnOnce(&crate::worktree_coordinator::WorktreeAdmissionGuard) -> Result<T, String>,
 ) -> Result<T, String> {
     let args = serde_json::to_value(opts)
         .map_err(|error| format!("spawn_terminal: audit arguments are invalid: {error}"))?;
+    let cwd = resolve_cwd(opts);
+    let _worktree_admission = admission_context.admit_worktree_activity(&cwd, "spawn_terminal")?;
     let _admission = admission_context.authorize_ui_spawn(provider_lanes, &args)?;
-    spawn()
+    spawn(&_worktree_admission)
 }
 
 /// The `resolve_pane_command` core over bare parts, shared with the control
@@ -353,7 +355,7 @@ pub fn spawn_terminal(
         &admission_context,
         &opts,
         usize::from(provider_intent.is_some()),
-        || {
+        |worktree_admission| {
             // The terminal id IS the tmux session's own suffix, so the id is stable and
             // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
             // after a reload (which strips `th_` off the session name), and the
@@ -382,6 +384,8 @@ pub fn spawn_terminal(
                     format!("pending:{provider}"),
                 ));
             }
+            let (command, elevation) =
+                worktree_admission.contain_process(command.as_deref(), elevation)?;
             if let Err(error) =
                 tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
             {
@@ -1180,7 +1184,7 @@ mod tests {
             capability: None,
         };
 
-        let result = run_authorized_ui_spawn(&context, &opts, 0, || {
+        let result = run_authorized_ui_spawn(&context, &opts, 0, |_| {
             effects_ran.set(true);
             identities.mint_for(crate::identity::Role::Crew, None)?;
             tmux::new_session_with_env(&tmux_session, "/tmp", None, &[])

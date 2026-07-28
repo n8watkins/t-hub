@@ -547,8 +547,9 @@ fn cmd_worktree(args: &[String]) -> Result<(), CliError> {
 
 /// `th worktree ls [repoRoot]` - the lifecycle table: every worktree with its
 /// branch, DIRTY, MERGED (into the default branch), and LEASED (a live T-Hub
-/// session rooted at or under it). Git is read locally; only the lease data
-/// comes from the control socket (with a direct-tmux fallback).
+/// session rooted at or under it). Git is read locally; lease data and Cargo
+/// cleanup reservations come from the control socket, while only lease data
+/// has a direct-tmux fallback.
 fn cmd_worktree_ls(args: &[String]) -> Result<(), CliError> {
     let f = Flags::parse(args, &[])?;
     let scan = worktree::scan(f.pos.first()).map_err(CliError::git)?;

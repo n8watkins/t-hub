@@ -1780,7 +1780,7 @@ fn exact_effect_command_with_python(
 }
 
 const MANAGED_CGROUP_EFFECT_PY: &str = r##"
-import json, os, re, resource, stat, subprocess, sys, tempfile, time
+import fcntl, json, os, re, resource, stat, subprocess, sys, tempfile, time
 
 def refuse(code):
     raise SystemExit(code)
@@ -2114,6 +2114,13 @@ try:
     if (second["InvocationID"] != actual["invocationId"] or
         second["ControlGroup"] != actual["cgroupPath"]):
         refuse(79)
+    freeze_descriptor = os.open(
+        "cgroup.freeze", os.O_WRONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        fcntl.flock(freeze_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(freeze_descriptor)
+        refuse(131)
     write_control(directory, "cgroup.freeze", b"1")
     deadline = time.monotonic() + 5
     while event_value(directory, "frozen") != 1:
@@ -2133,6 +2140,8 @@ try:
         open(crash_marker, "x", encoding="ascii").close()
         refuse(103)
 finally:
+    if "freeze_descriptor" in locals():
+        os.close(freeze_descriptor)
     os.close(directory)
 "##;
 
@@ -2761,6 +2770,7 @@ pub struct PaneInfo {
     pub session: String,
     pub command: String,
     pub cwd: String,
+    pub pid: u32,
 }
 
 /// One exact Codex rollout currently held open by a process under a T-Hub pane.
@@ -2906,7 +2916,7 @@ fgpid=$(ps -o tpgid= -p \"$pid\" 2>/dev/null | tr -d ' '); \
 case \"$fgpid\" in ''|*[!0-9]*|0) fgpid=\"$pid\";; esac; \
 line=$(tr '\\0' ' ' < /proc/$fgpid/cmdline 2>/dev/null); \
 case \"$line\" in *codex*) eff=codex;; *claude*) eff=claude;; esac;; esac; \
-printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
+printf '%s|%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\" \"$pid\"; done";
     let output = output_with_timeout(
         pane_info_command_with_args(script, &[socket]),
         tmux_cmd_timeout(),
@@ -2936,15 +2946,23 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(3, '|');
+        let mut parts = line.splitn(4, '|');
         let session = parts.next().unwrap_or("").trim().to_string();
         let command = parts.next().unwrap_or("").trim().to_string();
         let cwd = parts.next().unwrap_or("").trim().to_string();
+        let pid = parts.next().unwrap_or("").trim();
         if !session.is_empty() {
+            let pid = pid.parse::<u32>().map_err(|_| TmuxError {
+                op: "list-panes",
+                code: None,
+                io_kind: None,
+                message: "tmux returned a pane without an exact process identity".into(),
+            })?;
             out.push(PaneInfo {
                 session,
                 command,
                 cwd,
+                pid,
             });
         }
     }
@@ -4016,6 +4034,7 @@ while True:
     fn managed_owner_contract_fails_closed_on_unsupported_shapes() {
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("cgroup.freeze"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("cgroup.kill"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("systemd-run"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("refuse(70)"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("refuse(72)"));

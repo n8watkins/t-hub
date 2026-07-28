@@ -1350,9 +1350,35 @@ fn remote_precheck(path: &str, allowed_roots: &[PathBuf]) -> Result<(), String> 
 /// distro on the POSIX form (#26). Returns None ⇒ the caller DENIES (fail-closed):
 /// path doesn't exist, isn't a WSL path, or the wsl.exe call failed.
 fn resolve_real_posix(path: &str) -> Option<PathBuf> {
+    resolve_real_posix_inner(path, false)
+}
+
+fn resolve_real_posix_allow_missing(path: &str) -> Option<PathBuf> {
+    resolve_real_posix_inner(path, true)
+}
+
+fn resolve_real_posix_inner(path: &str, allow_missing: bool) -> Option<PathBuf> {
     #[cfg(not(windows))]
     {
-        std::fs::canonicalize(path).ok()
+        if !allow_missing {
+            return std::fs::canonicalize(path).ok();
+        }
+        let mut ancestor = Path::new(path);
+        let mut suffix = Vec::new();
+        loop {
+            match std::fs::canonicalize(ancestor) {
+                Ok(mut resolved) => {
+                    for component in suffix.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Some(resolved);
+                }
+                Err(_) => {
+                    suffix.push(ancestor.file_name()?.to_owned());
+                    ancestor = ancestor.parent()?;
+                }
+            }
+        }
     }
     #[cfg(windows)]
     {
@@ -1362,12 +1388,11 @@ fn resolve_real_posix(path: &str) -> Option<PathBuf> {
         // for a host path; a non-WSL drive path ⇒ None ⇒ caller fail-closes.
         let posix = unc_to_posix(&PathBuf::from(path))?;
         let mut c = Command::new("wsl.exe");
-        c.arg("-d")
-            .arg(host_distro())
-            .arg("-e")
-            .arg("realpath")
-            .arg("--")
-            .arg(&posix);
+        c.arg("-d").arg(host_distro()).arg("-e").arg("realpath");
+        if allow_missing {
+            c.arg("-m");
+        }
+        c.arg("--").arg(&posix);
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
                                        // Bounded (WSL_PROBE): a single `realpath`; this is a scope-validation gate
                                        // on file-read requests, so a wedged WSL must not park the handler.
@@ -1428,19 +1453,23 @@ pub(crate) fn posix_form(path: &str) -> String {
 /// Windows must resolve WSL roots inside WSL instead of using host
 /// `std::fs::canonicalize` over the UNC bridge.
 pub(crate) fn canonical_posix_path(path: &str) -> Result<String, String> {
-    let posix = posix_form(path);
-    #[cfg(windows)]
-    {
+    canonical_posix_path_inner(path, false)
+}
+
+pub(crate) fn canonical_posix_path_allow_missing(path: &str) -> Result<String, String> {
+    canonical_posix_path_inner(path, true)
+}
+
+fn canonical_posix_path_inner(path: &str, allow_missing: bool) -> Result<String, String> {
+    let posix = wsl_path_to_posix(path).unwrap_or_else(|| path.to_string());
+    let resolved = if allow_missing {
+        resolve_real_posix_allow_missing(&posix)
+    } else {
         resolve_real_posix(&posix)
-            .map(|resolved| resolved.to_string_lossy().into_owned())
-            .ok_or_else(|| format!("could not resolve WSL path '{posix}'"))
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::canonicalize(&posix)
-            .map(|resolved| resolved.to_string_lossy().into_owned())
-            .map_err(|error| format!("could not resolve path '{posix}': {error}"))
-    }
+    };
+    resolved
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("could not resolve WSL path '{posix}'"))
 }
 
 pub(crate) fn validate_configured_wsl_path(path: &str) -> Result<(), String> {

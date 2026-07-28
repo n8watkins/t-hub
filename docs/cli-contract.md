@@ -148,6 +148,11 @@ defaults
 
 T-Hub does not currently define a project-level CLI configuration layer, so one must not be implied.
 Endpoint discovery must remain compatible with the documented control environment variables and user handshake file while later reliability work adds stale-endpoint rediscovery.
+`th admin cleanup-worktree` requires the desktop backend to have an explicit `T_HUB_RUST_STORAGE_COMMAND`.
+The configured provider-namespace command is parsed into direct process arguments, runs inside one exact managed WSL scope, and receives `retirement-clean --request PATH --apply --confirm --json`.
+T-Hub captures the exact native and provider-namespace request identity and content, revalidates them immediately before process creation, and requires the provider to open only the exact request path supplied in that invocation.
+T-Hub does not thaw guarded runtimes until that managed provider scope is proven completed or terminated, including after timeout, descendant creation, or parent loss.
+`T_HUB_RUST_STORAGE_TIMEOUT_SECS` may set a bounded provider timeout from 60 through 21600 seconds and defaults to 7200 seconds.
 
 ## Active Supervisory Workflow Commands
 
@@ -159,9 +164,19 @@ The supervisory workflow is active through the shared control operation catalog.
 - A successful `start_agent` response returns `sourceCommit`, `sourceBaseline`, and `admissionPurpose` from the durable admitted record so callers can verify launch provenance without inferring it from their request.
 - `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
 - `th agents followup` delivers one idempotent durable inbox instruction to an exact owned agent session and forwards `--replacement-assignment` only when scope explicitly changes.
-- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `cleanup-session`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
+- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `approve-recovery`, `cleanup-session`, `cleanup-worktree`, `recover-worktree`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
 - `th admin approve-session` sends only the exact session ID, and the backend derives the target kind, ship, and ownership from the authoritative fleet registry.
 - `th admin cleanup-session` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
+- `th admin cleanup-worktree` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
+- `th admin approve-recovery` binds a new approval to one exact recovery-required cleanup operation, worktree, and ship.
+- `th admin recover-worktree` requires that exact unconsumed approval and `--confirm`, then revalidates the durable reservation, complete Cargo inventory, worktree identity, eligibility, and absence of live leases before resuming the provider.
+- Worktree Cargo cleanup is limited to clean, merged, linked worktrees with no live T-Hub lease and an exact non-symlink Cargo target inventory under the two T-Hub Cargo workspace roots.
+- The backend records the reservation in `~/.t-hub/worktree-retirements.json` and publishes it as nullable `retirementReservation` data through `th worktree ls --json`.
+- After restart, reserved work resumes automatically, while an interrupted running provider commit becomes `RecoveryRequired` and needs the separately approved explicit recovery flow.
+- Ambiguous provider failures remain active as `RecoveryRequired`; only a structured refusal proving every target stayed at its original path releases the reservation as failed.
+- Active cleanup reservations block matching worktree creation, terminal spawning, history resume, and agent starting.
+- Cargo cleanup removes target artifacts; subsequent Cargo builds recreate them.
+- It does not compress targets in place, remove a Git worktree, detach UI state, or delete a branch.
 - `th admin maintain-session` performs bounded non-destructive maintenance on one exact live T-Hub session after revalidating the current grant, actor, supervisor, and target ownership.
 - `th admin recover-resource` accepts a session, ship, or worktree target and either performs bounded maintenance or records an authoritative recovery plan when direct mutation is unsafe.
 - `th admin prepare-retirement` accepts a session, ship, or worktree target and records a deterministic readiness plan without performing a destructive action.

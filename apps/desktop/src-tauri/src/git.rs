@@ -1088,13 +1088,28 @@ pub async fn git_worktree_add(
     cwd: String,
     path: String,
     branch: Option<String>,
+    coordinator: tauri::State<'_, std::sync::Arc<crate::worktree_coordinator::WorktreeCoordinator>>,
 ) -> Result<String, String> {
+    git_worktree_add_with_coordinator(cwd, path, branch, coordinator.inner().clone()).await
+}
+
+async fn git_worktree_add_with_coordinator(
+    cwd: String,
+    path: String,
+    branch: Option<String>,
+    coordinator: std::sync::Arc<crate::worktree_coordinator::WorktreeCoordinator>,
+) -> Result<String, String> {
+    let admission = coordinator.admit_activity(&path, "git_worktree_add")?;
+    let path = admission.canonical_path().to_string();
     // `worktree_add` runs several blocking `run_git` spawns (show-ref + the add,
     // each a `wsl.exe` child on Windows). Run it off the Tokio executor; the owned
-    // args are moved into the `'static + Send` closure.
-    tauri::async_runtime::spawn_blocking(move || worktree_add(&cwd, &path, branch.as_deref()))
-        .await
-        .map_err(|e| format!("git_worktree_add task failed: {e}"))?
+    // args and admission guard are moved into the `'static + Send` closure.
+    tauri::async_runtime::spawn_blocking(move || {
+        let _admission = admission;
+        worktree_add(&cwd, &path, branch.as_deref())
+    })
+    .await
+    .map_err(|e| format!("git_worktree_add task failed: {e}"))?
 }
 
 /// Synchronous core of [`git_worktree_add`], shared with the MCP control channel
@@ -1258,6 +1273,75 @@ fn worktree_remove_git(cwd: &str, path: &str, force: bool) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_worktree_add_reservation_rejects_before_git_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = directory.path().join("repo");
+        let target = directory.path().join("reserved-worktree");
+        std::fs::create_dir(&repo).unwrap();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=T-Hub Test",
+            "commit",
+            "-qm",
+            "seed",
+        ]);
+
+        let coordinator =
+            std::sync::Arc::new(crate::worktree_coordinator::WorktreeCoordinator::ephemeral());
+        coordinator
+            .begin_retirement(
+                target.to_str().unwrap(),
+                directory.path().join("request.json").to_str().unwrap(),
+            )
+            .unwrap();
+        let before = worktree_list(repo.to_str().unwrap()).unwrap();
+
+        let error = tauri::async_runtime::block_on(git_worktree_add_with_coordinator(
+            repo.to_string_lossy().into_owned(),
+            target.to_string_lossy().into_owned(),
+            Some("reservation-race".into()),
+            coordinator,
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("reserved for Cargo cleanup"));
+        assert!(!target.exists(), "UI path must not create the worktree");
+        assert_eq!(worktree_list(repo.to_str().unwrap()).unwrap(), before);
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/reservation-race",
+            ])
+            .status()
+            .unwrap();
+        assert!(!branch.success(), "UI path must not create the branch");
+    }
 
     #[test]
     fn worktree_removal_fails_closed_until_unified_status_is_available() {

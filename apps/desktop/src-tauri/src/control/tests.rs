@@ -44,6 +44,36 @@ use std::thread;
 const TEST_ASYNC_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
+fn cortana_observation_retries_only_transient_unreadable_evidence() {
+    let mut attempts = 0;
+    let observed =
+        retry_unreadable_cortana_observation(Instant::now() + Duration::from_secs(1), |_| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(crate::harness::LaunchAttestationError::UnreadableEvidence)
+            } else {
+                Ok("stable")
+            }
+        })
+        .unwrap();
+    assert_eq!(observed, "stable");
+    assert_eq!(attempts, 3);
+
+    let mut mismatch_attempts = 0;
+    let error =
+        retry_unreadable_cortana_observation::<()>(Instant::now() + Duration::from_secs(1), |_| {
+            mismatch_attempts += 1;
+            Err(crate::harness::LaunchAttestationError::ProcessChanged)
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        crate::harness::LaunchAttestationError::ProcessChanged
+    );
+    assert_eq!(mismatch_attempts, 1);
+}
+
+#[test]
 fn control_request_debug_redacts_all_credential_and_argument_values() {
     let request = ControlRequest {
         token: "global-control-secret".into(),
@@ -94,6 +124,18 @@ fn test_ctx(token: &str) -> ControlContext {
         .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)));
     ctx.host_token = token.to_string();
     ctx
+}
+
+#[test]
+fn cleanup_review_cortana_prepublication_retires_only_new_identity() {
+    let ctx = test_ctx("cortana-prepublication-identity");
+    let newly_minted = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+    retire_new_unreserved_cortana_identity(&ctx, &newly_minted.id, true).unwrap();
+    assert!(ctx.identity.get(&newly_minted.id).is_none());
+
+    let reused = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+    retire_new_unreserved_cortana_identity(&ctx, &reused.id, false).unwrap();
+    assert!(ctx.identity.get(&reused.id).is_some());
 }
 
 fn dispatch_test_repo_root() -> String {
@@ -671,9 +713,13 @@ fn process_permission_attestation(
     ));
     std::fs::create_dir_all(&fixture_dir).unwrap();
     let executable = fixture_dir.join(executable_name);
+    let invocation = fixture_dir.join("invoked");
     std::fs::write(
         &executable,
-        "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+        format!(
+            "#!/usr/bin/env node\nrequire('fs').writeFileSync({}, 'invoked');\nsetInterval(() => {{}}, 1000);\n",
+            serde_json::to_string(&invocation).unwrap()
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -690,7 +736,13 @@ fn process_permission_attestation(
     tmux::send_text(&target, &command, true).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut next_retry = Instant::now() + Duration::from_secs(1);
+    while !invocation.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fake Harness did not start its provider process"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let result = loop {
         if let Ok(after) = observe_harness_process(&target) {
             match attest_launch_permissions(
@@ -699,16 +751,15 @@ fn process_permission_attestation(
                 &after,
                 PermMode::BypassPermissions,
             ) {
-                Err(crate::harness::LaunchAttestationError::StaleEvidence) => {
-                    let now = Instant::now();
+                Err(error)
+                    if error == crate::harness::LaunchAttestationError::StaleEvidence
+                        || (error == crate::harness::LaunchAttestationError::WrapperObscured
+                            && executable_name != "wrapper") =>
+                {
                     assert!(
-                        now < deadline,
+                        Instant::now() < deadline,
                         "fake Harness did not produce process evidence"
                     );
-                    if now >= next_retry {
-                        tmux::send_text(&target, &command, true).unwrap();
-                        next_retry = now + Duration::from_secs(1);
-                    }
                 }
                 result => break result,
             }
@@ -22670,6 +22721,10 @@ fn command_tiers_are_classified() {
     );
     assert_eq!(
         required_tier("history_resume"),
+        CommandTier::ProcessChanging
+    );
+    assert_eq!(
+        required_tier("cleanup_worktree_artifacts"),
         CommandTier::ProcessChanging
     );
     for command in ["preview_start", "preview_stop", "preview_restart"] {
