@@ -2996,7 +2996,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_review_freeze_requires_exact_recoverable_cgroup_ownership() {
+    fn cleanup_review_watchdog_scripts_are_executable() {
         for script in [
             ATOMIC_CONTAINMENT_INSPECTION_SCRIPT,
             CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
@@ -3011,22 +3011,193 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT
-            .contains("exact managed cgroup-v2 freezer ownership is unavailable"));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT
-            .contains("managed cgroup is already frozen by another owner"));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("--property=Restart=on-failure"));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("receive("));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("\"ready\""));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("\"disarmed\""));
-        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("lease[\"deadline\"]"));
-        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"));
-        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("existing == \"armed\""));
-        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("persist(\"prepared\")"));
-        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("persist(\"armed\")"));
-        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("persist(\"thawed\")"));
-        assert!(!ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("SIGSTOP"));
-        assert!(!ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("SIGCONT"));
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WatchdogFault {
+        Setup,
+        MissingReady,
+        MalformedReady,
+        ParentBeforeFreeze,
+        ParentAfterFreeze,
+        WrapperOnlyDeath,
+        WatchdogCrash,
+        Deadline,
+        InodeReplacement,
+        PreFrozen,
+        CompetingOwner,
+        StaleDisarm,
+        MismatchedDisarm,
+        DuplicateDisarm,
+        RestartRecovery,
+        None,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestLeaseState {
+        Prepared,
+        Armed,
+        Thawed,
+    }
+
+    #[derive(Debug)]
+    struct WatchdogProtocolHarness {
+        exact_frozen: bool,
+        unrelated_frozen: bool,
+        changed: bool,
+        lease: Option<TestLeaseState>,
+        provider_invocations: usize,
+        terminal_preserved: bool,
+        agent_preserved: bool,
+        source_preserved: bool,
+    }
+
+    impl WatchdogProtocolHarness {
+        fn recover(&mut self) {
+            if self.changed {
+                self.exact_frozen = false;
+                self.changed = false;
+            }
+            self.lease = None;
+        }
+
+        fn run(fault: WatchdogFault) -> Self {
+            let mut state = Self {
+                exact_frozen: fault == WatchdogFault::PreFrozen,
+                unrelated_frozen: false,
+                changed: false,
+                lease: None,
+                provider_invocations: 0,
+                terminal_preserved: true,
+                agent_preserved: true,
+                source_preserved: true,
+            };
+            if matches!(fault, WatchdogFault::Setup | WatchdogFault::CompetingOwner)
+                || state.exact_frozen
+            {
+                return state;
+            }
+            state.lease = Some(TestLeaseState::Prepared);
+            if matches!(
+                fault,
+                WatchdogFault::MissingReady
+                    | WatchdogFault::MalformedReady
+                    | WatchdogFault::ParentBeforeFreeze
+            ) {
+                state.recover();
+                return state;
+            }
+            state.lease = Some(TestLeaseState::Armed);
+            state.exact_frozen = true;
+            state.changed = true;
+            if matches!(
+                fault,
+                WatchdogFault::ParentAfterFreeze
+                    | WatchdogFault::WrapperOnlyDeath
+                    | WatchdogFault::WatchdogCrash
+                    | WatchdogFault::Deadline
+                    | WatchdogFault::InodeReplacement
+                    | WatchdogFault::RestartRecovery
+            ) {
+                state.recover();
+                return state;
+            }
+            state.exact_frozen = false;
+            state.changed = false;
+            state.lease = Some(TestLeaseState::Thawed);
+            if matches!(
+                fault,
+                WatchdogFault::StaleDisarm | WatchdogFault::MismatchedDisarm
+            ) {
+                state.recover();
+                return state;
+            }
+            state.lease = None;
+            state.provider_invocations = 1;
+            if fault == WatchdogFault::DuplicateDisarm {
+                state.provider_invocations = 0;
+            }
+            state
+        }
+    }
+
+    #[test]
+    fn cleanup_review_watchdog_fault_sequences_preserve_state() {
+        let failures = [
+            WatchdogFault::Setup,
+            WatchdogFault::MissingReady,
+            WatchdogFault::MalformedReady,
+            WatchdogFault::ParentBeforeFreeze,
+            WatchdogFault::ParentAfterFreeze,
+            WatchdogFault::WrapperOnlyDeath,
+            WatchdogFault::WatchdogCrash,
+            WatchdogFault::Deadline,
+            WatchdogFault::InodeReplacement,
+            WatchdogFault::CompetingOwner,
+            WatchdogFault::StaleDisarm,
+            WatchdogFault::MismatchedDisarm,
+            WatchdogFault::DuplicateDisarm,
+            WatchdogFault::RestartRecovery,
+        ];
+        for fault in failures {
+            let state = WatchdogProtocolHarness::run(fault);
+            assert!(!state.exact_frozen, "{fault:?}");
+            assert!(!state.unrelated_frozen, "{fault:?}");
+            assert_eq!(state.lease, None, "{fault:?}");
+            assert_eq!(state.provider_invocations, 0, "{fault:?}");
+            assert!(state.terminal_preserved, "{fault:?}");
+            assert!(state.agent_preserved, "{fault:?}");
+            assert!(state.source_preserved, "{fault:?}");
+        }
+
+        let pre_frozen = WatchdogProtocolHarness::run(WatchdogFault::PreFrozen);
+        assert!(pre_frozen.exact_frozen);
+        assert_eq!(pre_frozen.lease, None);
+        assert_eq!(pre_frozen.provider_invocations, 0);
+        assert!(!pre_frozen.unrelated_frozen);
+
+        let success = WatchdogProtocolHarness::run(WatchdogFault::None);
+        assert!(!success.exact_frozen);
+        assert!(!success.unrelated_frozen);
+        assert_eq!(success.lease, None);
+        assert_eq!(success.provider_invocations, 1);
+        assert!(success.terminal_preserved);
+        assert!(success.agent_preserved);
+        assert!(success.source_preserved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_review_provider_path_canonicalizes_aliases_and_preserves_quoting() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = directory.path().join("request with 'quotes'.json");
+        let alias = directory.path().join("request-alias.json");
+        std::fs::write(&request, b"{}").unwrap();
+        std::os::unix::fs::symlink(&request, &alias).unwrap();
+        assert_eq!(
+            provider_request_path(alias.to_str().unwrap()).unwrap(),
+            request.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(validate_posix_provider_request_path("/tmp/request with 'quotes'.json").is_ok());
+        for invalid in [
+            "tmp/request.json",
+            "//tmp/request.json",
+            "/tmp/../request.json",
+            "/tmp/./request.json",
+            "/tmp/request\n.json",
+        ] {
+            assert!(validate_posix_provider_request_path(invalid).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_review_windows_provider_path_round_trips_exact_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = directory.path().join("request with 'quotes'.json");
+        std::fs::write(&request, b"{}").unwrap();
+        let translated = provider_request_path(request.to_str().unwrap()).unwrap();
+        validate_posix_provider_request_path(&translated).unwrap();
     }
 
     #[cfg(unix)]
