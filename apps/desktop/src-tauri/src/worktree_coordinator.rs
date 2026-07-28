@@ -3914,19 +3914,26 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        let session = format!(
-            "th_test_managed_containment_{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        );
-        let launch = crate::tmux::prepare_managed_runtime_launch().unwrap();
-        let owner = crate::tmux::new_prepared_managed_session_with_env(
-            &session,
-            unrelated.to_str().unwrap(),
-            contained.as_deref(),
-            &env,
-            &launch,
-        )
-        .unwrap();
+        let launch = || {
+            let session = format!(
+                "th_test_managed_containment_{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            );
+            crate::tmux::new_managed_session_with_env(
+                &session,
+                unrelated.to_str().unwrap(),
+                contained.as_deref(),
+                &env,
+            )
+            .map(|owner| (session, owner))
+        };
+        // This test runs beside the process-heavy preview and agent suites.
+        // Retry the complete production launch once with fresh tmux and systemd
+        // identities so scheduler starvation cannot consume the first bounded
+        // ownership-publication window.
+        let (session, owner) = launch()
+            .or_else(|first_error| launch().map_err(|_| first_error))
+            .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let pane = loop {
             if let Some(pane) = crate::tmux::pane_info()
