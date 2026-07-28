@@ -1245,11 +1245,14 @@ pub(super) fn cleanup_worktree_artifacts(
             }))
         })();
         if let Err(error) = &execution {
-            let _ = ctx.worktrees.transition(
-                &record.operation_id,
-                crate::worktree_coordinator::RetirementState::RecoveryRequired,
-                Some(error.clone()),
-            );
+            let failure_state = if record.request_sha256.is_some() {
+                crate::worktree_coordinator::RetirementState::RecoveryRequired
+            } else {
+                crate::worktree_coordinator::RetirementState::Failed
+            };
+            let _ =
+                ctx.worktrees
+                    .transition(&record.operation_id, failure_state, Some(error.clone()));
         }
         execution
     })();

@@ -277,7 +277,10 @@ def inspection_timeout(signum, frame):
     raise RuntimeError("managed containment inspection timed out")
 
 signal.signal(signal.SIGALRM, inspection_timeout)
-signal.alarm(12)
+containment_timeout = int(sys.argv[6])
+if containment_timeout < 60 or containment_timeout > 21630:
+    raise RuntimeError("managed containment timeout is invalid")
+signal.alarm(containment_timeout)
 
 def proc_start(pid):
     value = pathlib.Path(f"/proc/{pid}/stat").read_text()
@@ -341,6 +344,8 @@ def containment_pair(identities, edges):
     candidates = {
         pid for pid in identities if executable_matches(pid, "/usr/bin/bwrap")
     }
+    if not candidates:
+        return None
     pairs = [
         (outer, inner)
         for outer in candidates
@@ -373,7 +378,7 @@ def evidence_for(pid):
     if (
         evidence.get("version") != 1
         or not re.fullmatch(r"[0-9a-f]{32}", evidence.get("launchNonce", ""))
-        or target not in evidence.get("blockers", [])
+        or not isinstance(evidence.get("blockers"), list)
     ):
         raise RuntimeError("managed process containment evidence is mismatched")
     return evidence
@@ -554,7 +559,7 @@ try:
     watchdog_secret = secrets.token_bytes(32)
     watchdog_unit = f"t-hub-freeze-watchdog-{watchdog_nonce}.service"
     watchdog_socket = f"t-hub-freeze-watchdog-{watchdog_nonce}"
-    watchdog_deadline = time.monotonic() + 10
+    watchdog_deadline = time.monotonic() + containment_timeout
     watchdog_lease = {
         "version": 1,
         "operationId": operation_id,
@@ -580,7 +585,7 @@ try:
             "--property=Type=exec",
             "--property=Restart=on-failure",
             "--property=RestartSec=100ms",
-            "--property=RuntimeMaxSec=12s",
+            f"--property=RuntimeMaxSec={containment_timeout}s",
             "--collect",
             "--quiet",
             "/usr/bin/python3",
@@ -647,66 +652,77 @@ try:
     identities, edges, task_identities = process_tree(roots)
     cgroup_identity = (managed_path, managed_inode, roots)
 
-    supervisor_pid, namespace_supervisor = containment_pair(identities, edges)
-    if (
-        pathlib.Path(f"/proc/{supervisor_pid}").stat().st_uid != os.getuid()
-        or pathlib.Path(f"/proc/{namespace_supervisor}").stat().st_uid != os.getuid()
-    ):
-        raise RuntimeError("containment supervisor ownership is mismatched")
-    if not executable_matches(root_pid, "/usr/bin/systemd-run") and root_pid != supervisor_pid:
-        raise RuntimeError("managed runtime root has an ambiguous executable identity")
     if any(cgroup_path(pid) != managed_path for pid in identities):
         raise RuntimeError("managed runtime crossed its exact cgroup")
     if cgroup_processes(cgroup_directory) != cgroup_identity[2]:
         raise RuntimeError("managed cgroup process set changed while frozen")
 
-    workload_roots = edges.get(namespace_supervisor, [])
-    if len(workload_roots) != 1:
-        raise RuntimeError("containment supervisor has an ambiguous child set")
-    workload = descendants(edges, workload_roots[0])
-    permitted = workload | {supervisor_pid, namespace_supervisor, root_pid}
-    if set(identities) != permitted:
-        raise RuntimeError("managed runtime contains an uncontained sibling process")
-    supervisor_descriptors = {}
-    for pid in (supervisor_pid, namespace_supervisor):
-        supervisor_cwd = os.readlink(f"/proc/{pid}/cwd")
-        if supervisor_cwd == target["path"] or supervisor_cwd.startswith(target["path"] + "/"):
-            raise RuntimeError("containment supervisor cwd reaches the target")
-        supervisor_descriptors[pid] = descriptors(pid)
-        if any(
-            value == target["path"] or value.startswith(target["path"] + "/")
-            for value in supervisor_descriptors[pid].values()
+    pair = containment_pair(identities, edges)
+    stable_descriptors = {}
+    if pair is not None:
+        supervisor_pid, namespace_supervisor = pair
+        if (
+            pathlib.Path(f"/proc/{supervisor_pid}").stat().st_uid != os.getuid()
+            or pathlib.Path(f"/proc/{namespace_supervisor}").stat().st_uid != os.getuid()
         ):
-            raise RuntimeError("containment supervisor retains a target descriptor")
-
-    expected_evidence = evidence_for(workload_roots[0])
-    expected_mount = namespace(workload_roots[0], "mnt")
-    expected_pid = namespace(workload_roots[0], "pid")
-    expected_cgroup = cgroup_path(workload_roots[0])
-    if (
-        expected_mount != namespace(namespace_supervisor, "mnt")
-        or expected_pid != namespace(namespace_supervisor, "pid")
-        or expected_mount == namespace(supervisor_pid, "mnt")
-        or expected_pid == namespace(supervisor_pid, "pid")
-    ):
-        raise RuntimeError("managed workload lacks private mount or PID namespaces")
-    for pid in workload:
-        if evidence_for(pid) != expected_evidence or cgroup_path(pid) != expected_cgroup:
-            raise RuntimeError("managed workload identity or cgroup changed")
-        for tid in tasks(pid):
+            raise RuntimeError("containment supervisor ownership is mismatched")
+        if not executable_matches(root_pid, "/usr/bin/systemd-run") and root_pid != supervisor_pid:
+            raise RuntimeError("managed runtime root has an ambiguous executable identity")
+        workload_roots = edges.get(namespace_supervisor, [])
+        if len(workload_roots) != 1:
+            raise RuntimeError("containment supervisor has an ambiguous child set")
+        workload = descendants(edges, workload_roots[0])
+        permitted = workload | {supervisor_pid, namespace_supervisor, root_pid}
+        if set(identities) != permitted:
+            raise RuntimeError("managed runtime contains an uncontained sibling process")
+        for pid in (supervisor_pid, namespace_supervisor):
+            stable_descriptors[pid] = descriptors(pid)
+        expected_evidence = evidence_for(workload_roots[0])
+        if target in expected_evidence["blockers"]:
+            expected_mount = namespace(workload_roots[0], "mnt")
+            expected_pid = namespace(workload_roots[0], "pid")
+            expected_cgroup = cgroup_path(workload_roots[0])
             if (
-                namespace(tid, "mnt") != expected_mount
-                or namespace(tid, "pid") != expected_pid
-                or not target_is_masked(f"/proc/{tid}/root")
-                or not mount_is_masked(tid)
+                expected_mount != namespace(namespace_supervisor, "mnt")
+                or expected_pid != namespace(namespace_supervisor, "pid")
+                or expected_mount == namespace(supervisor_pid, "mnt")
+                or expected_pid == namespace(supervisor_pid, "pid")
             ):
-                raise RuntimeError("managed task escaped exact target containment")
-            for alias in (
-                f"/proc/{tid}/root/proc/1/root",
-                f"/proc/{tid}/root/proc/self/root",
+                raise RuntimeError("managed workload lacks private mount or PID namespaces")
+            for pid in workload:
+                if evidence_for(pid) != expected_evidence or cgroup_path(pid) != expected_cgroup:
+                    raise RuntimeError("managed workload identity or cgroup changed")
+                for tid in tasks(pid):
+                    if (
+                        namespace(tid, "mnt") != expected_mount
+                        or namespace(tid, "pid") != expected_pid
+                        or not target_is_masked(f"/proc/{tid}/root")
+                        or not mount_is_masked(tid)
+                    ):
+                        raise RuntimeError("managed task escaped exact target containment")
+                    for alias in (
+                        f"/proc/{tid}/root/proc/1/root",
+                        f"/proc/{tid}/root/proc/self/root",
+                    ):
+                        if not target_is_unreachable_or_masked(alias):
+                            raise RuntimeError("managed task can access the target through proc root")
+        else:
+            for pid in identities:
+                stable_descriptors[pid] = descriptors(pid)
+    else:
+        for pid in identities:
+            stable_descriptors[pid] = descriptors(pid)
+
+    if pair is None or target not in expected_evidence["blockers"]:
+        for pid in identities:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            if cwd == target["path"] or cwd.startswith(target["path"] + "/"):
+                raise RuntimeError("preexisting managed workload cwd reaches the target")
+            if any(
+                value == target["path"] or value.startswith(target["path"] + "/")
+                for value in stable_descriptors[pid].values()
             ):
-                if not target_is_unreachable_or_masked(alias):
-                    raise RuntimeError("managed task can access the target through proc root")
+                raise RuntimeError("preexisting managed workload retains a target descriptor")
 
     after_identities, after_edges, after_tasks = process_tree(
         cgroup_processes(cgroup_directory)
@@ -715,11 +731,13 @@ try:
         identities != after_identities
         or edges != after_edges
         or task_identities != after_tasks
-        or supervisor_descriptors[supervisor_pid] != descriptors(supervisor_pid)
-        or supervisor_descriptors[namespace_supervisor] != descriptors(namespace_supervisor)
+        or any(stable_descriptors[pid] != descriptors(pid) for pid in stable_descriptors)
     ):
         raise RuntimeError("managed process or task set changed during containment inspection")
-    completed("inspectEvidence")
+    completed("inspectEvidence", {
+        "watchdogNonce": watchdog_nonce,
+        "leaseDigest": hashlib.sha256(canonical(watchdog_lease)).hexdigest(),
+    })
     command("thaw")
     if (
         cgroup_path(root_pid) != managed_path
@@ -760,10 +778,7 @@ try:
         min(watchdog_lease["deadline"], time.monotonic() + 2),
     )
     watchdog_disarmed = True
-    completed("disarm", {
-        "watchdogNonce": watchdog_nonce,
-        "leaseDigest": hashlib.sha256(canonical(watchdog_lease)).hexdigest(),
-    })
+    completed("disarm")
 finally:
     signal.alarm(0)
     unfreeze_error = None
@@ -1485,6 +1500,16 @@ impl WorktreeCoordinator {
             .retirements
             .get_mut(operation_id)
             .ok_or_else(|| WorktreeCoordinatorError::UnknownOperation(operation_id.to_string()))?;
+        if matches!(
+            state,
+            RetirementState::Running | RetirementState::RecoveryRequired
+        ) && record.request_identity.is_none()
+        {
+            return Err(WorktreeCoordinatorError::Conflict(
+                "Cargo cleanup cannot enter a provider state before request identity binding"
+                    .into(),
+            ));
+        }
         record.state = state;
         record.updated_at = now_ms();
         record.last_error = last_error;
@@ -1716,7 +1741,21 @@ impl WorktreeCoordinator {
         for record in self.pending_retirements() {
             match record.state {
                 RetirementState::Reserved => {
-                    if let Err(error) = self.start_provider_worker(record.clone()) {
+                    if record.request_identity.is_none() {
+                        if let Err(error) = self.transition(
+                            &record.operation_id,
+                            RetirementState::Failed,
+                            Some(
+                                "Cargo cleanup stopped before provider request identity binding"
+                                    .into(),
+                            ),
+                        ) {
+                            eprintln!(
+                                "t-hub-cargo-cleanup: could not release unbound operation '{}': {error}",
+                                record.operation_id
+                            );
+                        }
+                    } else if let Err(error) = self.start_provider_worker(record.clone()) {
                         eprintln!(
                             "t-hub-cargo-cleanup: could not recover operation '{}': {error}",
                             record.operation_id
@@ -1878,7 +1917,7 @@ impl WorktreeCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
             .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
-        let containment = verify_process_containment(
+        let mut containment = verify_process_containment(
             &panes,
             &request.request.worktree,
             &record.operation_id,
@@ -1909,18 +1948,31 @@ impl WorktreeCoordinator {
             &running,
             &request.request.worktree,
             request,
-            containment,
+            containment.evidence.clone(),
         )?;
         drop(_boundary);
-        authorization.launch(&running, &request.request.worktree, request)
+        let output = authorization.launch(&running, &request.request.worktree, request);
+        let release = containment.release();
+        match (output, release) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(provider_error), Err(release_error)) => Err(format!(
+                "{provider_error}; managed runtime containment release failed: {release_error}"
+            )),
+        }
     }
 }
 
 fn missing_request_completion(record: &WorktreeRetirement) -> ProviderCompletion {
-    ProviderCompletion::RecoveryRequired(format!(
+    let error = format!(
         "durable provider request is missing: {}",
         record.request_path
-    ))
+    );
+    if record.request_identity.is_some() {
+        ProviderCompletion::RecoveryRequired(error)
+    } else {
+        ProviderCompletion::Failed(error)
+    }
 }
 
 fn read_provider_request(record: &WorktreeRetirement) -> Result<RetirementCleanupRequest, String> {
@@ -1969,20 +2021,21 @@ fn classify_provider_output(
         .iter()
         .map(path_identity)
         .collect::<BTreeSet<_>>();
-    let reported_inventory = report
-        .get("actions")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|actions| {
-            actions
-                .iter()
-                .map(|action| {
-                    let identity = action.get("target").unwrap_or(action);
-                    serde_json::from_value::<CapturedPathIdentity>(identity.clone())
-                        .ok()
-                        .map(|identity| path_identity(&identity))
-                })
-                .collect::<Option<BTreeSet<_>>>()
-        });
+    let actions = report.get("actions").and_then(serde_json::Value::as_array);
+    let reported_inventory = actions.and_then(|actions| {
+        if actions.len() != expected_targets.len() {
+            return None;
+        }
+        actions
+            .iter()
+            .map(|action| {
+                let identity = action.get("target").unwrap_or(action);
+                serde_json::from_value::<CapturedPathIdentity>(identity.clone())
+                    .ok()
+                    .map(|identity| path_identity(&identity))
+            })
+            .collect::<Option<BTreeSet<_>>>()
+    });
     if reported_inventory.as_ref() != Some(&expected_inventory) {
         return ProviderCompletion::RecoveryRequired(
             "rust-storage returned a report without the complete target inventory".into(),
@@ -1990,11 +2043,25 @@ fn classify_provider_output(
     }
 
     if output.status.success() {
-        return if report.get("complete").and_then(serde_json::Value::as_bool) == Some(true) {
+        let completed_clean = actions.is_some_and(|actions| {
+            actions.iter().all(|action| {
+                action.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+                    && action
+                        .get("recoveryState")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("clean")
+                    && action
+                        .get("quarantinePath")
+                        .is_some_and(serde_json::Value::is_null)
+            })
+        });
+        return if report.get("complete").and_then(serde_json::Value::as_bool) == Some(true)
+            && completed_clean
+        {
             ProviderCompletion::Succeeded
         } else {
             ProviderCompletion::RecoveryRequired(
-                "rust-storage returned success without a complete report".into(),
+                "rust-storage returned success without an exact completed-clean report".into(),
             )
         };
     }
@@ -2246,7 +2313,7 @@ enum WatchdogOperation {
     AuthorizeProvider,
 }
 
-const WATCHDOG_LIFECYCLE: [WatchdogOperation; 11] = [
+const WATCHDOG_PREPARE_LIFECYCLE: [WatchdogOperation; 8] = [
     WatchdogOperation::CaptureCgroup,
     WatchdogOperation::CreateLease,
     WatchdogOperation::LaunchWatchdog,
@@ -2254,10 +2321,13 @@ const WATCHDOG_LIFECYCLE: [WatchdogOperation; 11] = [
     WatchdogOperation::Arm,
     WatchdogOperation::Freeze,
     WatchdogOperation::InspectEvidence,
+    WatchdogOperation::AuthorizeProvider,
+];
+
+const WATCHDOG_RELEASE_LIFECYCLE: [WatchdogOperation; 3] = [
     WatchdogOperation::Thaw,
     WatchdogOperation::VerifyThaw,
     WatchdogOperation::Disarm,
-    WatchdogOperation::AuthorizeProvider,
 ];
 
 impl WatchdogOperation {
@@ -2288,14 +2358,32 @@ trait WatchdogBackend {
 fn execute_watchdog_lifecycle(
     backend: &mut impl WatchdogBackend,
 ) -> Result<WatchdogAuthorizationEvidence, String> {
-    for operation in WATCHDOG_LIFECYCLE {
+    let authorization = prepare_watchdog_lifecycle(backend)?;
+    release_watchdog_lifecycle(backend)?;
+    Ok(authorization)
+}
+
+fn prepare_watchdog_lifecycle(
+    backend: &mut impl WatchdogBackend,
+) -> Result<WatchdogAuthorizationEvidence, String> {
+    for operation in WATCHDOG_PREPARE_LIFECYCLE {
+        if let Err(error) = backend.perform(operation) {
+            backend.recover()?;
+            return Err(error);
+        }
+    }
+    backend.take_authorization()
+}
+
+fn release_watchdog_lifecycle(backend: &mut impl WatchdogBackend) -> Result<(), String> {
+    for operation in WATCHDOG_RELEASE_LIFECYCLE {
         if let Err(error) = backend.perform(operation) {
             backend.recover()?;
             return Err(error);
         }
     }
     backend.finish()?;
-    backend.take_authorization()
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2349,6 +2437,7 @@ impl ProcessWatchdogBackend {
             operation_id,
             request_path,
             CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
+            &(provider_timeout().as_secs() + 30).to_string(),
         ]);
         command
             .stdin(Stdio::piped())
@@ -2507,9 +2596,9 @@ impl WatchdogBackend for ProcessWatchdogBackend {
                 operation.name()
             ));
         }
-        if operation == WatchdogOperation::Disarm {
+        if operation == WatchdogOperation::InspectEvidence {
             self.authorization = Some(completion.authorization.ok_or_else(|| {
-                "watchdog disarm omitted provider authorization evidence".to_string()
+                "watchdog inspection omitted provider authorization evidence".to_string()
             })?);
         } else if completion.authorization.is_some() {
             return Err("watchdog authorization evidence arrived out of state".into());
@@ -2552,9 +2641,16 @@ fn verify_process_containment(
     target: &CapturedWorktreeIdentity,
     operation_id: &str,
     request_path: &str,
-) -> Result<ContainmentAuthorizationEvidence, String> {
+) -> Result<ProcessContainmentGuard, String> {
     let generation = uuid::Uuid::new_v4().simple().to_string();
-    let mut watchdogs = Vec::with_capacity(panes.len());
+    let mut guard = ProcessContainmentGuard {
+        backends: Vec::with_capacity(panes.len()),
+        evidence: ContainmentAuthorizationEvidence {
+            generation,
+            watchdogs: Vec::with_capacity(panes.len()),
+        },
+        released: false,
+    };
     for pane in panes {
         if path_within(&pane.cwd, &target.path) {
             return Err(format!(
@@ -2569,23 +2665,54 @@ fn verify_process_containment(
                 pane.session
             )
         })?;
-        watchdogs.push(execute_watchdog_lifecycle(&mut backend).map_err(|error| {
+        let authorization = prepare_watchdog_lifecycle(&mut backend).map_err(|error| {
             format!(
                 "Cargo cleanup refuses session '{}' containment: {error}",
                 pane.session
             )
-        })?);
+        })?;
+        guard.evidence.watchdogs.push(authorization);
+        guard.backends.push(backend);
     }
-    Ok(ContainmentAuthorizationEvidence {
-        generation,
-        watchdogs,
-    })
+    Ok(guard)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ContainmentAuthorizationEvidence {
     generation: String,
     watchdogs: Vec<WatchdogAuthorizationEvidence>,
+}
+
+struct ProcessContainmentGuard {
+    backends: Vec<ProcessWatchdogBackend>,
+    evidence: ContainmentAuthorizationEvidence,
+    released: bool,
+}
+
+impl ProcessContainmentGuard {
+    fn release(&mut self) -> Result<(), String> {
+        let mut first_error = None;
+        for backend in &mut self.backends {
+            if let Err(error) = release_watchdog_lifecycle(backend) {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.released = first_error.is_none();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ProcessContainmentGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            for backend in &mut self.backends {
+                let _ = backend.recover();
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -3648,14 +3775,102 @@ mod tests {
     }
 
     #[test]
-    fn missing_reserved_request_requires_recovery() {
+    fn provider_success_requires_every_action_to_be_completed_clean() {
+        let target = CapturedPathIdentity {
+            path: "/repo/worktree/apps/cli/target".into(),
+            device: 7,
+            inode: 12,
+        };
+        let exact = provider_output(
+            true,
+            0,
+            serde_json::json!({
+                "complete": true,
+                "actions": [{
+                    "target": target.clone(),
+                    "status": "completed",
+                    "recoveryState": "clean",
+                    "quarantinePath": null,
+                }],
+            }),
+        );
+        assert_eq!(
+            classify_provider_output(&exact, std::slice::from_ref(&target)),
+            ProviderCompletion::Succeeded
+        );
+
+        for (status, recovery_state, quarantine_path) in [
+            ("failed", "clean", serde_json::Value::Null),
+            ("completed", "quarantined", serde_json::Value::Null),
+            (
+                "completed",
+                "clean",
+                serde_json::Value::String("/tmp/quarantine".into()),
+            ),
+        ] {
+            let contradictory = provider_output(
+                true,
+                0,
+                serde_json::json!({
+                    "complete": true,
+                    "actions": [{
+                        "target": target.clone(),
+                        "status": status,
+                        "recoveryState": recovery_state,
+                        "quarantinePath": quarantine_path,
+                    }],
+                }),
+            );
+            assert!(matches!(
+                classify_provider_output(&contradictory, std::slice::from_ref(&target)),
+                ProviderCompletion::RecoveryRequired(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_unbound_request_is_a_pre_provider_failure() {
         let record = WorktreeCoordinator::ephemeral()
             .begin_retirement("/repo/worktree", "/missing/request.json")
             .unwrap();
         assert!(matches!(
             missing_request_completion(&record),
-            ProviderCompletion::RecoveryRequired(_)
+            ProviderCompletion::Failed(_)
         ));
+    }
+
+    #[test]
+    fn restart_releases_unbound_reservation_without_invalid_recovery_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("retirements.json");
+        let operation_id = {
+            let coordinator = WorktreeCoordinator::load(store.clone()).unwrap();
+            coordinator
+                .begin_retirement("/repo/worktree", "/missing/request.json")
+                .unwrap()
+                .operation_id
+        };
+        let coordinator = Arc::new(WorktreeCoordinator::load(store.clone()).unwrap());
+        assert!(coordinator
+            .transition(
+                &operation_id,
+                RetirementState::RecoveryRequired,
+                Some("invalid".into()),
+            )
+            .is_err());
+        coordinator.recover_pending();
+
+        let restarted = WorktreeCoordinator::load(store).unwrap();
+        assert!(restarted.pending_retirements().is_empty());
+        assert_eq!(
+            restarted
+                .lock()
+                .retirements
+                .get(&operation_id)
+                .unwrap()
+                .state,
+            RetirementState::Failed
+        );
     }
 
     #[test]
@@ -3885,14 +4100,15 @@ mod tests {
             "0123456789abcdef0123456789abcdef",
             "/tmp/test-request.json",
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(error.contains("exact managed cgroup-v2 freezer ownership is unavailable"));
         crate::tmux::kill_session_tree(&session).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn cleanup_review_managed_runtime_uses_supervised_freeze_watchdog() {
+    fn cleanup_review_preexisting_managed_runtime_uses_frozen_boundary() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
         let worktree = directory.path().join("worktree");
@@ -3902,31 +4118,6 @@ mod tests {
         std::fs::create_dir(&unrelated).unwrap();
         let stat = std::fs::metadata(&worktree).unwrap();
         let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
-        let record = coordinator
-            .begin_retirement(worktree.to_str().unwrap(), request_path.to_str().unwrap())
-            .unwrap();
-        coordinator
-            .write_provider_request(
-                &record,
-                RetirementCleanupCapture {
-                    worktree: CapturedWorktreeIdentity {
-                        path: worktree.to_str().unwrap().into(),
-                        device: stat.dev(),
-                        inode: stat.ino(),
-                        head: "1234567890123456789012345678901234567890".into(),
-                        branch: "feature".into(),
-                    },
-                    targets: vec![CapturedPathIdentity {
-                        path: worktree.join("target").to_str().unwrap().into(),
-                        device: stat.dev(),
-                        inode: stat.ino() + 1,
-                    }],
-                    dirty: false,
-                    merged: true,
-                    is_linked: true,
-                },
-            )
-            .unwrap();
         let admission = coordinator
             .admit_activity(unrelated.to_str().unwrap(), "reconcile_cortana")
             .unwrap();
@@ -3960,6 +4151,33 @@ mod tests {
         let (session, owner) = launch()
             .or_else(|first_error| launch().map_err(|_| first_error))
             .unwrap();
+        drop(admission);
+        let target = CapturedWorktreeIdentity {
+            path: worktree.to_str().unwrap().into(),
+            device: stat.dev(),
+            inode: stat.ino(),
+            head: "1234567890123456789012345678901234567890".into(),
+            branch: "feature".into(),
+        };
+        let record = coordinator
+            .begin_retirement(worktree.to_str().unwrap(), request_path.to_str().unwrap())
+            .unwrap();
+        coordinator
+            .write_provider_request(
+                &record,
+                RetirementCleanupCapture {
+                    worktree: target.clone(),
+                    targets: vec![CapturedPathIdentity {
+                        path: worktree.join("target").to_str().unwrap().into(),
+                        device: stat.dev(),
+                        inode: stat.ino() + 1,
+                    }],
+                    dirty: false,
+                    merged: true,
+                    is_linked: true,
+                },
+            )
+            .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let pane = loop {
             if let Some(pane) = crate::tmux::pane_info()
@@ -3972,12 +4190,15 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(20));
         };
-        let verification = verify_process_containment(
+        let mut verification = verify_process_containment(
             &[pane],
-            admission.blockers.first().expect("one exact blocker"),
+            &target,
             &record.operation_id,
             request_path.to_str().unwrap(),
         );
+        if let Ok(guard) = &mut verification {
+            guard.release().unwrap();
+        }
         let leaked_lease = std::fs::read_dir(directory.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -4008,7 +4229,8 @@ mod tests {
             "0123456789abcdef0123456789abcdef",
             "/tmp/test-request.json"
         )
-        .unwrap_err()
+        .err()
+        .unwrap()
         .contains("exact managed cgroup-v2 freezer ownership is unavailable"));
     }
 
@@ -4066,6 +4288,12 @@ mod tests {
                     self.exact_frozen = true;
                     self.changed = true;
                 }
+                WatchdogOperation::InspectEvidence => {
+                    self.authorization = Some(WatchdogAuthorizationEvidence {
+                        watchdog_nonce: "a".repeat(32),
+                        lease_digest: "b".repeat(64),
+                    });
+                }
                 WatchdogOperation::Thaw => {
                     self.exact_frozen = false;
                     self.changed = false;
@@ -4073,10 +4301,6 @@ mod tests {
                 }
                 WatchdogOperation::Disarm => {
                     self.lease = None;
-                    self.authorization = Some(WatchdogAuthorizationEvidence {
-                        watchdog_nonce: "a".repeat(32),
-                        lease_digest: "b".repeat(64),
-                    });
                 }
                 WatchdogOperation::AuthorizeProvider => {
                     if self.authorization.is_none() {
@@ -4155,7 +4379,11 @@ mod tests {
             assert!(!state.exact_frozen, "{name}");
             assert!(!state.unrelated_frozen, "{name}");
             assert_eq!(state.lease, None, "{name}");
-            assert_eq!(state.provider_admissions, 0, "{name}");
+            assert_eq!(
+                state.provider_admissions,
+                usize::from(WATCHDOG_RELEASE_LIFECYCLE.contains(&operation)),
+                "{name}"
+            );
             assert!(state.terminal_preserved, "{name}");
             assert!(state.agent_preserved, "{name}");
             assert!(state.source_preserved, "{name}");
@@ -4179,7 +4407,27 @@ mod tests {
         assert!(success.terminal_preserved);
         assert!(success.agent_preserved);
         assert!(success.source_preserved);
-        assert_eq!(success.operations, WATCHDOG_LIFECYCLE);
+        assert_eq!(
+            success.operations,
+            WATCHDOG_PREPARE_LIFECYCLE
+                .into_iter()
+                .chain(WATCHDOG_RELEASE_LIFECYCLE)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cleanup_review_watchdog_remains_frozen_until_provider_completion() {
+        let mut state = injected_watchdog(None);
+        let authorization = prepare_watchdog_lifecycle(&mut state).unwrap();
+        assert!(state.exact_frozen);
+        assert_eq!(state.lease, Some(TestLeaseState::Armed));
+        assert_eq!(state.provider_admissions, 1);
+        assert_eq!(authorization.watchdog_nonce.len(), 32);
+
+        release_watchdog_lifecycle(&mut state).unwrap();
+        assert!(!state.exact_frozen);
+        assert_eq!(state.lease, None);
     }
 
     #[cfg(unix)]
