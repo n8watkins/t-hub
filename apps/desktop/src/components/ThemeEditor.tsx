@@ -1170,11 +1170,11 @@ function AboutSection() {
       <AboutGroup />
       <Group
         title="What is T-Hub"
-        description="A local, terminal-first cockpit for running and supervising many Claude Code sessions at once — free and open source, by n8builds. Windows + WSL."
+        description="A local, terminal-first cockpit for running and supervising many Codex and Claude coding-agent sessions at once. Free and open source, by n8builds. Windows + WSL."
       >
         <Bullet>Every terminal is a persistent tmux session — closing a tile detaches it; the session keeps running and can be re-adopted.</Bullet>
         <Bullet>Drag, resize, and reorder tiles freely — terminals never reload when they move.</Bullet>
-        <Bullet>Install the Claude hooks to light up the supervision tree, the attention queue, and live context/cost/usage.</Bullet>
+        <Bullet>Install Codex or Claude hooks to light up the supervision tree and attention queue. Claude hooks also supply live context, cost, and usage.</Bullet>
       </Group>
     </>
   );
@@ -1187,7 +1187,7 @@ function SetupSection() {
       <Step n={2}>Drag a tile’s header to rearrange the grid; drag a column/row gutter to resize. Drag a tile onto a workspace tab to move it there.</Step>
       <Step n={3}>Right-click a tile (or hold Shift over its “×”) to close or delete it; a plain “×” detaches (the session keeps running).</Step>
       <Step n={4}>Open the Files panel to browse the focused terminal’s project; click a file to preview or edit it.</Step>
-      <Step n={5}>Install Claude hooks in Settings → Hooks (pick which events) to get the supervision tree, attention queue, and live usage.</Step>
+      <Step n={5}>Install Codex or Claude hooks in Settings → Hooks to get the supervision tree and attention queue. Claude hooks also supply live context, cost, and usage.</Step>
     </Group>
   );
 }
