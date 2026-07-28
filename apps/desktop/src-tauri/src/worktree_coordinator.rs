@@ -24,6 +24,7 @@ const CONTAINMENT_EVIDENCE_LIMIT: usize = 64 * 1024;
 
 const ATOMIC_CONTAINMENT_INSPECTION_SCRIPT: &str = r#"
 import base64
+import fcntl
 import json
 import os
 import pathlib
@@ -202,13 +203,9 @@ def event_value(directory, key):
         raise RuntimeError("managed cgroup freeze evidence is incomplete")
     return values[key]
 
-def write_freeze(directory, value):
-    descriptor = os.open("cgroup.freeze", os.O_WRONLY | os.O_CLOEXEC, dir_fd=directory)
-    try:
-        if os.write(descriptor, value) != len(value):
-            raise RuntimeError("managed cgroup freeze write was partial")
-    finally:
-        os.close(descriptor)
+def write_freeze(descriptor, value):
+    if os.write(descriptor, value) != len(value):
+        raise RuntimeError("managed cgroup freeze write was partial")
 
 def wait_frozen(directory, expected):
     deadline = time.monotonic() + 5
@@ -266,59 +263,58 @@ def cgroup_processes(directory):
         raise RuntimeError("managed cgroup process set is empty or exceeds the safe bound")
     return values
 
-stopped = set()
 cgroup_directory = None
 cgroup_identity = None
+freeze_descriptor = None
+freeze_changed = False
+recovery_write = None
+recovery_pid = None
 try:
     managed = managed_cgroup(root_pid)
-    if managed is not None:
-        managed_path, managed_inode, cgroup_directory = managed
-        write_freeze(cgroup_directory, b"1")
-        wait_frozen(cgroup_directory, 1)
-        if (
-            cgroup_path(root_pid) != managed_path
-            or os.fstat(cgroup_directory).st_ino != managed_inode
-        ):
-            raise RuntimeError("managed cgroup identity changed during freeze")
-        roots = cgroup_processes(cgroup_directory)
-        identities, edges, task_identities = process_tree(roots)
-        cgroup_identity = (managed_path, managed_inode, roots)
-    else:
-        identities, edges, task_identities = process_tree([root_pid])
-        provisional, namespace_supervisor = containment_pair(identities, edges)
-        if provisional != root_pid:
-            raise RuntimeError("unmanaged process root is not the exact containment boundary")
-        workload_roots = edges.get(namespace_supervisor, [])
-        if len(workload_roots) != 1:
-            raise RuntimeError("containment supervisor has an ambiguous child set")
-        while True:
-            workload, _, workload_tasks = process_tree(workload_roots)
-            for pid in workload:
-                states = {
-                    pathlib.Path(f"/proc/{tid}/stat").read_text().split(") ", 1)[1][0]
-                    for tid in tasks(pid)
-                }
-                if not states.issubset({"T", "t"}):
-                    os.kill(pid, signal.SIGSTOP)
-                    stopped.add(pid)
-            deadline = time.monotonic() + 5
-            while True:
-                all_stopped = True
-                for pid in workload:
-                    states = {
-                        pathlib.Path(f"/proc/{tid}/stat").read_text().split(") ", 1)[1][0]
-                        for tid in tasks(pid)
-                    }
-                    all_stopped = all_stopped and states.issubset({"T", "t"})
-                if all_stopped:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("managed process tree did not freeze")
-                time.sleep(0.005)
-            after, _, after_tasks = process_tree(workload_roots)
-            if workload == after and workload_tasks == after_tasks:
-                break
-        identities, edges, task_identities = process_tree([root_pid])
+    if managed is None:
+        raise RuntimeError("exact managed cgroup-v2 freezer ownership is unavailable")
+    managed_path, managed_inode, cgroup_directory = managed
+    freeze_descriptor = os.open(
+        "cgroup.freeze",
+        os.O_WRONLY | os.O_CLOEXEC,
+        dir_fd=cgroup_directory,
+    )
+    fcntl.flock(freeze_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if event_value(cgroup_directory, "frozen") != 0:
+        raise RuntimeError("managed cgroup is already frozen by another owner")
+    recovery_read, recovery_write = os.pipe()
+    recovery_pid = os.fork()
+    if recovery_pid == 0:
+        try:
+            os.close(recovery_write)
+            os.setsid()
+            null = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
+            for descriptor in (0, 1, 2):
+                os.dup2(null, descriptor)
+            os.close(null)
+            while os.read(recovery_read, 1):
+                pass
+            if (
+                os.fstat(cgroup_directory).st_ino == managed_inode
+                and event_value(cgroup_directory, "frozen") == 1
+            ):
+                write_freeze(freeze_descriptor, b"0")
+                wait_frozen(cgroup_directory, 0)
+            os._exit(0)
+        except Exception:
+            os._exit(1)
+    os.close(recovery_read)
+    write_freeze(freeze_descriptor, b"1")
+    freeze_changed = True
+    wait_frozen(cgroup_directory, 1)
+    if (
+        cgroup_path(root_pid) != managed_path
+        or os.fstat(cgroup_directory).st_ino != managed_inode
+    ):
+        raise RuntimeError("managed cgroup identity changed during freeze")
+    roots = cgroup_processes(cgroup_directory)
+    identities, edges, task_identities = process_tree(roots)
+    cgroup_identity = (managed_path, managed_inode, roots)
 
     supervisor_pid, namespace_supervisor = containment_pair(identities, edges)
     if (
@@ -326,13 +322,12 @@ try:
         or pathlib.Path(f"/proc/{namespace_supervisor}").stat().st_uid != os.getuid()
     ):
         raise RuntimeError("containment supervisor ownership is mismatched")
-    if managed is not None:
-        if not executable_matches(root_pid, "/usr/bin/systemd-run") and root_pid != supervisor_pid:
-            raise RuntimeError("managed runtime root has an ambiguous executable identity")
-        if any(cgroup_path(pid) != managed_path for pid in identities):
-            raise RuntimeError("managed runtime crossed its exact cgroup")
-        if cgroup_processes(cgroup_directory) != cgroup_identity[2]:
-            raise RuntimeError("managed cgroup process set changed while frozen")
+    if not executable_matches(root_pid, "/usr/bin/systemd-run") and root_pid != supervisor_pid:
+        raise RuntimeError("managed runtime root has an ambiguous executable identity")
+    if any(cgroup_path(pid) != managed_path for pid in identities):
+        raise RuntimeError("managed runtime crossed its exact cgroup")
+    if cgroup_processes(cgroup_directory) != cgroup_identity[2]:
+        raise RuntimeError("managed cgroup process set changed while frozen")
 
     workload_roots = edges.get(namespace_supervisor, [])
     if len(workload_roots) != 1:
@@ -383,7 +378,7 @@ try:
                     raise RuntimeError("managed task can access the target through proc root")
 
     after_identities, after_edges, after_tasks = process_tree(
-        cgroup_processes(cgroup_directory) if managed is not None else [root_pid]
+        cgroup_processes(cgroup_directory)
     )
     if (
         identities != after_identities
@@ -396,68 +391,29 @@ try:
 finally:
     signal.alarm(0)
     unfreeze_error = None
-    if cgroup_directory is not None:
+    if cgroup_directory is not None and freeze_changed:
         try:
-            write_freeze(cgroup_directory, b"0")
+            if (
+                cgroup_path(root_pid) != managed_path
+                or os.fstat(cgroup_directory).st_ino != managed_inode
+            ):
+                raise RuntimeError("managed cgroup identity changed before unfreeze")
+            write_freeze(freeze_descriptor, b"0")
             wait_frozen(cgroup_directory, 0)
         except Exception as error:
             unfreeze_error = error
+    if recovery_write is not None:
+        os.close(recovery_write)
+    if recovery_pid is not None:
+        _, recovery_status = os.waitpid(recovery_pid, 0)
+        if recovery_status != 0 and unfreeze_error is None:
+            unfreeze_error = RuntimeError("managed cgroup recovery watchdog failed")
+    if freeze_descriptor is not None:
+        os.close(freeze_descriptor)
+    if cgroup_directory is not None:
         os.close(cgroup_directory)
-    for pid in sorted(stopped, reverse=True):
-        try:
-            os.kill(pid, signal.SIGCONT)
-        except ProcessLookupError:
-            if unfreeze_error is None:
-                unfreeze_error = RuntimeError("managed process vanished before unfreeze")
     if unfreeze_error is not None:
         raise RuntimeError(f"managed process unfreeze failed: {unfreeze_error}")
-"#;
-
-const CONTAINMENT_UNFREEZE_SCRIPT: &str = r#"
-import os
-import pathlib
-import re
-import sys
-import time
-
-pid = int(sys.argv[1])
-rows = [row for row in pathlib.Path(f"/proc/{pid}/cgroup").read_text().splitlines() if row]
-if len(rows) != 1 or not rows[0].startswith("0::/"):
-    raise RuntimeError("managed cgroup identity is malformed")
-path = rows[0][3:]
-unit = pathlib.PurePosixPath(path).name
-expected = (
-    f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/"
-    f"app.slice/{unit}"
-)
-if not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit) or path != expected:
-    raise SystemExit(0)
-directory = os.open(
-    "/sys/fs/cgroup" + path,
-    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-)
-try:
-    descriptor = os.open("cgroup.freeze", os.O_WRONLY | os.O_CLOEXEC, dir_fd=directory)
-    try:
-        if os.write(descriptor, b"0") != 1:
-            raise RuntimeError("managed cgroup unfreeze write was partial")
-    finally:
-        os.close(descriptor)
-    deadline = time.monotonic() + 5
-    while True:
-        descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
-        try:
-            events = os.read(descriptor, 4097).decode("ascii").splitlines()
-        finally:
-            os.close(descriptor)
-        frozen = [row.split()[1] for row in events if row.startswith("frozen ")]
-        if frozen == ["0"]:
-            break
-        if time.monotonic() >= deadline:
-            raise RuntimeError("managed cgroup did not unfreeze")
-        time.sleep(0.005)
-finally:
-    os.close(directory)
 "#;
 
 const CONTAINMENT_PREFLIGHT_SCRIPT: &str = r#"
@@ -1062,7 +1018,10 @@ impl WorktreeCoordinator {
         if self
             .boundary_snapshot()
             .iter()
-            .any(|(_, boundary)| boundary.admissions.load(Ordering::SeqCst) > 0)
+            .any(|(candidate, boundary)| {
+                path_within(candidate, &worktree_path)
+                    && boundary.admissions.load(Ordering::SeqCst) > 0
+            })
         {
             return Err(WorktreeCoordinatorError::Conflict(format!(
                 "worktree '{worktree_path}' has activity being admitted"
@@ -1755,56 +1714,6 @@ fn require_namespace_containment(
     Ok(())
 }
 
-struct ContainmentFreezeRecoveryGuard {
-    pane_pid: u32,
-    armed: bool,
-}
-
-impl ContainmentFreezeRecoveryGuard {
-    fn new(pane_pid: u32) -> Self {
-        Self {
-            pane_pid,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn recover(&mut self) -> Result<(), String> {
-        let mut command = containment_command();
-        command.args([
-            "/usr/bin/python3",
-            "-c",
-            CONTAINMENT_UNFREEZE_SCRIPT,
-            &self.pane_pid.to_string(),
-        ]);
-        let output = crate::bounded_exec::output_with_timeout_and_limit(
-            command,
-            Duration::from_secs(6),
-            4096,
-        )
-        .map_err(|error| format!("containment unfreeze recovery failed: {error}"))?;
-        if !output.status.success() || !output.stderr.is_empty() {
-            return Err(format!(
-                "containment unfreeze recovery failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        self.armed = false;
-        Ok(())
-    }
-}
-
-impl Drop for ContainmentFreezeRecoveryGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.recover();
-        }
-    }
-}
-
 fn verify_process_containment(
     panes: &[crate::tmux::PaneInfo],
     target: &CapturedWorktreeIdentity,
@@ -1826,41 +1735,24 @@ fn verify_process_containment(
             &pane.pid.to_string(),
             &target_json,
         ]);
-        let mut freeze_guard = ContainmentFreezeRecoveryGuard::new(pane.pid);
-        let mut recovery_error = None;
         let output = match crate::bounded_exec::output_with_timeout_and_limit(
             command,
             Duration::from_secs(5),
             CONTAINMENT_EVIDENCE_LIMIT,
         ) {
-            Ok(output) => {
-                if output.status.success() && output.stderr.is_empty() {
-                    freeze_guard.disarm();
-                } else if let Err(error) = freeze_guard.recover() {
-                    recovery_error = Some(error);
-                }
-                output
-            }
+            Ok(output) => output,
             Err(error) => {
-                let recovery = freeze_guard.recover();
                 return Err(format!(
-                    "Cargo cleanup could not verify session '{}' containment: {error}{}",
-                    pane.session,
-                    recovery
-                        .err()
-                        .map(|error| format!("; {error}"))
-                        .unwrap_or_default()
+                    "Cargo cleanup could not verify session '{}' containment: {error}",
+                    pane.session
                 ));
             }
         };
         if !output.status.success() || !output.stderr.is_empty() {
             return Err(format!(
-                "Cargo cleanup refuses uncontained session '{}': {}{}",
+                "Cargo cleanup refuses uncontained session '{}': {}",
                 pane.session,
-                String::from_utf8_lossy(&output.stderr).trim(),
-                recovery_error
-                    .map(|error| format!("; {error}"))
-                    .unwrap_or_default()
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
     }
@@ -2555,11 +2447,12 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(20));
         };
-        verify_process_containment(
+        let error = verify_process_containment(
             &[pane],
             admission.blockers.first().expect("one exact blocker"),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(error.contains("exact managed cgroup-v2 freezer ownership is unavailable"));
         crate::tmux::kill_session_tree(&session).unwrap();
     }
 
@@ -2666,6 +2559,18 @@ mod tests {
             .contains("uncontained"));
     }
 
+    #[test]
+    fn cleanup_review_freeze_requires_exact_recoverable_cgroup_ownership() {
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT
+            .contains("exact managed cgroup-v2 freezer ownership is unavailable"));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT
+            .contains("managed cgroup is already frozen by another owner"));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("recovery_pid = os.fork()"));
+        assert!(!ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("SIGSTOP"));
+        assert!(!ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("SIGCONT"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn multiple_targets_coordinate_without_holding_the_global_boundary() {
@@ -2743,6 +2648,56 @@ mod tests {
                 "spawn_terminal",
             )
             .is_err());
+    }
+
+    #[test]
+    fn cleanup_review_retirement_checks_only_matching_inflight_admissions() {
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let unrelated = coordinator
+            .admit_activity("/repo/worktrees/second/nested", "spawn_terminal")
+            .unwrap();
+        coordinator
+            .begin_retirement_if_idle("/repo/worktrees/first", "/requests/first.json", |_| {
+                Ok(Vec::new())
+            })
+            .unwrap();
+        drop(unrelated);
+
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let matching = coordinator
+            .admit_activity("/repo/worktrees/third/nested", "spawn_terminal")
+            .unwrap();
+        let error = coordinator
+            .begin_retirement_if_idle("/repo/worktrees/third", "/requests/third.json", |_| {
+                Ok(Vec::new())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("activity being admitted"));
+        drop(matching);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_review_retirement_matches_inflight_symlink_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("worktree");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&worktree).unwrap();
+        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let matching = coordinator
+            .admit_activity(alias.join("nested").to_str().unwrap(), "spawn_terminal")
+            .unwrap();
+
+        let error = coordinator
+            .begin_retirement_if_idle(
+                worktree.to_str().unwrap(),
+                directory.path().join("request.json").to_str().unwrap(),
+                |_| Ok(Vec::new()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("activity being admitted"));
+        drop(matching);
     }
 
     #[test]

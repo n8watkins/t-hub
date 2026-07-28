@@ -1780,7 +1780,7 @@ fn exact_effect_command_with_python(
 }
 
 const MANAGED_CGROUP_EFFECT_PY: &str = r##"
-import json, os, re, resource, stat, subprocess, sys, tempfile, time
+import fcntl, json, os, re, resource, stat, subprocess, sys, tempfile, time
 
 def refuse(code):
     raise SystemExit(code)
@@ -2114,6 +2114,13 @@ try:
     if (second["InvocationID"] != actual["invocationId"] or
         second["ControlGroup"] != actual["cgroupPath"]):
         refuse(79)
+    freeze_descriptor = os.open(
+        "cgroup.freeze", os.O_WRONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        fcntl.flock(freeze_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(freeze_descriptor)
+        refuse(131)
     write_control(directory, "cgroup.freeze", b"1")
     deadline = time.monotonic() + 5
     while event_value(directory, "frozen") != 1:
@@ -2133,6 +2140,8 @@ try:
         open(crash_marker, "x", encoding="ascii").close()
         refuse(103)
 finally:
+    if "freeze_descriptor" in locals():
+        os.close(freeze_descriptor)
     os.close(directory)
 "##;
 
@@ -4025,6 +4034,7 @@ while True:
     fn managed_owner_contract_fails_closed_on_unsupported_shapes() {
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("cgroup.freeze"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("cgroup.kill"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("systemd-run"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("refuse(70)"));
         assert!(MANAGED_CGROUP_EFFECT_PY.contains("refuse(72)"));
