@@ -2535,6 +2535,16 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[cfg(unix)]
+    fn resolve_launch_executable_after_scheduler_retry(
+        provider: &str,
+        shell: &str,
+    ) -> Result<ResolvedLaunchExecutable, LaunchAttestationError> {
+        resolve_launch_executable_with_shell(provider, Some(shell)).or_else(|first_error| {
+            resolve_launch_executable_with_shell(provider, Some(shell)).map_err(|_| first_error)
+        })
+    }
+
     #[test]
     fn launch_resolution_accepts_only_exact_non_tty_shell_diagnostics() {
         assert!(valid_launch_resolution_stderr("bash", b""));
@@ -2597,20 +2607,15 @@ mod tests {
             {
                 continue;
             }
-            resolve_launch_executable_with_shell(provider, Some(shell))
-                .or_else(|first_error| {
-                    // This test runs alongside process-heavy tmux and supervisor
-                    // suites. A saturated CI host can consume the entire bounded
-                    // probe window before the login shell is scheduled. Retry the
-                    // same production path once: deterministic trust failures
-                    // remain failures, while scheduler starvation does not make
-                    // this shell-compatibility test flaky.
-                    resolve_launch_executable_with_shell(provider, Some(shell))
-                        .map_err(|_| first_error)
-                })
-                .unwrap_or_else(|error| {
-                    panic!("launch resolution failed through {shell}: {error}")
-                });
+            // These tests run alongside process-heavy tmux and supervisor
+            // suites. A saturated CI host can consume the entire bounded probe
+            // window before the login shell is scheduled. Retry the same
+            // production path once: deterministic trust failures remain
+            // failures, while scheduler starvation does not make these
+            // shell-compatibility tests flaky.
+            resolve_launch_executable_after_scheduler_retry(provider, shell).unwrap_or_else(
+                |error| panic!("launch resolution failed through {shell}: {error}"),
+            );
             tested.push(shell);
         }
         assert!(tested.iter().any(|shell| shell.ends_with("/bash")));
@@ -2678,7 +2683,8 @@ mod tests {
 
         std::fs::write(&rc, path_setup).unwrap();
         let resolved =
-            resolve_launch_executable_with_shell("codex", Some(shell.to_str().unwrap())).unwrap();
+            resolve_launch_executable_after_scheduler_retry("codex", shell.to_str().unwrap())
+                .unwrap();
         assert_eq!(resolved.identity.path, provider.to_str().unwrap());
         assert!(!marker.exists(), "the provider command must never execute");
 
