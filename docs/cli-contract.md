@@ -163,12 +163,15 @@ The supervisory workflow is active through the shared control operation catalog.
 - A successful `start_agent` response returns `sourceCommit`, `sourceBaseline`, and `admissionPurpose` from the durable admitted record so callers can verify launch provenance without inferring it from their request.
 - `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
 - `th agents followup` delivers one idempotent durable inbox instruction to an exact owned agent session and forwards `--replacement-assignment` only when scope explicitly changes.
-- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `cleanup-session`, `cleanup-worktree`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
+- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `approve-recovery`, `cleanup-session`, `cleanup-worktree`, `recover-worktree`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
 - `th admin approve-session` sends only the exact session ID, and the backend derives the target kind, ship, and ownership from the authoritative fleet registry.
 - `th admin cleanup-session` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
 - `th admin cleanup-worktree` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
+- `th admin approve-recovery` binds a new approval to one exact recovery-required cleanup operation, worktree, and ship.
+- `th admin recover-worktree` requires that exact unconsumed approval and `--confirm`, then revalidates the durable reservation, complete Cargo inventory, worktree identity, eligibility, and absence of live leases before resuming the provider.
 - Worktree Cargo cleanup is limited to clean, merged, linked worktrees with no live T-Hub lease and an exact non-symlink Cargo target inventory under the two T-Hub Cargo workspace roots.
-- The backend records the reservation in `~/.t-hub/worktree-retirements.json`, publishes it as nullable `retirementReservation` data through `th worktree ls --json`, and resumes interrupted provider work after restart.
+- The backend records the reservation in `~/.t-hub/worktree-retirements.json` and publishes it as nullable `retirementReservation` data through `th worktree ls --json`.
+- After restart, reserved work resumes automatically, while an interrupted running provider commit becomes `RecoveryRequired` and needs the separately approved explicit recovery flow.
 - Ambiguous provider failures remain active as `RecoveryRequired`; only a structured refusal proving every target stayed at its original path releases the reservation as failed.
 - Active cleanup reservations block matching worktree creation, terminal spawning, history resume, and agent starting.
 - Cargo cleanup removes and later rebuilds target artifacts.
