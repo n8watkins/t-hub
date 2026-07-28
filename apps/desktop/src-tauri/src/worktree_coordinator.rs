@@ -518,8 +518,11 @@ def command(operation):
     if value != {"operation": operation}:
         raise RuntimeError("watchdog backend command is out of state")
 
-def completed(operation):
-    sys.stdout.write(json.dumps({"operation": operation}, separators=(",", ":")) + "\n")
+def completed(operation, authorization=None):
+    value = {"operation": operation}
+    if authorization is not None:
+        value["authorization"] = authorization
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 cgroup_directory = None
@@ -757,7 +760,10 @@ try:
         min(watchdog_lease["deadline"], time.monotonic() + 2),
     )
     watchdog_disarmed = True
-    completed("disarm")
+    completed("disarm", {
+        "watchdogNonce": watchdog_nonce,
+        "leaseDigest": hashlib.sha256(canonical(watchdog_lease)).hexdigest(),
+    })
 finally:
     signal.alarm(0)
     unfreeze_error = None
@@ -1037,6 +1043,10 @@ pub struct WorktreeRetirement {
     pub state: RetirementState,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_identity: Option<BoundProviderRequestIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -1412,6 +1422,8 @@ impl WorktreeCoordinator {
             state: RetirementState::Reserved,
             created_at: timestamp,
             updated_at: timestamp,
+            request_sha256: None,
+            request_identity: None,
             last_error: None,
         };
         let _publication = self
@@ -1532,7 +1544,7 @@ impl WorktreeCoordinator {
         &self,
         record: &WorktreeRetirement,
         capture: RetirementCleanupCapture,
-    ) -> Result<(), WorktreeCoordinatorError> {
+    ) -> Result<WorktreeRetirement, WorktreeCoordinatorError> {
         let request = RetirementCleanupRequest {
             schema_version: SCHEMA_VERSION,
             operation_id: record.operation_id.clone(),
@@ -1542,9 +1554,57 @@ impl WorktreeCoordinator {
             allow_unmerged: false,
             inventory_complete: true,
         };
-        write_json_atomic(Path::new(&record.request_path), &request).map_err(|error| {
+        let body = serde_json::to_vec_pretty(&request).map_err(|error| {
             WorktreeCoordinatorError::Persistence(format!("{}: {error}", record.request_path))
-        })
+        })?;
+        write_bytes_atomic(Path::new(&record.request_path), &body).map_err(|error| {
+            WorktreeCoordinatorError::Persistence(format!("{}: {error}", record.request_path))
+        })?;
+        let digest = format!("{:x}", Sha256::digest(&body));
+        let provider_path = provider_request_path(&record.request_path)
+            .map_err(WorktreeCoordinatorError::Persistence)?;
+        let (identity, captured_body) =
+            capture_provider_request_identity(&record.request_path, &provider_path)
+                .map_err(WorktreeCoordinatorError::Persistence)?;
+        if captured_body != body {
+            return Err(WorktreeCoordinatorError::Conflict(
+                "Cargo cleanup request changed before identity binding".into(),
+            ));
+        }
+        let bound_identity = BoundProviderRequestIdentity {
+            provider_path,
+            identity,
+        };
+        let mut snapshot = self.lock();
+        let previous = snapshot.clone();
+        let current = snapshot
+            .retirements
+            .get_mut(&record.operation_id)
+            .filter(|current| {
+                *current == record
+                    && current.state == RetirementState::Reserved
+                    && current.request_sha256.is_none()
+                    && current.request_identity.is_none()
+            })
+            .ok_or_else(|| {
+                WorktreeCoordinatorError::Conflict(
+                    "Cargo cleanup reservation changed before request identity binding".into(),
+                )
+            })?;
+        current.request_sha256 = Some(digest);
+        current.request_identity = Some(bound_identity);
+        current.updated_at = now_ms();
+        let updated = current.clone();
+        if let Err(error) = self.persist(&snapshot) {
+            *snapshot = previous;
+            return Err(error);
+        }
+        let boundary = self.boundary_for(&record.worktree_path);
+        *boundary
+            .retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(updated.clone());
+        Ok(updated)
     }
 
     pub fn require_provider_configured(&self) -> Result<(), String> {
@@ -1687,7 +1747,7 @@ impl WorktreeCoordinator {
             if !Path::new(&record.request_path).is_file() {
                 return missing_request_completion(&record);
             }
-            let request = match read_provider_request(&record) {
+            let request = match capture_provider_request(&record) {
                 Ok(request) => request,
                 Err(error) => return ProviderCompletion::RecoveryRequired(error),
             };
@@ -1697,7 +1757,7 @@ impl WorktreeCoordinator {
                 ));
             }
             match self.run_provider(&record, &request) {
-                Ok(output) => classify_provider_output(&output, &request.targets),
+                Ok(output) => classify_provider_output(&output, &request.request.targets),
                 Err(error) => ProviderCompletion::RecoveryRequired(error),
             }
         })();
@@ -1809,7 +1869,7 @@ impl WorktreeCoordinator {
     fn run_provider(
         &self,
         record: &WorktreeRetirement,
-        request: &RetirementCleanupRequest,
+        request: &CapturedProviderRequest,
     ) -> Result<std::process::Output, String> {
         let boundary = self.boundary_for(&record.worktree_path);
         let _boundary = boundary
@@ -1818,35 +1878,41 @@ impl WorktreeCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
             .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
-        let request_capture = capture_provider_request(&record.request_path)?;
-        invoke_provider_after_containment(
-            &request_capture,
-            || {
-                verify_process_containment(
-                    &panes,
-                    &request.worktree,
-                    &record.operation_id,
-                    &request_capture.provider_path,
-                )?;
-                if self
-                    .boundary_snapshot()
-                    .iter()
-                    .any(|(candidate, boundary)| {
-                        path_within(candidate, &record.worktree_path)
-                            && boundary.admissions.load(Ordering::SeqCst) > 0
-                    })
-                {
-                    return Err(
-                        "Cargo cleanup commit refused because worktree activity is admitted".into(),
-                    );
-                }
-                Ok(())
-            },
-            |request_path| {
-                drop(_boundary);
-                run_provider_command(request_path)
-            },
-        )
+        let containment = verify_process_containment(
+            &panes,
+            &request.request.worktree,
+            &record.operation_id,
+            &request.provider_path,
+        )?;
+        if self
+            .boundary_snapshot()
+            .iter()
+            .any(|(candidate, boundary)| {
+                path_within(candidate, &record.worktree_path)
+                    && boundary.admissions.load(Ordering::SeqCst) > 0
+            })
+        {
+            return Err(
+                "Cargo cleanup commit refused because worktree activity is admitted".into(),
+            );
+        }
+        let running = self
+            .lock()
+            .retirements
+            .get(&record.operation_id)
+            .filter(|current| current.state == RetirementState::Running)
+            .cloned()
+            .ok_or_else(|| {
+                "Cargo cleanup reservation changed before provider authorization".to_string()
+            })?;
+        let mut authorization = ProviderAuthorizationGuard::issue(
+            &running,
+            &request.request.worktree,
+            request,
+            containment,
+        )?;
+        drop(_boundary);
+        authorization.launch(&running, &request.request.worktree, request)
     }
 }
 
@@ -1858,11 +1924,15 @@ fn missing_request_completion(record: &WorktreeRetirement) -> ProviderCompletion
 }
 
 fn read_provider_request(record: &WorktreeRetirement) -> Result<RetirementCleanupRequest, String> {
-    let request: RetirementCleanupRequest = serde_json::from_slice(
-        &std::fs::read(&record.request_path)
-            .map_err(|error| format!("could not read durable provider request: {error}"))?,
-    )
-    .map_err(|error| format!("durable provider request is invalid: {error}"))?;
+    capture_provider_request(record).map(|capture| capture.request)
+}
+
+fn parse_provider_request_bytes(
+    record: &WorktreeRetirement,
+    bytes: &[u8],
+) -> Result<RetirementCleanupRequest, String> {
+    let request: RetirementCleanupRequest = serde_json::from_slice(bytes)
+        .map_err(|error| format!("durable provider request is invalid: {error}"))?;
     if request.schema_version != SCHEMA_VERSION
         || request.operation_id != record.operation_id
         || request.project != "t-hub"
@@ -2030,6 +2100,36 @@ fn validate_snapshot(
                 "retirement '{operation_id}' was updated before it was created"
             )));
         }
+        if record.request_sha256.is_some() != record.request_identity.is_some() {
+            return Err(WorktreeCoordinatorError::CorruptState(format!(
+                "retirement '{operation_id}' has partial provider request identity"
+            )));
+        }
+        if let (Some(digest), Some(identity)) = (&record.request_sha256, &record.request_identity) {
+            if digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || identity
+                    .identity
+                    .digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+                    != *digest
+            {
+                return Err(WorktreeCoordinatorError::CorruptState(format!(
+                    "retirement '{operation_id}' has mismatched provider request identity"
+                )));
+            }
+        }
+        if matches!(
+            record.state,
+            RetirementState::Running | RetirementState::RecoveryRequired
+        ) && record.request_identity.is_none()
+        {
+            return Err(WorktreeCoordinatorError::CorruptState(format!(
+                "retirement '{operation_id}' has no bound provider request identity"
+            )));
+        }
         if record.state.is_active() && !active_paths.insert(normalize_path(&record.worktree_path)) {
             return Err(WorktreeCoordinatorError::CorruptState(format!(
                 "worktree '{}' has duplicate active retirements",
@@ -2182,16 +2282,20 @@ trait WatchdogBackend {
     fn perform(&mut self, operation: WatchdogOperation) -> Result<(), String>;
     fn recover(&mut self) -> Result<(), String>;
     fn finish(&mut self) -> Result<(), String>;
+    fn take_authorization(&mut self) -> Result<WatchdogAuthorizationEvidence, String>;
 }
 
-fn execute_watchdog_lifecycle(backend: &mut impl WatchdogBackend) -> Result<(), String> {
+fn execute_watchdog_lifecycle(
+    backend: &mut impl WatchdogBackend,
+) -> Result<WatchdogAuthorizationEvidence, String> {
     for operation in WATCHDOG_LIFECYCLE {
         if let Err(error) = backend.perform(operation) {
             backend.recover()?;
             return Err(error);
         }
     }
-    backend.finish()
+    backend.finish()?;
+    backend.take_authorization()
 }
 
 #[derive(Serialize)]
@@ -2204,6 +2308,15 @@ struct WatchdogBackendCommand {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WatchdogBackendCompletion {
     operation: String,
+    #[serde(default)]
+    authorization: Option<WatchdogAuthorizationEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WatchdogAuthorizationEvidence {
+    watchdog_nonce: String,
+    lease_digest: String,
 }
 
 struct ProcessWatchdogBackend {
@@ -2213,6 +2326,8 @@ struct ProcessWatchdogBackend {
     stderr: Arc<Mutex<Vec<u8>>>,
     stdout_thread: Option<std::thread::JoinHandle<()>>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
+    authorization: Option<WatchdogAuthorizationEvidence>,
+    authorization_issued: bool,
 }
 
 impl ProcessWatchdogBackend {
@@ -2283,6 +2398,8 @@ impl ProcessWatchdogBackend {
             stderr: captured_stderr,
             stdout_thread: Some(stdout_thread),
             stderr_thread: Some(stderr_thread),
+            authorization: None,
+            authorization_issued: false,
         })
     }
 
@@ -2325,6 +2442,25 @@ impl ProcessWatchdogBackend {
 impl WatchdogBackend for ProcessWatchdogBackend {
     fn perform(&mut self, operation: WatchdogOperation) -> Result<(), String> {
         if operation == WatchdogOperation::AuthorizeProvider {
+            self.authorization
+                .as_ref()
+                .filter(|authorization| {
+                    authorization.watchdog_nonce.len() == 32
+                        && authorization
+                            .watchdog_nonce
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && authorization.lease_digest.len() == 64
+                        && authorization
+                            .lease_digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| "watchdog provider authorization evidence is missing".to_string())?;
+            if self.authorization_issued {
+                return Err("watchdog provider authorization was already issued".into());
+            }
+            self.authorization_issued = true;
             return Ok(());
         }
         let stdin = self
@@ -2371,6 +2507,13 @@ impl WatchdogBackend for ProcessWatchdogBackend {
                 operation.name()
             ));
         }
+        if operation == WatchdogOperation::Disarm {
+            self.authorization = Some(completion.authorization.ok_or_else(|| {
+                "watchdog disarm omitted provider authorization evidence".to_string()
+            })?);
+        } else if completion.authorization.is_some() {
+            return Err("watchdog authorization evidence arrived out of state".into());
+        }
         Ok(())
     }
 
@@ -2392,6 +2535,16 @@ impl WatchdogBackend for ProcessWatchdogBackend {
         }
         Ok(())
     }
+
+    fn take_authorization(&mut self) -> Result<WatchdogAuthorizationEvidence, String> {
+        if !self.authorization_issued {
+            return Err("watchdog provider authorization transition is incomplete".into());
+        }
+        self.authorization_issued = false;
+        self.authorization
+            .take()
+            .ok_or_else(|| "watchdog provider authorization was already consumed".into())
+    }
 }
 
 fn verify_process_containment(
@@ -2399,7 +2552,9 @@ fn verify_process_containment(
     target: &CapturedWorktreeIdentity,
     operation_id: &str,
     request_path: &str,
-) -> Result<(), String> {
+) -> Result<ContainmentAuthorizationEvidence, String> {
+    let generation = uuid::Uuid::new_v4().simple().to_string();
+    let mut watchdogs = Vec::with_capacity(panes.len());
     for pane in panes {
         if path_within(&pane.cwd, &target.path) {
             return Err(format!(
@@ -2414,14 +2569,23 @@ fn verify_process_containment(
                 pane.session
             )
         })?;
-        execute_watchdog_lifecycle(&mut backend).map_err(|error| {
+        watchdogs.push(execute_watchdog_lifecycle(&mut backend).map_err(|error| {
             format!(
                 "Cargo cleanup refuses session '{}' containment: {error}",
                 pane.session
             )
-        })?;
+        })?);
     }
-    Ok(())
+    Ok(ContainmentAuthorizationEvidence {
+        generation,
+        watchdogs,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContainmentAuthorizationEvidence {
+    generation: String,
+    watchdogs: Vec<WatchdogAuthorizationEvidence>,
 }
 
 #[cfg(not(windows))]
@@ -2456,44 +2620,8 @@ fn provider_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn invoke_provider_after_containment<T>(
-    request: &CapturedProviderRequest,
-    containment: impl FnOnce() -> Result<(), String>,
-    invoke: impl FnOnce(&str) -> Result<T, String>,
-) -> Result<T, String> {
-    containment()?;
-    invoke_provider_after_revalidation(request, invoke)
-}
-
-fn invoke_provider_after_revalidation<T>(
-    request: &CapturedProviderRequest,
-    invoke: impl FnOnce(&str) -> Result<T, String>,
-) -> Result<T, String> {
-    request.revalidate()?;
-    invoke(&request.provider_path)
-}
-
-fn run_provider_command(request_path: &str) -> Result<std::process::Output, String> {
-    let configured = configured_provider_command()?;
-    let mut command = Command::new(&configured[0]);
-    command.args(&configured[1..]);
-    command.args([
-        "retirement-clean",
-        "--request",
-        request_path,
-        "--apply",
-        "--confirm",
-        "--json",
-    ]);
-    crate::bounded_exec::output_with_timeout_and_limit(
-        command,
-        provider_timeout(),
-        PROVIDER_OUTPUT_LIMIT,
-    )
-    .map_err(|error| format!("rust-storage retirement-clean could not complete: {error}"))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderRequestIdentity {
     device: Option<u64>,
     inode: Option<u64>,
@@ -2506,7 +2634,7 @@ struct ProviderRequestIdentity {
     provider_namespace: ProviderNamespaceIdentity,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderNamespaceIdentity {
     device: u64,
@@ -2517,29 +2645,184 @@ struct ProviderNamespaceIdentity {
     digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CapturedProviderRequest {
-    native_path: String,
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BoundProviderRequestIdentity {
     provider_path: String,
     identity: ProviderRequestIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedProviderRequest {
+    native_path: String,
+    provider_path: String,
+    bytes: Vec<u8>,
+    request: RetirementCleanupRequest,
+    identity: ProviderRequestIdentity,
+}
+
+struct ProviderAuthorizationGuard {
+    guard_nonce: String,
+    operation_id: String,
+    reservation_updated_at: u64,
+    target: CapturedWorktreeIdentity,
+    request_path: String,
+    request_identity: ProviderRequestIdentity,
+    request_digest: [u8; 32],
+    containment: ContainmentAuthorizationEvidence,
+    consumed: bool,
+}
+
+impl ProviderAuthorizationGuard {
+    fn issue(
+        record: &WorktreeRetirement,
+        target: &CapturedWorktreeIdentity,
+        request: &CapturedProviderRequest,
+        containment: ContainmentAuthorizationEvidence,
+    ) -> Result<Self, String> {
+        let request_digest = Sha256::digest(&request.bytes);
+        let request_digest_hex = format!("{request_digest:x}");
+        if record.state != RetirementState::Running
+            || record.operation_id != request.request.operation_id
+            || record.worktree_path != target.path
+            || &request.request.worktree != target
+            || record.request_sha256.as_deref() != Some(request_digest_hex.as_str())
+            || containment.generation.len() != 32
+            || !containment
+                .generation
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("provider authorization binding is mismatched".into());
+        }
+        let watchdog_nonces = containment
+            .watchdogs
+            .iter()
+            .map(|evidence| evidence.watchdog_nonce.as_str())
+            .collect::<BTreeSet<_>>();
+        if watchdog_nonces.len() != containment.watchdogs.len()
+            || containment.watchdogs.iter().any(|evidence| {
+                evidence.watchdog_nonce.len() != 32
+                    || !evidence
+                        .watchdog_nonce
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || evidence.lease_digest.len() != 64
+                    || !evidence
+                        .lease_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err("provider authorization has invalid watchdog evidence".into());
+        }
+        Ok(Self {
+            guard_nonce: uuid::Uuid::new_v4().simple().to_string(),
+            operation_id: record.operation_id.clone(),
+            reservation_updated_at: record.updated_at,
+            target: target.clone(),
+            request_path: request.provider_path.clone(),
+            request_identity: request.identity.clone(),
+            request_digest: request_digest.into(),
+            containment,
+            consumed: false,
+        })
+    }
+
+    fn launch(
+        &mut self,
+        record: &WorktreeRetirement,
+        target: &CapturedWorktreeIdentity,
+        request: &CapturedProviderRequest,
+    ) -> Result<std::process::Output, String> {
+        self.launch_with(record, target, request, |request_path| {
+            let configured = configured_provider_command()?;
+            let mut command = Command::new(&configured[0]);
+            command.args(&configured[1..]);
+            command.args([
+                "retirement-clean",
+                "--request",
+                request_path,
+                "--apply",
+                "--confirm",
+                "--json",
+            ]);
+            crate::bounded_exec::output_with_timeout_and_limit(
+                command,
+                provider_timeout(),
+                PROVIDER_OUTPUT_LIMIT,
+            )
+            .map_err(|error| format!("rust-storage retirement-clean could not complete: {error}"))
+        })
+    }
+
+    fn launch_with<T>(
+        &mut self,
+        record: &WorktreeRetirement,
+        target: &CapturedWorktreeIdentity,
+        request: &CapturedProviderRequest,
+        invoke: impl FnOnce(&str) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.consumed {
+            return Err("provider authorization was already consumed".into());
+        }
+        self.consumed = true;
+        let digest: [u8; 32] = Sha256::digest(&request.bytes).into();
+        if self.guard_nonce.len() != 32
+            || self.operation_id != record.operation_id
+            || self.reservation_updated_at != record.updated_at
+            || record.state != RetirementState::Running
+            || &self.target != target
+            || self.request_path != request.provider_path
+            || self.request_identity != request.identity
+            || self.request_digest != digest
+            || self.containment.generation.len() != 32
+        {
+            return Err("provider authorization is stale or mismatched".into());
+        }
+        request.revalidate()?;
+        invoke(&self.request_path)
+    }
+}
+
 impl CapturedProviderRequest {
     fn revalidate(&self) -> Result<(), String> {
-        let current = capture_provider_request(&self.native_path)?;
-        if current.provider_path != self.provider_path || current.identity != self.identity {
+        let provider_path = provider_request_path(&self.native_path)?;
+        let (identity, bytes) =
+            capture_provider_request_identity(&self.native_path, &provider_path)?;
+        if provider_path != self.provider_path || identity != self.identity || bytes != self.bytes {
             return Err("provider request identity changed before invocation".into());
         }
         Ok(())
     }
 }
 
-fn capture_provider_request(request_path: &str) -> Result<CapturedProviderRequest, String> {
-    let provider_path = provider_request_path(request_path)?;
-    let identity = capture_provider_request_identity(request_path, &provider_path)?;
+fn capture_provider_request(
+    record: &WorktreeRetirement,
+) -> Result<CapturedProviderRequest, String> {
+    let expected_digest = record
+        .request_sha256
+        .as_deref()
+        .ok_or_else(|| "durable provider request identity is not bound".to_string())?;
+    let provider_path = provider_request_path(&record.request_path)?;
+    let (identity, bytes) =
+        capture_provider_request_identity(&record.request_path, &provider_path)?;
+    let bound_identity = record
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| "durable provider request path identity is not bound".to_string())?;
+    if bound_identity.provider_path != provider_path
+        || bound_identity.identity != identity
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_digest
+    {
+        return Err("durable provider request changed after reservation binding".into());
+    }
+    let request = parse_provider_request_bytes(record, &bytes)?;
     Ok(CapturedProviderRequest {
-        native_path: request_path.to_string(),
+        native_path: record.request_path.clone(),
         provider_path,
+        bytes,
+        request,
         identity,
     })
 }
@@ -2547,7 +2830,15 @@ fn capture_provider_request(request_path: &str) -> Result<CapturedProviderReques
 fn capture_provider_request_identity(
     request_path: &str,
     provider_path: &str,
-) -> Result<ProviderRequestIdentity, String> {
+) -> Result<(ProviderRequestIdentity, Vec<u8>), String> {
+    capture_provider_request_identity_with(request_path, provider_path, || {})
+}
+
+fn capture_provider_request_identity_with(
+    request_path: &str,
+    provider_path: &str,
+    after_open: impl FnOnce(),
+) -> Result<(ProviderRequestIdentity, Vec<u8>), String> {
     let symlink = std::fs::symlink_metadata(request_path)
         .map_err(|error| format!("could not inspect provider request path: {error}"))?;
     if symlink.file_type().is_symlink() || !symlink.file_type().is_file() {
@@ -2560,6 +2851,7 @@ fn capture_provider_request_identity(
     if before.len() > INSPECTION_OUTPUT_LIMIT as u64 {
         return Err("provider request exceeds the safe identity bound".into());
     }
+    after_open();
     let mut contents = Vec::with_capacity(before.len() as usize);
     file.read_to_end(&mut contents)
         .map_err(|error| format!("could not hash provider request file: {error}"))?;
@@ -2578,21 +2870,30 @@ fn capture_provider_request_identity(
     let digest: [u8; 32] = Sha256::digest(&contents).into();
     let initial_file_identity = provider_file_identity(&symlink)?;
     let (device, inode, links, volume, file) = provider_file_identity(&after)?;
-    if initial_file_identity != (device, inode, links, volume, file) {
+    let durable_after = std::fs::symlink_metadata(request_path)
+        .map_err(|error| format!("could not recheck provider request path: {error}"))?;
+    if durable_after.file_type().is_symlink()
+        || !durable_after.file_type().is_file()
+        || initial_file_identity != (device, inode, links, volume, file)
+        || provider_file_identity(&durable_after)? != (device, inode, links, volume, file)
+    {
         return Err("provider request changed while opening exact identity".into());
     }
     let provider_namespace = capture_provider_namespace_identity(provider_path)?;
-    Ok(ProviderRequestIdentity {
-        device,
-        inode,
-        links,
-        volume,
-        file,
-        length: after.len(),
-        modified_nanos,
-        digest,
-        provider_namespace,
-    })
+    Ok((
+        ProviderRequestIdentity {
+            device,
+            inode,
+            links,
+            volume,
+            file,
+            length: after.len(),
+            modified_nanos,
+            digest,
+            provider_namespace,
+        },
+        contents,
+    ))
 }
 
 #[cfg(unix)]
@@ -2944,9 +3245,12 @@ fn write_atomic(path: &Path, snapshot: &WorktreeRetirementSnapshot) -> std::io::
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    write_bytes_atomic(path, &serde_json::to_vec_pretty(value)?)
+}
+
+fn write_bytes_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let body = serde_json::to_vec_pretty(value)?;
     let temp = path.with_extension(format!(
         "json.tmp.{}.{}",
         std::process::id(),
@@ -2961,7 +3265,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> std::io::Result<()>
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        file.write_all(&body)?;
+        file.write_all(body)?;
         file.sync_all()?;
         drop(file);
         replace_file(&temp, path)?;
@@ -3686,6 +3990,8 @@ mod tests {
         changed: bool,
         lease: Option<TestLeaseState>,
         provider_admissions: usize,
+        authorization: Option<WatchdogAuthorizationEvidence>,
+        authorization_issued: bool,
         terminal_preserved: bool,
         agent_preserved: bool,
         source_preserved: bool,
@@ -3709,8 +4015,20 @@ mod tests {
                     self.changed = false;
                     self.lease = Some(TestLeaseState::Thawed);
                 }
-                WatchdogOperation::Disarm => self.lease = None,
-                WatchdogOperation::AuthorizeProvider => self.provider_admissions += 1,
+                WatchdogOperation::Disarm => {
+                    self.lease = None;
+                    self.authorization = Some(WatchdogAuthorizationEvidence {
+                        watchdog_nonce: "a".repeat(32),
+                        lease_digest: "b".repeat(64),
+                    });
+                }
+                WatchdogOperation::AuthorizeProvider => {
+                    if self.authorization.is_none() {
+                        return Err("missing injected authorization".into());
+                    }
+                    self.provider_admissions += 1;
+                    self.authorization_issued = true;
+                }
                 _ => {}
             }
             Ok(())
@@ -3728,6 +4046,16 @@ mod tests {
         fn finish(&mut self) -> Result<(), String> {
             Ok(())
         }
+
+        fn take_authorization(&mut self) -> Result<WatchdogAuthorizationEvidence, String> {
+            if !self.authorization_issued {
+                return Err("injected authorization transition is incomplete".into());
+            }
+            self.authorization_issued = false;
+            self.authorization
+                .take()
+                .ok_or_else(|| "injected authorization was already consumed".into())
+        }
     }
 
     fn injected_watchdog(fail_at: Option<WatchdogOperation>) -> InjectedWatchdogOperations {
@@ -3739,6 +4067,8 @@ mod tests {
             changed: false,
             lease: None,
             provider_admissions: 0,
+            authorization: None,
+            authorization_issued: false,
             terminal_preserved: true,
             agent_preserved: true,
             source_preserved: true,
@@ -3761,6 +4091,7 @@ mod tests {
             ("stale-disarm", WatchdogOperation::Disarm),
             ("mismatched-disarm", WatchdogOperation::Disarm),
             ("restart-recovery", WatchdogOperation::InspectEvidence),
+            ("failed-authorize", WatchdogOperation::AuthorizeProvider),
         ];
         for (name, operation) in failures {
             let mut state = injected_watchdog(Some(operation));
@@ -3820,43 +4151,204 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn cleanup_review_provider_request_rejects_replacement_at_invocation() {
-        let directory = tempfile::tempdir().unwrap();
+    fn captured_test_provider_request(
+        directory: &tempfile::TempDir,
+    ) -> (WorktreeRetirement, CapturedProviderRequest) {
         let request = directory.path().join("request.json");
-        let replacement = directory.path().join("replacement.json");
-        std::fs::write(&request, br#"{"operation":"original"}"#).unwrap();
-        std::fs::write(&replacement, br#"{"operation":"changed!"}"#).unwrap();
-        let capture = capture_provider_request(request.to_str().unwrap()).unwrap();
+        let coordinator = WorktreeCoordinator::ephemeral();
+        let record = coordinator
+            .begin_retirement("/repo/worktree", request.to_str().unwrap())
+            .unwrap();
+        let record = coordinator
+            .write_provider_request(
+                &record,
+                RetirementCleanupCapture {
+                    worktree: CapturedWorktreeIdentity {
+                        path: "/repo/worktree".into(),
+                        device: 7,
+                        inode: 11,
+                        head: "1234567890123456789012345678901234567890".into(),
+                        branch: "feature".into(),
+                    },
+                    targets: vec![CapturedPathIdentity {
+                        path: "/repo/worktree/apps/cli/target".into(),
+                        device: 7,
+                        inode: 12,
+                    }],
+                    dirty: false,
+                    merged: true,
+                    is_linked: true,
+                },
+            )
+            .unwrap();
+        let request = capture_provider_request(&record).unwrap();
+        let mut running = record;
+        running.state = RetirementState::Running;
+        running.updated_at += 1;
+        (running, request)
+    }
+
+    #[cfg(unix)]
+    fn test_containment_authorization() -> ContainmentAuthorizationEvidence {
+        let mut backend = injected_watchdog(None);
+        let evidence = execute_watchdog_lifecycle(&mut backend).unwrap();
+        ContainmentAuthorizationEvidence {
+            generation: "c".repeat(32),
+            watchdogs: vec![evidence],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_review_provider_request_rejects_replacements_at_every_boundary() {
+        for phase in [
+            "before-capture",
+            "during-read",
+            "after-capture",
+            "during-containment",
+            "immediately-before-launch",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let request_path = directory.path().join("request.json");
+            let (record, capture) = captured_test_provider_request(&directory);
+            let source = directory.path().join("source.txt");
+            std::fs::write(&source, b"preserved").unwrap();
+            let replacement = directory.path().join("replacement.json");
+            std::fs::write(&replacement, &capture.bytes).unwrap();
+            let invocations = std::sync::atomic::AtomicUsize::new(0);
+
+            if phase == "before-capture" {
+                std::fs::rename(&replacement, &request_path).unwrap();
+                assert!(capture_provider_request(&record).is_err());
+            } else if phase == "during-read" {
+                let provider_path = provider_request_path(request_path.to_str().unwrap()).unwrap();
+                assert!(capture_provider_request_identity_with(
+                    request_path.to_str().unwrap(),
+                    &provider_path,
+                    || std::fs::rename(&replacement, &request_path).unwrap()
+                )
+                .is_err());
+            } else {
+                let mut guard = ProviderAuthorizationGuard::issue(
+                    &record,
+                    &capture.request.worktree,
+                    &capture,
+                    test_containment_authorization(),
+                )
+                .unwrap();
+                std::fs::rename(&replacement, &request_path).unwrap();
+                let result =
+                    guard.launch_with(&record, &capture.request.worktree, &capture, |_| {
+                        invocations.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    });
+                assert!(result.is_err(), "{phase}");
+            }
+            assert_eq!(invocations.load(Ordering::SeqCst), 0, "{phase}");
+            assert!(request_path.is_file(), "{phase}");
+            assert_eq!(record.state, RetirementState::Running, "{phase}");
+            assert_eq!(std::fs::read(&source).unwrap(), b"preserved", "{phase}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_review_provider_authorization_is_exact_and_single_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let (record, capture) = captured_test_provider_request(&directory);
+        let target = capture.request.worktree.clone();
         let invocations = std::sync::atomic::AtomicUsize::new(0);
-        let result = invoke_provider_after_containment(
+        let mut valid = ProviderAuthorizationGuard::issue(
+            &record,
+            &target,
             &capture,
-            || {
-                std::fs::rename(&replacement, &request).unwrap();
-                Ok(())
-            },
-            |_| {
+            test_containment_authorization(),
+        )
+        .unwrap();
+        valid
+            .launch_with(&record, &target, &capture, |_| {
                 invocations.fetch_add(1, Ordering::SeqCst);
                 Ok(())
+            })
+            .unwrap();
+        assert!(valid
+            .launch_with(&record, &target, &capture, |_| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+
+        let mut stale = ProviderAuthorizationGuard::issue(
+            &record,
+            &target,
+            &capture,
+            test_containment_authorization(),
+        )
+        .unwrap();
+        let mut changed_record = record.clone();
+        changed_record.updated_at += 1;
+        assert!(stale
+            .launch_with(&changed_record, &target, &capture, |_| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+
+        let mut mismatched = ProviderAuthorizationGuard::issue(
+            &record,
+            &target,
+            &capture,
+            test_containment_authorization(),
+        )
+        .unwrap();
+        let mut changed_target = target.clone();
+        changed_target.inode += 1;
+        assert!(mismatched
+            .launch_with(&record, &changed_target, &capture, |_| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+
+        assert!(ProviderAuthorizationGuard::issue(
+            &record,
+            &target,
+            &capture,
+            ContainmentAuthorizationEvidence {
+                generation: String::new(),
+                watchdogs: Vec::new(),
             },
-        );
-        assert!(result.is_err());
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        )
+        .is_err());
+        let duplicated = WatchdogAuthorizationEvidence {
+            watchdog_nonce: "d".repeat(32),
+            lease_digest: "e".repeat(64),
+        };
+        assert!(ProviderAuthorizationGuard::issue(
+            &record,
+            &target,
+            &capture,
+            ContainmentAuthorizationEvidence {
+                generation: "f".repeat(32),
+                watchdogs: vec![duplicated.clone(), duplicated],
+            },
+        )
+        .is_err());
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
     #[test]
     fn cleanup_review_provider_request_rejects_link_and_digest_changes() {
         let directory = tempfile::tempdir().unwrap();
-        let request = directory.path().join("request.json");
+        let (record, capture) = captured_test_provider_request(&directory);
+        let request = PathBuf::from(&capture.native_path);
         let alias = directory.path().join("request-link.json");
-        std::fs::write(&request, b"exact-content").unwrap();
-        let capture = capture_provider_request(request.to_str().unwrap()).unwrap();
         std::fs::hard_link(&request, &alias).unwrap();
         assert!(capture.revalidate().is_err());
         std::fs::remove_file(&alias).unwrap();
 
-        let capture = capture_provider_request(request.to_str().unwrap()).unwrap();
+        let capture = capture_provider_request(&record).unwrap();
         std::fs::write(&request, b"other-content").unwrap();
         assert!(capture.revalidate().is_err());
     }

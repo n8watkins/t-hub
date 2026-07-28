@@ -1209,7 +1209,7 @@ pub(super) fn cleanup_worktree_artifacts(
         let request_path = ctx.worktrees.next_request_path();
         let request_path = request_path.to_string_lossy().into_owned();
         let target_count = capture.targets.len();
-        let record = ctx
+        let mut record = ctx
             .worktrees
             .begin_retirement_if_idle(&path, &request_path, |canonical_path| {
                 tmux::pane_info()
@@ -1228,7 +1228,8 @@ pub(super) fn cleanup_worktree_artifacts(
             })
             .map_err(|error| error.to_string())?;
         let execution: Result<Value, String> = (|| {
-            ctx.worktrees
+            record = ctx
+                .worktrees
                 .write_provider_request(&record, capture)
                 .map_err(|error| error.to_string())?;
             ctx.worktrees.start_provider_worker(record.clone())?;
