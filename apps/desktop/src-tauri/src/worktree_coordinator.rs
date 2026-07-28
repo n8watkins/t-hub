@@ -22,58 +22,111 @@ const INSPECTION_OUTPUT_LIMIT: usize = 1024 * 1024;
 const LAST_ERROR_LIMIT: usize = 8192;
 const CONTAINMENT_EVIDENCE_LIMIT: usize = 64 * 1024;
 
-const CONTAINMENT_INSPECTION_SCRIPT: &str = r#"
+const ATOMIC_CONTAINMENT_INSPECTION_SCRIPT: &str = r#"
 import base64
 import json
 import os
 import pathlib
+import re
+import signal
+import stat
 import sys
+import time
 
 root_pid = int(sys.argv[1])
 target = json.loads(sys.argv[2])
+MAX_PROCESSES = 256
+MAX_TASKS = 1024
 
-def unescape_mount(value):
-    for encoded, decoded in (
-        ("\\040", " "),
-        ("\\011", "\t"),
-        ("\\012", "\n"),
-        ("\\134", "\\"),
-    ):
-        value = value.replace(encoded, decoded)
-    return value
+def inspection_timeout(signum, frame):
+    raise RuntimeError("managed containment inspection timed out")
 
-def process_identity(pid):
-    fields = pathlib.Path(f"/proc/{pid}/stat").read_text().split()
-    if len(fields) < 22:
+signal.signal(signal.SIGALRM, inspection_timeout)
+signal.alarm(4)
+
+def proc_start(pid):
+    value = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    end = value.rfind(")")
+    fields = value[end + 2:].split()
+    if end < 1 or len(fields) < 20:
         raise RuntimeError("managed process identity is incomplete")
-    return (pid, fields[21])
+    return fields[19]
 
-def children(pid):
-    values = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-    return [int(value) for value in values]
+def tasks(pid):
+    values = [int(path.name) for path in pathlib.Path(f"/proc/{pid}/task").iterdir()]
+    if not values or len(values) > MAX_TASKS:
+        raise RuntimeError("managed task set is empty or exceeds the safe bound")
+    return sorted(values)
 
-def process_tree():
-    pending = [root_pid]
+def task_children(tid):
+    return [
+        int(value)
+        for value in pathlib.Path(f"/proc/{tid}/task/{tid}/children").read_text().split()
+    ]
+
+def process_tree(roots):
+    pending = list(roots)
     identities = {}
     edges = {}
+    task_identities = {}
     while pending:
         pid = pending.pop()
         if pid in identities:
-            raise RuntimeError("managed process tree contains a cycle")
-        if len(identities) >= 256:
+            continue
+        if len(identities) >= MAX_PROCESSES:
             raise RuntimeError("managed process tree exceeds the safe bound")
-        identities[pid] = process_identity(pid)
-        descendants = children(pid)
-        edges[pid] = descendants
+        identities[pid] = proc_start(pid)
+        descendants = set()
+        for tid in tasks(pid):
+            if len(task_identities) >= MAX_TASKS:
+                raise RuntimeError("managed task tree exceeds the safe bound")
+            task_identities[tid] = proc_start(tid)
+            descendants.update(task_children(tid))
+        edges[pid] = sorted(descendants)
         pending.extend(descendants)
-    return identities, edges
+    return identities, edges, task_identities
+
+def descendants(edges, root):
+    pending = [root]
+    result = set()
+    while pending:
+        pid = pending.pop()
+        if pid in result:
+            continue
+        result.add(pid)
+        pending.extend(edges.get(pid, []))
+    return result
+
+def executable_matches(pid, expected):
+    actual = pathlib.Path(f"/proc/{pid}/exe").stat()
+    trusted = pathlib.Path(expected).stat()
+    return (actual.st_dev, actual.st_ino) == (trusted.st_dev, trusted.st_ino)
+
+def containment_pair(identities, edges):
+    candidates = {
+        pid for pid in identities if executable_matches(pid, "/usr/bin/bwrap")
+    }
+    pairs = [
+        (outer, inner)
+        for outer in candidates
+        for inner in edges.get(outer, [])
+        if inner in candidates
+    ]
+    if len(candidates) != 2 or len(pairs) != 1:
+        raise RuntimeError("managed runtime lacks one exact containment boundary")
+    return pairs[0]
+
+def environment(pid):
+    values = pathlib.Path(f"/proc/{pid}/environ").read_bytes()
+    if len(values) > 131072:
+        raise RuntimeError("managed process environment exceeds the safe bound")
+    return values.split(b"\0")
 
 def evidence_for(pid):
-    environ = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
     encoded = next(
         (
             item.split(b"=", 1)[1]
-            for item in environ
+            for item in environment(pid)
             if item.startswith(b"T_HUB_WORKTREE_CONTAINMENT=")
         ),
         None,
@@ -84,21 +137,20 @@ def evidence_for(pid):
     evidence = json.loads(base64.urlsafe_b64decode(encoded + padding))
     if (
         evidence.get("version") != 1
-        or not isinstance(evidence.get("launchNonce"), str)
-        or len(evidence["launchNonce"]) != 32
+        or not re.fullmatch(r"[0-9a-f]{32}", evidence.get("launchNonce", ""))
         or target not in evidence.get("blockers", [])
     ):
         raise RuntimeError("managed process containment evidence is mismatched")
     return evidence
 
-def namespace(pid, name):
-    return os.readlink(f"/proc/{pid}/ns/{name}")
-
-def cgroup(pid):
-    value = pathlib.Path(f"/proc/{pid}/cgroup").read_text()
-    if not value or "\n\n" in value:
+def cgroup_path(pid):
+    rows = [row for row in pathlib.Path(f"/proc/{pid}/cgroup").read_text().splitlines() if row]
+    if len(rows) != 1 or not rows[0].startswith("0::/"):
         raise RuntimeError("managed process cgroup identity is malformed")
-    return value
+    return rows[0][3:]
+
+def namespace(tid, name):
+    return os.readlink(f"/proc/{tid}/ns/{name}")
 
 def target_is_masked(root):
     visible = os.stat(root + target["path"])
@@ -110,79 +162,302 @@ def target_is_unreachable_or_masked(root):
     except (FileNotFoundError, PermissionError):
         return True
 
-def descriptors(pid):
-    result = {}
-    for fd in pathlib.Path(f"/proc/{pid}/fd").iterdir():
-        try:
-            result[fd.name] = os.readlink(fd)
-        except FileNotFoundError:
-            raise RuntimeError("containment supervisor descriptors changed during inspection")
-    return result
-
-before, edges = process_tree()
-root_children = edges[root_pid]
-if len(root_children) != 1:
-    raise RuntimeError("containment supervisor has an ambiguous child set")
-supervisor = pathlib.Path(f"/proc/{root_pid}/exe").stat()
-bwrap = pathlib.Path("/usr/bin/bwrap").stat()
-if (supervisor.st_dev, supervisor.st_ino) != (bwrap.st_dev, bwrap.st_ino):
-    raise RuntimeError("managed process root is not the exact containment supervisor")
-if os.getuid() != pathlib.Path(f"/proc/{root_pid}").stat().st_uid:
-    raise RuntimeError("containment supervisor ownership is mismatched")
-supervisor_cwd = os.readlink(f"/proc/{root_pid}/cwd")
-if supervisor_cwd == target["path"] or supervisor_cwd.startswith(target["path"] + "/"):
-    raise RuntimeError("containment supervisor cwd reaches the target")
-supervisor_descriptors = descriptors(root_pid)
-for destination in supervisor_descriptors.values():
-    if destination == target["path"] or destination.startswith(target["path"] + "/"):
-        raise RuntimeError("containment supervisor retains a target descriptor")
-
-workload = root_children[0]
-expected_evidence = evidence_for(workload)
-expected_mount = namespace(workload, "mnt")
-expected_pid = namespace(workload, "pid")
-expected_cgroup = cgroup(workload)
-if expected_mount == namespace(root_pid, "mnt") or expected_pid == namespace(root_pid, "pid"):
-    raise RuntimeError("managed workload lacks private mount or PID namespaces")
-
-for pid in before:
-    if pid == root_pid:
-        continue
-    if evidence_for(pid) != expected_evidence:
-        raise RuntimeError("managed process containment evidence changed")
-    if namespace(pid, "mnt") != expected_mount or namespace(pid, "pid") != expected_pid:
-        raise RuntimeError("managed process escaped the containment namespaces")
-    if cgroup(pid) != expected_cgroup:
-        raise RuntimeError("managed process escaped the bounded cgroup")
-    if not target_is_masked(f"/proc/{pid}/root"):
-        raise RuntimeError("managed process can access the real target")
-    for alias in (
-        f"/proc/{pid}/root/proc/1/root",
-        f"/proc/{pid}/root/proc/self/root",
-    ):
-        if not target_is_unreachable_or_masked(alias):
-            raise RuntimeError("managed process can access the target through proc root")
-    contained = False
-    for line in pathlib.Path(f"/proc/{pid}/mountinfo").read_text().splitlines():
+def mount_is_masked(tid):
+    for line in pathlib.Path(f"/proc/{tid}/mountinfo").read_text().splitlines():
         fields = line.split()
         separator = fields.index("-")
-        if (
-            unescape_mount(fields[4]) == target["path"]
-            and fields[separator + 1] == "tmpfs"
+        mountpoint = fields[4]
+        for encoded, decoded in (
+            ("\\040", " "),
+            ("\\011", "\t"),
+            ("\\012", "\n"),
+            ("\\134", "\\"),
         ):
-            contained = True
-            break
-    if not contained:
-        raise RuntimeError("managed process lacks the exact target blocker")
+            mountpoint = mountpoint.replace(encoded, decoded)
+        if mountpoint == target["path"] and fields[separator + 1] == "tmpfs":
+            return True
+    return False
 
-after, after_edges = process_tree()
-if (
-    before != after
-    or edges != after_edges
-    or supervisor_descriptors != descriptors(root_pid)
-):
-    raise RuntimeError("managed process tree changed during containment inspection")
-sys.exit(0)
+def descriptors(pid):
+    values = {}
+    for fd in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+        values[fd.name] = os.readlink(fd)
+    return values
+
+def event_value(directory, key):
+    values = {}
+    descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        raw = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 4096:
+        raise RuntimeError("managed cgroup events exceed the safe bound")
+    for row in raw.decode("ascii").splitlines():
+        name, value = row.split()
+        if name in values:
+            raise RuntimeError("managed cgroup events are ambiguous")
+        values[name] = int(value)
+    if key not in values:
+        raise RuntimeError("managed cgroup freeze evidence is incomplete")
+    return values[key]
+
+def write_freeze(directory, value):
+    descriptor = os.open("cgroup.freeze", os.O_WRONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        if os.write(descriptor, value) != len(value):
+            raise RuntimeError("managed cgroup freeze write was partial")
+    finally:
+        os.close(descriptor)
+
+def wait_frozen(directory, expected):
+    deadline = time.monotonic() + 5
+    while event_value(directory, "frozen") != expected:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("managed cgroup freeze state did not converge")
+        time.sleep(0.005)
+
+def managed_cgroup(pid):
+    path = cgroup_path(pid)
+    nonce = next(
+        (
+            value.split(b"=", 1)[1].decode("ascii")
+            for value in environment(pid)
+            if value.startswith(b"T_HUB_LAUNCH_NONCE=")
+        ),
+        None,
+    )
+    unit = pathlib.PurePosixPath(path).name
+    expected = (
+        f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/"
+        f"app.slice/{unit}"
+    )
+    managed_shape = re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit) is not None
+    if managed_shape or nonce is not None:
+        if not managed_shape or nonce != unit[6:-6] or path != expected:
+            raise RuntimeError("managed runtime ownership evidence is mismatched")
+    if (
+        not managed_shape
+        or nonce != unit[6:-6]
+        or path != expected
+    ):
+        return None
+    directory = os.open(
+        "/sys/fs/cgroup" + path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    inode = os.fstat(directory).st_ino
+    for control in ("cgroup.freeze", "cgroup.events", "cgroup.procs"):
+        if not stat.S_ISREG(os.stat(control, dir_fd=directory, follow_symlinks=False).st_mode):
+            os.close(directory)
+            raise RuntimeError("managed cgroup controls are incomplete")
+    return path, inode, directory
+
+def cgroup_processes(directory):
+    descriptor = os.open("cgroup.procs", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        raw = os.read(descriptor, 65537)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 65536:
+        raise RuntimeError("managed cgroup process set exceeds the safe bound")
+    values = sorted({int(value) for value in raw.split()})
+    if not values or len(values) > MAX_PROCESSES:
+        raise RuntimeError("managed cgroup process set is empty or exceeds the safe bound")
+    return values
+
+stopped = set()
+cgroup_directory = None
+cgroup_identity = None
+try:
+    managed = managed_cgroup(root_pid)
+    if managed is not None:
+        managed_path, managed_inode, cgroup_directory = managed
+        write_freeze(cgroup_directory, b"1")
+        wait_frozen(cgroup_directory, 1)
+        if (
+            cgroup_path(root_pid) != managed_path
+            or os.fstat(cgroup_directory).st_ino != managed_inode
+        ):
+            raise RuntimeError("managed cgroup identity changed during freeze")
+        roots = cgroup_processes(cgroup_directory)
+        identities, edges, task_identities = process_tree(roots)
+        cgroup_identity = (managed_path, managed_inode, roots)
+    else:
+        identities, edges, task_identities = process_tree([root_pid])
+        provisional, namespace_supervisor = containment_pair(identities, edges)
+        if provisional != root_pid:
+            raise RuntimeError("unmanaged process root is not the exact containment boundary")
+        workload_roots = edges.get(namespace_supervisor, [])
+        if len(workload_roots) != 1:
+            raise RuntimeError("containment supervisor has an ambiguous child set")
+        while True:
+            workload, _, workload_tasks = process_tree(workload_roots)
+            for pid in workload:
+                states = {
+                    pathlib.Path(f"/proc/{tid}/stat").read_text().split(") ", 1)[1][0]
+                    for tid in tasks(pid)
+                }
+                if not states.issubset({"T", "t"}):
+                    os.kill(pid, signal.SIGSTOP)
+                    stopped.add(pid)
+            deadline = time.monotonic() + 5
+            while True:
+                all_stopped = True
+                for pid in workload:
+                    states = {
+                        pathlib.Path(f"/proc/{tid}/stat").read_text().split(") ", 1)[1][0]
+                        for tid in tasks(pid)
+                    }
+                    all_stopped = all_stopped and states.issubset({"T", "t"})
+                if all_stopped:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("managed process tree did not freeze")
+                time.sleep(0.005)
+            after, _, after_tasks = process_tree(workload_roots)
+            if workload == after and workload_tasks == after_tasks:
+                break
+        identities, edges, task_identities = process_tree([root_pid])
+
+    supervisor_pid, namespace_supervisor = containment_pair(identities, edges)
+    if (
+        pathlib.Path(f"/proc/{supervisor_pid}").stat().st_uid != os.getuid()
+        or pathlib.Path(f"/proc/{namespace_supervisor}").stat().st_uid != os.getuid()
+    ):
+        raise RuntimeError("containment supervisor ownership is mismatched")
+    if managed is not None:
+        if not executable_matches(root_pid, "/usr/bin/systemd-run") and root_pid != supervisor_pid:
+            raise RuntimeError("managed runtime root has an ambiguous executable identity")
+        if any(cgroup_path(pid) != managed_path for pid in identities):
+            raise RuntimeError("managed runtime crossed its exact cgroup")
+        if cgroup_processes(cgroup_directory) != cgroup_identity[2]:
+            raise RuntimeError("managed cgroup process set changed while frozen")
+
+    workload_roots = edges.get(namespace_supervisor, [])
+    if len(workload_roots) != 1:
+        raise RuntimeError("containment supervisor has an ambiguous child set")
+    workload = descendants(edges, workload_roots[0])
+    permitted = workload | {supervisor_pid, namespace_supervisor, root_pid}
+    if set(identities) != permitted:
+        raise RuntimeError("managed runtime contains an uncontained sibling process")
+    supervisor_descriptors = {}
+    for pid in (supervisor_pid, namespace_supervisor):
+        supervisor_cwd = os.readlink(f"/proc/{pid}/cwd")
+        if supervisor_cwd == target["path"] or supervisor_cwd.startswith(target["path"] + "/"):
+            raise RuntimeError("containment supervisor cwd reaches the target")
+        supervisor_descriptors[pid] = descriptors(pid)
+        if any(
+            value == target["path"] or value.startswith(target["path"] + "/")
+            for value in supervisor_descriptors[pid].values()
+        ):
+            raise RuntimeError("containment supervisor retains a target descriptor")
+
+    expected_evidence = evidence_for(workload_roots[0])
+    expected_mount = namespace(workload_roots[0], "mnt")
+    expected_pid = namespace(workload_roots[0], "pid")
+    expected_cgroup = cgroup_path(workload_roots[0])
+    if (
+        expected_mount != namespace(namespace_supervisor, "mnt")
+        or expected_pid != namespace(namespace_supervisor, "pid")
+        or expected_mount == namespace(supervisor_pid, "mnt")
+        or expected_pid == namespace(supervisor_pid, "pid")
+    ):
+        raise RuntimeError("managed workload lacks private mount or PID namespaces")
+    for pid in workload:
+        if evidence_for(pid) != expected_evidence or cgroup_path(pid) != expected_cgroup:
+            raise RuntimeError("managed workload identity or cgroup changed")
+        for tid in tasks(pid):
+            if (
+                namespace(tid, "mnt") != expected_mount
+                or namespace(tid, "pid") != expected_pid
+                or not target_is_masked(f"/proc/{tid}/root")
+                or not mount_is_masked(tid)
+            ):
+                raise RuntimeError("managed task escaped exact target containment")
+            for alias in (
+                f"/proc/{tid}/root/proc/1/root",
+                f"/proc/{tid}/root/proc/self/root",
+            ):
+                if not target_is_unreachable_or_masked(alias):
+                    raise RuntimeError("managed task can access the target through proc root")
+
+    after_identities, after_edges, after_tasks = process_tree(
+        cgroup_processes(cgroup_directory) if managed is not None else [root_pid]
+    )
+    if (
+        identities != after_identities
+        or edges != after_edges
+        or task_identities != after_tasks
+        or supervisor_descriptors[supervisor_pid] != descriptors(supervisor_pid)
+        or supervisor_descriptors[namespace_supervisor] != descriptors(namespace_supervisor)
+    ):
+        raise RuntimeError("managed process or task set changed during containment inspection")
+finally:
+    signal.alarm(0)
+    unfreeze_error = None
+    if cgroup_directory is not None:
+        try:
+            write_freeze(cgroup_directory, b"0")
+            wait_frozen(cgroup_directory, 0)
+        except Exception as error:
+            unfreeze_error = error
+        os.close(cgroup_directory)
+    for pid in sorted(stopped, reverse=True):
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            if unfreeze_error is None:
+                unfreeze_error = RuntimeError("managed process vanished before unfreeze")
+    if unfreeze_error is not None:
+        raise RuntimeError(f"managed process unfreeze failed: {unfreeze_error}")
+"#;
+
+const CONTAINMENT_UNFREEZE_SCRIPT: &str = r#"
+import os
+import pathlib
+import re
+import sys
+import time
+
+pid = int(sys.argv[1])
+rows = [row for row in pathlib.Path(f"/proc/{pid}/cgroup").read_text().splitlines() if row]
+if len(rows) != 1 or not rows[0].startswith("0::/"):
+    raise RuntimeError("managed cgroup identity is malformed")
+path = rows[0][3:]
+unit = pathlib.PurePosixPath(path).name
+expected = (
+    f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/"
+    f"app.slice/{unit}"
+)
+if not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit) or path != expected:
+    raise SystemExit(0)
+directory = os.open(
+    "/sys/fs/cgroup" + path,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+)
+try:
+    descriptor = os.open("cgroup.freeze", os.O_WRONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        if os.write(descriptor, b"0") != 1:
+            raise RuntimeError("managed cgroup unfreeze write was partial")
+    finally:
+        os.close(descriptor)
+    deadline = time.monotonic() + 5
+    while True:
+        descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+        try:
+            events = os.read(descriptor, 4097).decode("ascii").splitlines()
+        finally:
+            os.close(descriptor)
+        frozen = [row.split()[1] for row in events if row.startswith("frozen ")]
+        if frozen == ["0"]:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("managed cgroup did not unfreeze")
+        time.sleep(0.005)
+finally:
+    os.close(directory)
 "#;
 
 const CONTAINMENT_PREFLIGHT_SCRIPT: &str = r#"
@@ -1480,6 +1755,56 @@ fn require_namespace_containment(
     Ok(())
 }
 
+struct ContainmentFreezeRecoveryGuard {
+    pane_pid: u32,
+    armed: bool,
+}
+
+impl ContainmentFreezeRecoveryGuard {
+    fn new(pane_pid: u32) -> Self {
+        Self {
+            pane_pid,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn recover(&mut self) -> Result<(), String> {
+        let mut command = containment_command();
+        command.args([
+            "/usr/bin/python3",
+            "-c",
+            CONTAINMENT_UNFREEZE_SCRIPT,
+            &self.pane_pid.to_string(),
+        ]);
+        let output = crate::bounded_exec::output_with_timeout_and_limit(
+            command,
+            Duration::from_secs(6),
+            4096,
+        )
+        .map_err(|error| format!("containment unfreeze recovery failed: {error}"))?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(format!(
+                "containment unfreeze recovery failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ContainmentFreezeRecoveryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.recover();
+        }
+    }
+}
+
 fn verify_process_containment(
     panes: &[crate::tmux::PaneInfo],
     target: &CapturedWorktreeIdentity,
@@ -1497,26 +1822,45 @@ fn verify_process_containment(
         command.args([
             "/usr/bin/python3",
             "-c",
-            CONTAINMENT_INSPECTION_SCRIPT,
+            ATOMIC_CONTAINMENT_INSPECTION_SCRIPT,
             &pane.pid.to_string(),
             &target_json,
         ]);
-        let output = crate::bounded_exec::output_with_timeout_and_limit(
+        let mut freeze_guard = ContainmentFreezeRecoveryGuard::new(pane.pid);
+        let mut recovery_error = None;
+        let output = match crate::bounded_exec::output_with_timeout_and_limit(
             command,
             Duration::from_secs(5),
             CONTAINMENT_EVIDENCE_LIMIT,
-        )
-        .map_err(|error| {
-            format!(
-                "Cargo cleanup could not verify session '{}' containment: {error}",
-                pane.session
-            )
-        })?;
-        if !output.status.success() {
+        ) {
+            Ok(output) => {
+                if output.status.success() && output.stderr.is_empty() {
+                    freeze_guard.disarm();
+                } else if let Err(error) = freeze_guard.recover() {
+                    recovery_error = Some(error);
+                }
+                output
+            }
+            Err(error) => {
+                let recovery = freeze_guard.recover();
+                return Err(format!(
+                    "Cargo cleanup could not verify session '{}' containment: {error}{}",
+                    pane.session,
+                    recovery
+                        .err()
+                        .map(|error| format!("; {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+        };
+        if !output.status.success() || !output.stderr.is_empty() {
             return Err(format!(
-                "Cargo cleanup refuses uncontained session '{}': {}",
+                "Cargo cleanup refuses uncontained session '{}': {}{}",
                 pane.session,
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&output.stderr).trim(),
+                recovery_error
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default()
             ));
         }
     }
@@ -2183,7 +2527,14 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         let (contained, env) = admission
-            .contain_process(Some("sleep 30 & wait"), Vec::new())
+            .contain_process(
+                Some(
+                    "python3 -c 'import os,threading,time; \
+                     threading.Thread(target=lambda: (os.fork() or time.sleep(30)), daemon=True).start(); \
+                     time.sleep(30)'",
+                ),
+                Vec::new(),
+            )
             .unwrap();
         crate::tmux::new_session_with_env(
             &session,
@@ -2210,6 +2561,89 @@ mod tests {
         )
         .unwrap();
         crate::tmux::kill_session_tree(&session).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_containment_resolves_inside_exact_cgroup() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("worktree");
+        let unrelated = directory.path().join("unrelated");
+        let request_path = directory.path().join("request.json");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        let stat = std::fs::metadata(&worktree).unwrap();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let record = coordinator
+            .begin_retirement(worktree.to_str().unwrap(), request_path.to_str().unwrap())
+            .unwrap();
+        coordinator
+            .write_provider_request(
+                &record,
+                RetirementCleanupCapture {
+                    worktree: CapturedWorktreeIdentity {
+                        path: worktree.to_str().unwrap().into(),
+                        device: stat.dev(),
+                        inode: stat.ino(),
+                        head: "1234567890123456789012345678901234567890".into(),
+                        branch: "feature".into(),
+                    },
+                    targets: vec![CapturedPathIdentity {
+                        path: worktree.join("target").to_str().unwrap().into(),
+                        device: stat.dev(),
+                        inode: stat.ino() + 1,
+                    }],
+                    dirty: false,
+                    merged: true,
+                    is_linked: true,
+                },
+            )
+            .unwrap();
+        let admission = coordinator
+            .admit_activity(unrelated.to_str().unwrap(), "reconcile_cortana")
+            .unwrap();
+        let (contained, env) = admission
+            .contain_process(
+                Some(
+                    "python3 -c 'import os,threading,time; \
+                     threading.Thread(target=lambda: (os.fork() or time.sleep(30)), daemon=True).start(); \
+                     time.sleep(30)'",
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+        let session = format!(
+            "th_test_managed_containment_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let launch = crate::tmux::prepare_managed_runtime_launch().unwrap();
+        let owner = crate::tmux::new_prepared_managed_session_with_env(
+            &session,
+            unrelated.to_str().unwrap(),
+            contained.as_deref(),
+            &env,
+            &launch,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pane = loop {
+            if let Some(pane) = crate::tmux::pane_info()
+                .unwrap()
+                .into_iter()
+                .find(|pane| pane.session == session)
+            {
+                break pane;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let verification = verify_process_containment(
+            &[pane],
+            admission.blockers.first().expect("one exact blocker"),
+        );
+        crate::tmux::retire_managed_runtime(&session, &owner).unwrap();
+        verification.unwrap();
     }
 
     #[test]
