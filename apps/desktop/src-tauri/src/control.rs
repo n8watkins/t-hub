@@ -11945,6 +11945,8 @@ fn reconcile_cortana_inner(
     ));
     let pane = crate::commands::pane_command(None, Some(&effect_startup_command));
     let tmux_cwd = files::posix_form(&home);
+    let worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "reconcile_cortana")?;
+    let (pane, elevation) = worktree_admission.contain_process(pane.as_deref(), elevation)?;
     let launch = tmux::prepare_managed_runtime_launch().map_err(|error| {
         format!("reconcile_cortana: managed launch preparation failed: {error}")
     })?;

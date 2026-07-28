@@ -242,6 +242,31 @@ pub(super) fn create_worktree_authorized(
         // None keeps the prior bare-shell behavior. No `shell` preset for a
         // worktree spawn - the crew boots into the worktree dir running this.
         let pane = crate::commands::pane_command(None, startup_command.as_deref());
+        let (pane, elevation) = match worktree_admission.contain_process(pane.as_deref(), elevation)
+        {
+            Ok(contained) => contained,
+            Err(error) => {
+                let identity_rollback = minted_identity
+                    .as_ref()
+                    .map(|identity| ctx.identity.retire(&identity.id))
+                    .transpose();
+                let primary = format!(
+                    "create_worktree: terminal containment failed: {error}{}",
+                    identity_rollback
+                        .err()
+                        .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                        .unwrap_or_default()
+                );
+                let rollback = rollback_created_worktree_state(
+                    ctx,
+                    &repo_root,
+                    &worktree_path,
+                    &tab_id,
+                    tab_was_created,
+                );
+                return Err(create_worktree_rollback_error(primary, rollback));
+            }
+        };
         match spawn_tmux_terminal(&worktree_path, pane.as_deref(), &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
