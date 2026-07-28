@@ -7,7 +7,6 @@
 //! records participate in admission decisions.
 
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -247,15 +246,6 @@ struct RetirementCleanupRequest {
     inventory_complete: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CleanupCommitToken {
-    operation_id: String,
-    worktree_path: String,
-    request_digest: String,
-    prepare_token: String,
-    consumed: bool,
-}
-
 impl From<&WorktreeRetirement> for RetirementReservation {
     fn from(record: &WorktreeRetirement) -> Self {
         Self {
@@ -321,8 +311,6 @@ pub struct WorktreeCoordinator {
     inner: Mutex<WorktreeRetirementSnapshot>,
     admissions: Mutex<BTreeMap<String, usize>>,
     workers: Mutex<BTreeSet<String>>,
-    lease_boundary: Mutex<()>,
-    commit_tokens: Mutex<BTreeMap<String, CleanupCommitToken>>,
 }
 
 pub struct WorktreeAdmissionGuard {
@@ -379,8 +367,6 @@ impl WorktreeCoordinator {
             inner: Mutex::new(snapshot),
             admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
-            lease_boundary: Mutex::new(()),
-            commit_tokens: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -394,8 +380,6 @@ impl WorktreeCoordinator {
             inner: Mutex::new(WorktreeRetirementSnapshot::default()),
             admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
-            lease_boundary: Mutex::new(()),
-            commit_tokens: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -446,10 +430,6 @@ impl WorktreeCoordinator {
             ));
         }
 
-        let _lease_boundary = self
-            .lease_boundary
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let admissions = self
             .admissions
             .lock()
@@ -668,29 +648,14 @@ impl WorktreeCoordinator {
 
     pub fn recover_pending(self: &Arc<Self>) {
         for record in self.pending_retirements() {
-            match record.state {
-                RetirementState::Reserved => {
-                    if let Err(error) = self.start_provider_worker(record.clone()) {
-                        eprintln!(
-                            "t-hub-cargo-cleanup: could not recover operation '{}': {error}",
-                            record.operation_id
-                        );
-                    }
-                }
-                RetirementState::Running => {
-                    if let Err(error) = self.transition(
-                        &record.operation_id,
-                        RetirementState::RecoveryRequired,
-                        Some("Cargo cleanup was interrupted during its provider commit".into()),
-                    ) {
-                        eprintln!(
-                            "t-hub-cargo-cleanup: could not preserve interrupted operation '{}': {error}",
-                            record.operation_id
-                        );
-                    }
-                }
-                RetirementState::RecoveryRequired => {}
-                RetirementState::Succeeded | RetirementState::Failed => unreachable!(),
+            if record.state == RetirementState::RecoveryRequired {
+                continue;
+            }
+            if let Err(error) = self.start_provider_worker(record.clone()) {
+                eprintln!(
+                    "t-hub-cargo-cleanup: could not recover operation '{}': {error}",
+                    record.operation_id
+                );
             }
         }
     }
@@ -710,7 +675,7 @@ impl WorktreeCoordinator {
                     "could not persist the running provider state: {error}"
                 ));
             }
-            match self.run_provider(&record, &request) {
+            match run_provider(&record.request_path, &record.worktree_path) {
                 Ok(output) => classify_provider_output(&output, &request.targets),
                 Err(error) => ProviderCompletion::RecoveryRequired(error),
             }
@@ -768,10 +733,6 @@ impl WorktreeCoordinator {
             .map_err(|error| {
                 format!("{operation}: could not resolve worktree activity: {error}")
             })?;
-        let _lease_boundary = self
-            .lease_boundary
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut admissions = self
             .admissions
             .lock()
@@ -788,133 +749,6 @@ impl WorktreeCoordinator {
             coordinator: Arc::clone(self),
             path: candidate_path,
         })
-    }
-
-    fn run_provider(
-        &self,
-        record: &WorktreeRetirement,
-        request: &RetirementCleanupRequest,
-    ) -> Result<std::process::Output, String> {
-        let request_digest = provider_request_digest(request)?;
-        let prepared = run_provider_prepare(&record.request_path)?;
-        validate_prepared_report(&prepared, request, &request_digest)?;
-        let prepare_token = prepared
-            .get("prepareToken")
-            .and_then(serde_json::Value::as_str)
-            .filter(|token| {
-                (16..=256).contains(&token.len())
-                    && token
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            })
-            .ok_or("rust-storage prepare report omitted its exact prepare token")?;
-        let _lease_boundary = self
-            .lease_boundary
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let leased = crate::tmux::pane_info()
-            .map_err(|error| format!("Cargo cleanup lease inspection failed: {error}"))?
-            .into_iter()
-            .any(|pane| path_within(&pane.cwd, &record.worktree_path));
-        if leased {
-            return Err(
-                "Cargo cleanup commit refused because a live worktree session exists".into(),
-            );
-        }
-        if self
-            .admissions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .any(|candidate| path_within(candidate, &record.worktree_path))
-        {
-            return Err(
-                "Cargo cleanup commit refused because worktree activity is admitted".into(),
-            );
-        }
-
-        let commit_token = self.issue_commit_token(record, &request_digest, prepare_token)?;
-        self.consume_commit_token(&commit_token, record, &request_digest, prepare_token)?;
-        let result = run_provider_commit(
-            &record.request_path,
-            &record.worktree_path,
-            prepare_token,
-            &commit_token,
-            &request_digest,
-        );
-        self.revoke_commit_token(&commit_token);
-        let output = result?;
-        validate_commit_report_binding(
-            &output,
-            &record.operation_id,
-            prepare_token,
-            &commit_token,
-            &request_digest,
-        )?;
-        Ok(output)
-    }
-
-    fn issue_commit_token(
-        &self,
-        record: &WorktreeRetirement,
-        request_digest: &str,
-        prepare_token: &str,
-    ) -> Result<String, String> {
-        let mut tokens = self
-            .commit_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if tokens
-            .values()
-            .any(|token| token.operation_id == record.operation_id)
-        {
-            return Err("Cargo cleanup commit token is duplicated".into());
-        }
-        let token_id = uuid::Uuid::new_v4().simple().to_string();
-        tokens.insert(
-            token_id.clone(),
-            CleanupCommitToken {
-                operation_id: record.operation_id.clone(),
-                worktree_path: record.worktree_path.clone(),
-                request_digest: request_digest.to_string(),
-                prepare_token: prepare_token.to_string(),
-                consumed: false,
-            },
-        );
-        Ok(token_id)
-    }
-
-    fn consume_commit_token(
-        &self,
-        token_id: &str,
-        record: &WorktreeRetirement,
-        request_digest: &str,
-        prepare_token: &str,
-    ) -> Result<(), String> {
-        let mut tokens = self
-            .commit_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let token = tokens
-            .get_mut(token_id)
-            .ok_or("Cargo cleanup commit token is missing or revoked")?;
-        if token.consumed
-            || token.operation_id != record.operation_id
-            || token.worktree_path != record.worktree_path
-            || token.request_digest != request_digest
-            || token.prepare_token != prepare_token
-        {
-            return Err("Cargo cleanup commit token is stale, mismatched, or consumed".into());
-        }
-        token.consumed = true;
-        Ok(())
-    }
-
-    fn revoke_commit_token(&self, token_id: &str) {
-        self.commit_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(token_id);
     }
 }
 
@@ -1173,94 +1007,15 @@ fn provider_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn provider_command(request_path: &str) -> Result<Command, String> {
+fn run_provider(request_path: &str, worktree_path: &str) -> Result<std::process::Output, String> {
     let configured = configured_provider_command()?;
     let mut command = Command::new(&configured[0]);
     command.args(&configured[1..]);
     let request_path = provider_request_path(request_path)?;
-    command.args(["retirement-clean", "--request", &request_path]);
-    Ok(command)
-}
-
-fn run_provider_prepare(request_path: &str) -> Result<serde_json::Value, String> {
-    let mut command = provider_command(request_path)?;
-    command.args(["--prepare", "--json"]);
-    let output = crate::bounded_exec::output_with_timeout_and_limit(
-        command,
-        provider_timeout(),
-        PROVIDER_OUTPUT_LIMIT,
-    )
-    .map_err(|error| format!("rust-storage retirement-clean prepare failed: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rust-storage retirement-clean prepare refused: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("rust-storage prepare returned invalid JSON: {error}"))
-}
-
-fn validate_prepared_report(
-    report: &serde_json::Value,
-    request: &RetirementCleanupRequest,
-    request_digest: &str,
-) -> Result<(), String> {
-    let prepared = report.get("prepared").and_then(serde_json::Value::as_bool) == Some(true);
-    let operation_matches = report
-        .get("operationId")
-        .and_then(serde_json::Value::as_str)
-        == Some(request.operation_id.as_str());
-    let worktree_matches = report
-        .get("worktree")
-        .and_then(|worktree| {
-            serde_json::from_value::<CapturedWorktreeIdentity>(worktree.clone()).ok()
-        })
-        .as_ref()
-        == Some(&request.worktree);
-    let targets = report.get("targets").and_then(|targets| {
-        serde_json::from_value::<Vec<CapturedPathIdentity>>(targets.clone()).ok()
-    });
-    let digest_matches = report
-        .get("requestDigest")
-        .and_then(serde_json::Value::as_str)
-        == Some(request_digest);
-    if !prepared
-        || !operation_matches
-        || !worktree_matches
-        || targets.as_ref() != Some(&request.targets)
-        || !digest_matches
-    {
-        return Err(
-            "rust-storage prepare report does not match the exact cleanup request and inventory"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-fn provider_request_digest(request: &RetirementCleanupRequest) -> Result<String, String> {
-    serde_json::to_vec(request)
-        .map(|bytes| format!("sha256:{:x}", sha2::Sha256::digest(bytes)))
-        .map_err(|error| format!("Cargo cleanup request digest failed: {error}"))
-}
-
-fn run_provider_commit(
-    request_path: &str,
-    worktree_path: &str,
-    prepare_token: &str,
-    commit_token: &str,
-    request_digest: &str,
-) -> Result<std::process::Output, String> {
-    let mut command = provider_command(request_path)?;
     command.args([
-        "--commit",
-        "--prepare-token",
-        prepare_token,
-        "--commit-token",
-        commit_token,
-        "--request-digest",
-        request_digest,
+        "retirement-clean",
+        "--request",
+        &request_path,
         "--apply",
         "--confirm",
         "--json",
@@ -1339,39 +1094,6 @@ fn run_provider_with_lease_inspector(
         stdout,
         stderr,
     })
-}
-
-fn validate_commit_report_binding(
-    output: &std::process::Output,
-    operation_id: &str,
-    prepare_token: &str,
-    commit_token: &str,
-    request_digest: &str,
-) -> Result<(), String> {
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("rust-storage commit returned invalid JSON: {error}"))?;
-    if report
-        .get("operationId")
-        .and_then(serde_json::Value::as_str)
-        != Some(operation_id)
-        || report
-            .get("prepareToken")
-            .and_then(serde_json::Value::as_str)
-            != Some(prepare_token)
-        || report
-            .get("commitToken")
-            .and_then(serde_json::Value::as_str)
-            != Some(commit_token)
-        || report
-            .get("requestDigest")
-            .and_then(serde_json::Value::as_str)
-            != Some(request_digest)
-    {
-        return Err(
-            "rust-storage commit report is missing its exact operation and commit binding".into(),
-        );
-    }
-    Ok(())
 }
 
 fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, String> {
@@ -1887,34 +1609,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restart_preserves_interrupted_commit_for_explicit_recovery() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = directory.path().join("retirements.json");
-        let operation_id = {
-            let coordinator = WorktreeCoordinator::load(store.clone()).unwrap();
-            let record = coordinator
-                .begin_retirement("/repo/worktree", "/requests/one.json")
-                .unwrap();
-            coordinator
-                .transition(&record.operation_id, RetirementState::Running, None)
-                .unwrap();
-            record.operation_id
-        };
-
-        let restarted = Arc::new(WorktreeCoordinator::load(store).unwrap());
-        restarted.recover_pending();
-
-        let recovered = restarted
-            .recovery_record(&operation_id, "/repo/worktree")
-            .unwrap();
-        assert_eq!(recovered.state, RetirementState::RecoveryRequired);
-        assert!(recovered
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("interrupted")));
-    }
-
     #[cfg(unix)]
     #[test]
     fn late_lease_stops_provider_before_its_filesystem_mutation() {
@@ -1947,145 +1641,6 @@ mod tests {
             .unwrap_err()
             .contains("live worktree session appeared"));
         assert!(!mutation.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lease_before_commit_prevents_provider_spawn_and_mutation() {
-        let directory = tempfile::tempdir().unwrap();
-        let mutation = directory.path().join("provider-mutated");
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", &format!("touch '{}'", mutation.display())]);
-
-        let result =
-            run_provider_with_lease_inspector(command, Duration::from_secs(5), || Ok(true));
-
-        assert!(result
-            .unwrap_err()
-            .contains("live worktree session is present"));
-        assert!(!mutation.exists());
-    }
-
-    #[test]
-    fn commit_tokens_fail_closed_on_duplicate_mismatch_reuse_and_revocation() {
-        let coordinator = WorktreeCoordinator::ephemeral();
-        let record = coordinator
-            .begin_retirement("/repo/worktree", "/requests/one.json")
-            .unwrap();
-        let token = coordinator
-            .issue_commit_token(&record, "sha256:request", "prepare-1")
-            .unwrap();
-        assert!(coordinator
-            .issue_commit_token(&record, "sha256:request", "prepare-1")
-            .is_err());
-        assert!(coordinator
-            .consume_commit_token(&token, &record, "sha256:changed", "prepare-1")
-            .is_err());
-        coordinator
-            .consume_commit_token(&token, &record, "sha256:request", "prepare-1")
-            .unwrap();
-        assert!(coordinator
-            .consume_commit_token(&token, &record, "sha256:request", "prepare-1")
-            .is_err());
-        coordinator.revoke_commit_token(&token);
-        assert!(coordinator
-            .consume_commit_token(&token, &record, "sha256:request", "prepare-1")
-            .is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn committed_cleanup_boundary_rejects_late_symlink_activity() {
-        let directory = tempfile::tempdir().unwrap();
-        let worktree = directory.path().join("worktree");
-        let alias = directory.path().join("worktree-alias");
-        std::fs::create_dir(&worktree).unwrap();
-        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
-        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
-        coordinator
-            .begin_retirement(worktree.to_str().unwrap(), "/requests/one.json")
-            .unwrap();
-
-        let held = coordinator
-            .lease_boundary
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let attempt_coordinator = Arc::clone(&coordinator);
-        let candidate = alias.join("apps/cli");
-        let attempt = std::thread::spawn(move || {
-            attempt_coordinator.admit_activity(candidate.to_str().unwrap(), "terminal_cwd")
-        });
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(!attempt.is_finished());
-        drop(held);
-
-        assert!(attempt.join().unwrap().is_err());
-    }
-
-    #[test]
-    fn prepared_report_requires_exact_operation_target_and_inventory() {
-        let request = RetirementCleanupRequest {
-            schema_version: SCHEMA_VERSION,
-            operation_id: "operation-1".into(),
-            project: "t-hub".into(),
-            worktree: CapturedWorktreeIdentity {
-                path: "/repo/worktree".into(),
-                device: 7,
-                inode: 11,
-                head: "1234567890123456789012345678901234567890".into(),
-                branch: "feature".into(),
-            },
-            targets: vec![CapturedPathIdentity {
-                path: "/repo/worktree/apps/cli/target".into(),
-                device: 7,
-                inode: 12,
-            }],
-            allow_unmerged: false,
-            inventory_complete: true,
-        };
-        let report = serde_json::json!({
-            "prepared": true,
-            "prepareToken": "prepare-1",
-            "operationId": request.operation_id.clone(),
-            "worktree": request.worktree.clone(),
-            "targets": request.targets.clone(),
-            "requestDigest": "sha256:request",
-        });
-        validate_prepared_report(&report, &request, "sha256:request").unwrap();
-
-        let mut mismatched = report;
-        mismatched["operationId"] = serde_json::json!("operation-2");
-        assert!(validate_prepared_report(&mismatched, &request, "sha256:request").is_err());
-    }
-
-    #[test]
-    fn commit_report_requires_exact_operation_token_and_request_binding() {
-        let output = provider_output(
-            true,
-            0,
-            serde_json::json!({
-                "operationId": "operation-1",
-                "prepareToken": "prepare-token-1",
-                "commitToken": "commit-token-1",
-                "requestDigest": "sha256:request",
-            }),
-        );
-        validate_commit_report_binding(
-            &output,
-            "operation-1",
-            "prepare-token-1",
-            "commit-token-1",
-            "sha256:request",
-        )
-        .unwrap();
-        assert!(validate_commit_report_binding(
-            &output,
-            "operation-1",
-            "prepare-token-1",
-            "commit-token-2",
-            "sha256:request",
-        )
-        .is_err());
     }
 
     #[test]
