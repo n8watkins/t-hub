@@ -1736,11 +1736,12 @@ impl WorktreeCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
             .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
+        let request_path = provider_request_path(&record.request_path)?;
         verify_process_containment(
             &panes,
             &request.worktree,
             &record.operation_id,
-            &record.request_path,
+            &request_path,
         )?;
         if self
             .boundary_snapshot()
@@ -1755,7 +1756,7 @@ impl WorktreeCoordinator {
             );
         }
         drop(_boundary);
-        run_provider(&record.request_path)
+        run_provider(&request_path)
     }
 }
 
@@ -2126,11 +2127,10 @@ fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
     let configured = configured_provider_command()?;
     let mut command = Command::new(&configured[0]);
     command.args(&configured[1..]);
-    let request_path = provider_request_path(request_path)?;
     command.args([
         "retirement-clean",
         "--request",
-        &request_path,
+        request_path,
         "--apply",
         "--confirm",
         "--json",
@@ -2145,11 +2145,72 @@ fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
 
 #[cfg(not(windows))]
 fn provider_request_path(request_path: &str) -> Result<String, String> {
-    Ok(request_path.to_string())
+    let canonical = std::fs::canonicalize(request_path)
+        .map_err(|error| format!("could not canonicalize provider request path: {error}"))?;
+    let path = canonical
+        .to_str()
+        .ok_or_else(|| "provider request path is not valid UTF-8".to_string())?;
+    validate_posix_provider_request_path(path)?;
+    Ok(path.to_string())
 }
 
 #[cfg(windows)]
 fn provider_request_path(request_path: &str) -> Result<String, String> {
+    use std::os::windows::fs::MetadataExt;
+
+    if request_path.trim() != request_path
+        || request_path.contains('\0')
+        || (request_path.contains('/') && request_path.contains('\\'))
+        || !Path::new(request_path).is_absolute()
+        || Path::new(request_path).components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err("provider request path has ambiguous native spelling".into());
+    }
+    let canonical_native = std::fs::canonicalize(request_path)
+        .map_err(|error| format!("could not canonicalize provider request path: {error}"))?;
+    let canonical_native = canonical_native
+        .to_str()
+        .ok_or_else(|| "provider request path is not valid UTF-8".to_string())?;
+    let path = run_wslpath(&["-a", "-u", request_path])?;
+    validate_posix_provider_request_path(&path)?;
+    let canonical_wsl = run_wsl_readlink(&path)?;
+    if canonical_wsl != path {
+        return Err("provider request path changes identity inside WSL".into());
+    }
+    let round_trip = run_wslpath(&["-a", "-w", &path])?;
+    let round_trip = std::fs::canonicalize(&round_trip)
+        .map_err(|error| format!("could not validate provider request round trip: {error}"))?;
+    let original = std::fs::metadata(canonical_native)
+        .map_err(|error| format!("could not inspect provider request identity: {error}"))?;
+    let translated = std::fs::metadata(&round_trip)
+        .map_err(|error| format!("could not inspect translated request identity: {error}"))?;
+    if original.volume_serial_number() != translated.volume_serial_number()
+        || original.file_index() != translated.file_index()
+    {
+        return Err("provider request path round trip changed file identity".into());
+    }
+    Ok(path)
+}
+
+fn validate_posix_provider_request_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('\0')
+        || path.contains('\n')
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return Err("provider request path is not an exact absolute POSIX path".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_wslpath(arguments: &[&str]) -> Result<String, String> {
     let mut command = Command::new("wsl.exe");
     command.args([
         "-d",
@@ -2158,9 +2219,8 @@ fn provider_request_path(request_path: &str) -> Result<String, String> {
         "~",
         "-e",
         "wslpath",
-        "-a",
-        request_path,
     ]);
+    command.args(arguments);
     let output = crate::bounded_exec::output_with_timeout_and_limit(
         command,
         crate::bounded_exec::WSL_PROBE_TIMEOUT,
@@ -2174,9 +2234,40 @@ fn provider_request_path(request_path: &str) -> Result<String, String> {
         ));
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !path.starts_with('/') {
-        return Err("wslpath returned a non-absolute provider request path".into());
+    if path.is_empty() || path.contains('\0') || path.contains('\n') {
+        return Err("wslpath returned an invalid provider request path".into());
     }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn run_wsl_readlink(path: &str) -> Result<String, String> {
+    let mut command = Command::new("wsl.exe");
+    command.args([
+        "-d",
+        &crate::files::host_distro(),
+        "--cd",
+        "~",
+        "-e",
+        "readlink",
+        "-f",
+        "--",
+        path,
+    ]);
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        4096,
+    )
+    .map_err(|error| format!("could not canonicalize provider request path in WSL: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "could not canonicalize provider request path in WSL: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    validate_posix_provider_request_path(&path)?;
     Ok(path)
 }
 
