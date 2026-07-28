@@ -172,7 +172,7 @@ export const Commands05 = {
  * emission lights up with the transport.
  */
 export const Events05 = {
-  /** A durable journal entry arrived (streamed or replayed). → JournalEvent */
+  /** A newly committed live journal entry arrived. → JournalEvent */
   journal: "agent://journal",
   /** A supervision tree snapshot changed for a session. → SupervisionTree */
   supervision: "supervision://tree",

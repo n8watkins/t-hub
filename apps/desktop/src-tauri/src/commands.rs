@@ -322,17 +322,13 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
     // Claude" bug). `-i` forces ~/.zshrc to load, so the command resolves exactly
     // as when typed by hand. Verified in a clean env (no inherited PATH).
     //
-    // NO DOUBLE QUOTES in the generated wrapping syntax. On Windows every tmux
-    // call is spawned via `wsl.exe -e tmux <argv>` (tmux.rs `tmux()`), and Rust's
-    // Windows `Command` arg-serializer backslash-escapes any embedded `"` into
-    // `\"`; wsl.exe's command-line parsing then mangles those `\"` sequences and
-    // DROPS this trailing command entirely, so tmux launches a bare login shell and
-    // the `startupCommand` (e.g. `claude --resume <uuid>`) never runs -- the
-    // "spawn booted to bare zsh" bug (captain log 0024/0025). Every other tmux
-    // script in this codebase that survives the wsl.exe round-trip uses SINGLE quotes only (see tmux.rs
-    // `list_sessions`/`kill_session_tree` notes); we match that here. `$SHELL` is a
-    // bare path with no spaces, so leaving `${SHELL:-/bin/sh}` unquoted is safe, and
-    // the interactive-login `-i` argument stays single-quoted via `sh_single_quote`.
+    // Keep the generated wrapping syntax free of double quotes. This preserves the
+    // built-in Windows startup fix and minimizes the command-line surface before
+    // tmux.rs base64-encodes the complete pane command for the `wsl.exe` boundary.
+    // User-supplied double quotes remain valid because that transport preserves the
+    // complete command verbatim. `$SHELL` is a bare path with no spaces, so leaving
+    // `${SHELL:-/bin/sh}` unquoted is safe, while `sh_single_quote` protects the
+    // interactive-login command argument.
     Some(format!(
         "exec ${{SHELL:-/bin/sh}} -ilc {}",
         sh_single_quote(&format!("{startup}; exec ${{SHELL:-/bin/sh}} -l"))
@@ -1446,14 +1442,9 @@ mod tests {
         assert!(cmd.contains("exec ${SHELL:-/bin/sh} -l"), "got: {cmd}");
     }
 
-    /// REGRESSION (startupCommand no-op bug): the wrapped pane command must contain
-    /// ZERO double-quote characters. On Windows tmux is spawned via `wsl.exe -e tmux
-    /// <argv>`; Rust's Windows `Command` arg-serializer escapes any embedded `"` into
-    /// `\"`, which wsl.exe's command-line parsing mangles -- dropping the trailing
-    /// command so the pane boots to a bare login shell and `claude --resume` never
-    /// runs. Every tmux script here that survives the wsl.exe round-trip uses single
-    /// quotes only; pin that invariant so a future edit can't silently reintroduce a
-    /// `"` and re-break one-click resume / Create Orchestrator.
+    /// REGRESSION (startupCommand no-op bug): built-in pane-command wrappers must
+    /// remain double-quote-free. The Windows tmux layer additionally base64-encodes
+    /// the complete command so custom commands can preserve their own quotes.
     #[test]
     fn pane_command_has_no_double_quotes() {
         // Realistic startup commands (the "+" presets + `claude --resume <uuid>`);

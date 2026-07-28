@@ -13,7 +13,9 @@ Legacy Powder registry fields remain readable as inert compatibility data.
   On startup, workspace placements are reconciled against live T-Hub tmux sessions so stale tiles do not return after an app, WSL, or computer restart.
   The Workspaces header offers a trash action only when empty workspaces can be closed safely; it never kills or detaches a session and always preserves at least one work workspace.
   History remains visible below the independently scrolling workspace list so active and resumable conversations stay available.
-- **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
+- **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal, with one PTY client per visible tile.
+  Closing a tile **detaches** (the process survives); stop **kills** the session.
+  `#[cfg(windows)]` executes tmux directly through `wsl.exe --cd ~ -e tmux`; `#[cfg(unix)]` invokes tmux directly.
 - **Agent supervision:** a `t-hub-agent` sidecar plus provider lifecycle hooks feed the journal and supervision tree, while the Claude statusline supplies context and cost readouts.
   Claude and Codex hook installation is consent-gated in **Settings → Hooks**.
   Claude entries self-heal on startup; the Codex panel preserves unrelated configuration, warns about other hook sources that can duplicate events, and directs trust or enablement changes through Codex's own `/hooks` review.
@@ -42,16 +44,16 @@ apps/
     src/                       React frontend (xterm tiles, auto-grid canvas, Zustand stores)
       ipc/types.ts             The IPC contract (commands + events) — single source of truth
       ipc/client.ts            Typed wrappers over Tauri invoke/listen
-      components/              45 components (Terminal, Sidebar, UsageStrip, ThemeEditor,
+      components/              React components (Terminal, Sidebar, UsageStrip, ThemeEditor,
                                CommandPalette, WorktreePrompt, WorktreesList, RecoveryReview, …)
       store/                  Zustand stores (workspace, settings, activity, supervision,
                                keybindings, rules, fileOpen, sessionContext, …)
       lib/                    Side-effect mounts + helpers (commands · chord · keymapExecutor ·
                                prefixKeyHandler · notify · rulesMount · worktreeTarget · recentRepos · …)
-    src-tauri/                 Rust/Tauri backend (~58 commands across these modules)
+    src-tauri/                 Rust/Tauri backend
       src/commands.rs          0.1 terminal-nucleus commands (mirrors ipc/types.ts)
       src/commands_05.rs       Agent-bridge / supervision / status / hooks commands
-      src/tmux.rs              `tmux -L t-hub` wrappers (isolated socket; `wsl.exe -e bash`)
+      src/tmux.rs              `tmux -L t-hub` wrappers (isolated socket; direct `wsl.exe -e tmux`)
       src/pty.rs               portable-pty ↔ tmux-attach bridge
       src/git.rs               git info/commit + worktree list/add/remove commands
       src/agent/               core↔agent transport + journal spine

@@ -803,6 +803,9 @@ fn session_env_with_agent_journal(
 
 #[cfg(any(windows, test))]
 fn windows_safe_pane_command(command: &str) -> String {
+    // Rust and wsl.exe apply different Windows command-line quoting rules.
+    // Carry only a quote-free base64 token across that boundary, then reconstruct
+    // the exact pane command in a temporary WSL file before executing it.
     let encoded = STANDARD.encode(command);
     format!(
         "p=$(mktemp) || exit; trap 'rm -f $p' EXIT HUP INT TERM; printf %s {encoded} | base64 -d >$p || exit; ${{SHELL:-/bin/sh}} $p"

@@ -9,16 +9,17 @@ Provider hook -> WSL journal -> t-hub-agent -> core (Tauri) -> UI
 
 ## The live event spine (what was wired)
 
-The frontend already subscribed to five Tauri event channels (`Events05` in
-`src/ipc/types.ts`); the backend now actually **emits** on them:
+The frontend subscribes to the bridge event channels below.
+The five shared channels are named by `Events05` in `src/ipc/types.ts`, while the workspace store owns the title subscription:
 
-| Channel               | Emitted when                                   | Payload (TS)         |
-| --------------------- | ---------------------------------------------- | -------------------- |
-| `agent://journal`     | core consumes a new live journal entry         | `JournalEvent`       |
-| `supervision://tree`  | a session's subagent tree changes              | `SupervisionTree`    |
-| `session://status`    | a session's FR-012 status changes              | `SessionStatusEvent` |
-| `agent://state`       | connection state / journal cursor changes      | `AgentStateInfo`     |
-| `status://snapshot`   | a statusline snapshot is ingested              | `StatusSnapshot`     |
+| Channel | Emitted when | Payload (TS) |
+| --- | --- | --- |
+| `agent://journal` | core consumes a new live journal entry | `JournalEvent` |
+| `agent://title` | a session's derived title changes | `{ sessionId, cwd?, title }` |
+| `supervision://tree` | a session's subagent tree changes | `SupervisionTree` |
+| `session://status` | a session's FR-012 status changes | `SessionStatusEvent` |
+| `agent://state` | connection state or journal cursor changes | `AgentStateInfo` |
+| `status://snapshot` | a statusline snapshot is ingested | `StatusSnapshot` |
 
 The emit sink is `src-tauri/src/agent/emit.rs` (`EventEmitter` trait plus the control-socket implementation).
 It is installed on `AgentBridge` during application setup.
