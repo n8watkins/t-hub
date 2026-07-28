@@ -29,6 +29,7 @@ export const createTabsSlice = (
   | "renameTab"
   | "closeTab"
   | "closeWorkspace"
+  | "closeEmptyWorkspaces"
   | "setActiveTab"
   | "setActiveTabByIndex"
   | "cycleTab"
@@ -41,7 +42,7 @@ export const createTabsSlice = (
   | "setDropTab"
   | "setDropTile"
 > => {
-  const { persist, activeTab, cleanupTileSideState, captainRegistryIds } = deps;
+  const { persist, activeTab, cleanupTileSideState, agentPresentationIds } = deps;
 
   return {
     addTab: () => {
@@ -119,7 +120,7 @@ export const createTabsSlice = (
       // instead, and kill only the genuine work sessions. (The precise UX - silent
       // re-place vs. a confirm prompt - is flagged for the general's ratification;
       // the protective default ships now.)
-      const registeredCaptains = new Set(captainRegistryIds());
+      const registeredCaptains = new Set(agentPresentationIds());
       const captainsHere = target.order.filter((tid) => registeredCaptains.has(tid));
       for (const tid of captainsHere) get().moveTileToCaptainsTab(tid);
       const ids = target.order.filter((tid) => !registeredCaptains.has(tid));
@@ -169,6 +170,33 @@ export const createTabsSlice = (
       // RecentList's open-cwd filter reactively un-hides the closed projects — the
       // immediate visible recall, independent of the cache re-fetch above).
       get().closeTab(id);
+    },
+
+    closeEmptyWorkspaces: () => {
+      const { tabs, activeTabId } = get();
+      const workTabs = tabs.filter((tab) => workspaceKind(tab) === "work");
+      if (workTabs.length <= 1) return [];
+
+      const emptyTabs = workTabs.filter((tab) => tab.order.length === 0);
+      if (emptyTabs.length === 0) return [];
+
+      // If every workspace is empty, keep the active work workspace. If the
+      // active tab is somehow the reserved Captain Workspace, keep the first
+      // work workspace instead. Otherwise every empty workspace is removable
+      // because a non-empty work workspace remains.
+      const keepId =
+        emptyTabs.length === workTabs.length
+          ? workTabs.find((tab) => tab.id === activeTabId)?.id ?? workTabs[0].id
+          : null;
+      const closeIds = emptyTabs
+        .map((tab) => tab.id)
+        .filter((id) => id !== keepId);
+
+      // Reuse closeTab's active-neighbor selection, color cleanup, persistence,
+      // and last-workspace guard. These tabs have no tile IDs, so this path can
+      // never detach or kill a process.
+      for (const id of closeIds) get().closeTab(id);
+      return closeIds;
     },
 
     closeTab: (id) => {

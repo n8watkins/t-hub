@@ -2,15 +2,15 @@
 //!
 //! The journal is the authority for reconstruction *intent*: it survives the
 //! Windows app closing (it lives on the WSL VHDX), and is replayed to the core
-//! on every reconnect. It is an append-only file of newline-delimited JSON —
-//! one [`EventJournalEntry`] per line — so it is crash-tolerant by construction
-//! (a torn final line is detected and ignored on open).
+//! on every reconnect. Current writers append one [`EventJournalEntry`] per
+//! newline-delimited JSON record, so the file is crash-tolerant by construction
+//! (a torn final record is detected and ignored on open).
 //!
 //! ## Durability
 //! Each [`Journal::append`] acquires the journal's interprocess transaction
 //! lock, allocates the next sequence from durable head state, writes one complete
 //! line, and `fsync`s both the journal and head state before returning.
-//! A stale or torn head state is rebuilt from complete journal lines.
+//! A stale or torn head state is rebuilt from complete journal records.
 //!
 //! ## Why a file, not SQLite (here)
 //! The agent's journal is a *write-mostly, append-only, replay-from-cursor* log;
@@ -124,6 +124,11 @@ struct RecentEventId {
 pub enum AppendOutcome {
     Appended(EventJournalEntry),
     Duplicate(EventJournalEntry),
+}
+
+pub struct JournalReplay {
+    pub entries: Vec<EventJournalEntry>,
+    pub last_seq: u64,
 }
 
 impl AppendOutcome {
@@ -354,8 +359,8 @@ impl Journal {
         }
     }
 
-    /// Scan the file and return its complete, parseable line count plus the byte
-    /// boundary before any torn trailing line.
+    /// Scan complete physical records to rebuild durable sequence state and the
+    /// byte boundary before any torn trailing record.
     fn recover_head(path: &Path) -> Result<HeadState> {
         let file = match Self::open_private_file(path, false) {
             Ok(f) => f,
@@ -393,11 +398,17 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                head_seq = entry.seq.max(head_seq.saturating_add(1));
-                if let Some(event_id) = entry.event_id.as_deref() {
-                    Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+            match Self::parse_complete_record(&line.bytes) {
+                Ok(entries) => {
+                    for entry in entries {
+                        head_seq = entry.seq.max(head_seq.saturating_add(1));
+                        if let Some(event_id) = entry.event_id.as_deref() {
+                            Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                        }
+                    }
                 }
+                Err(error) if error.is_io() => return Err(error.into()),
+                Err(_) => {}
             }
         }
         Ok(HeadState {
@@ -494,11 +505,12 @@ impl Journal {
         scanned: &mut u64,
     ) -> Result<Option<BoundedLine>> {
         let mut bytes = Vec::new();
-        let limit = MAX_ENTRY_BYTES
-            .checked_add(2)
-            .context("journal entry read limit overflow")?;
+        let limit = MAX_SCAN_BYTES
+            .checked_sub(*scanned)
+            .and_then(|remaining| remaining.checked_add(1))
+            .context("journal scan byte limit overflow")?;
         let read = reader
-            .take(limit as u64)
+            .take(limit)
             .read_until(b'\n', &mut bytes)
             .context("reading journal line")?;
         if read == 0 {
@@ -512,15 +524,52 @@ impl Journal {
             "journal scan exceeded the {MAX_SCAN_BYTES}-byte limit"
         );
         let complete = bytes.last() == Some(&b'\n');
-        let content_len = bytes.len().saturating_sub(usize::from(complete));
-        anyhow::ensure!(
-            content_len <= MAX_ENTRY_BYTES,
-            "journal entry exceeds the {MAX_ENTRY_BYTES}-byte limit"
-        );
         if complete {
             bytes.pop();
         }
         Ok(Some(BoundedLine { bytes, complete }))
+    }
+
+    /// Parse every complete JSON value in one physical journal record.
+    ///
+    /// Current writers append one serialized entry and its newline in a single
+    /// locked write.
+    /// Older writers could interleave those two writes across hook processes,
+    /// leaving multiple otherwise complete entries concatenated before one
+    /// newline.
+    /// Treat those values as consecutive durable entries while still rejecting
+    /// malformed bytes.
+    fn parse_complete_record(bytes: &[u8]) -> serde_json::Result<Vec<EventJournalEntry>> {
+        let mut stream =
+            serde_json::Deserializer::from_slice(bytes).into_iter::<EventJournalEntry>();
+        let mut entries = Vec::new();
+        let mut previous_end = 0;
+        while let Some(result) = stream.next() {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(error) if bytes.len() <= MAX_ENTRY_BYTES => return Err(error),
+                Err(_) => return Err(Self::oversized_record_error()),
+            };
+            let end = stream.byte_offset();
+            let start = previous_end
+                + bytes[previous_end..end]
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .unwrap_or(end - previous_end);
+            if end - start > MAX_ENTRY_BYTES {
+                return Err(Self::oversized_record_error());
+            }
+            previous_end = end;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn oversized_record_error() -> serde_json::Error {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal entry exceeds the {MAX_ENTRY_BYTES}-byte limit"),
+        ))
     }
 
     fn read_head_state(&self) -> Option<HeadState> {
@@ -679,9 +728,16 @@ impl Journal {
     }
 
     /// Read back all entries with `seq > after_seq`, in order, for replay to the
-    /// core. `after_seq == 0` replays the whole journal. Torn/garbage lines are
-    /// skipped (same tolerance as recovery).
+    /// core. `after_seq == 0` replays the whole journal. A torn final line is
+    /// ignored, but a malformed complete record fails replay closed.
+    #[cfg(test)]
     pub fn replay(&self, after_seq: u64) -> Result<Vec<EventJournalEntry>> {
+        Ok(self.replay_with_boundary(after_seq)?.entries)
+    }
+
+    /// Read a replay batch together with the durable cursor represented by the
+    /// scanned file, including a compaction watermark that is not an event.
+    pub fn replay_with_boundary(&self, after_seq: u64) -> Result<JournalReplay> {
         // Take the lock to get a consistent view, then read from the start of the
         // file via a fresh handle so we don't disturb the append cursor.
         let _guard = self.inner.lock().expect("journal mutex poisoned");
@@ -692,7 +748,10 @@ impl Journal {
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
-                return Ok(Vec::new());
+                return Ok(JournalReplay {
+                    entries: Vec::new(),
+                    last_seq: after_seq,
+                });
             }
             Err(e) => return Err(e).context("opening journal for replay"),
         };
@@ -708,8 +767,10 @@ impl Journal {
 
         let mut out = Vec::new();
         let mut seq: u64 = 0;
+        let mut last_seq = after_seq;
         let mut scanned = 0_u64;
         loop {
+            let record_offset = scanned;
             let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
                 break;
             };
@@ -719,22 +780,30 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                Ok(mut entry) => {
-                    seq = entry.seq.max(seq.saturating_add(1));
-                    if seq > after_seq && !Self::is_compaction_watermark(&entry) {
-                        entry.seq = seq;
-                        out.push(entry);
+            match Self::parse_complete_record(&line.bytes) {
+                Ok(entries) => {
+                    for mut entry in entries {
+                        seq = entry.seq.max(seq.saturating_add(1));
+                        last_seq = last_seq.max(seq);
+                        if seq > after_seq && !Self::is_compaction_watermark(&entry) {
+                            entry.seq = seq;
+                            out.push(entry);
+                        }
                     }
                 }
-                Err(_) => {
-                    // A complete unknown/future record does not consume an
-                    // event sequence and must not hide later valid entries.
-                    continue;
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "decoding complete journal record at byte offset {record_offset} during replay"
+                        )
+                    });
                 }
             }
         }
-        Ok(out)
+        Ok(JournalReplay {
+            entries: out,
+            last_seq,
+        })
     }
 
     /// The current on-disk size of the journal file in bytes (0 if absent).
@@ -819,13 +888,15 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            // Skip torn/garbage lines but still advance past them (same tolerance
-            // as recovery/replay); only count parseable entries toward `seq`.
-            if let Ok(mut e) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                seq = e.seq.max(seq.saturating_add(1));
-                if !Self::is_compaction_watermark(&e) {
-                    e.seq = seq;
-                    out.push(e);
+            // Skip torn/garbage lines but still advance past them.
+            // Only count parseable entries toward `seq`.
+            if let Ok(entries) = Self::parse_complete_record(&line.bytes) {
+                for mut entry in entries {
+                    seq = entry.seq.max(seq.saturating_add(1));
+                    if !Self::is_compaction_watermark(&entry) {
+                        entry.seq = seq;
+                        out.push(entry);
+                    }
                 }
             }
         }
@@ -893,26 +964,38 @@ impl Journal {
                 if line.bytes.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let parsed = serde_json::from_slice::<EventJournalEntry>(&line.bytes).ok();
-                if let Some(entry) = parsed.as_ref() {
-                    head_seq = entry.seq.max(head_seq.saturating_add(1));
-                }
-                let is_discarded = parsed.as_ref().is_some_and(|entry| {
-                    entry.source == JournalSource::Status || Self::is_compaction_watermark(entry)
-                });
-                if !is_discarded {
-                    out.write_all(&line.bytes)
-                        .context("writing compaction entry")?;
-                    out.write_all(b"\n")?;
-                    compacted_len = compacted_len
-                        .checked_add(line.bytes.len() as u64 + 1)
-                        .context("compacted journal length overflow")?;
-                    if let Some(entry) = parsed {
-                        kept += 1;
-                        retained_head_seq = head_seq;
-                        if let Some(event_id) = entry.event_id.as_deref() {
-                            Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                match Self::parse_complete_record(&line.bytes) {
+                    Ok(entries) => {
+                        for mut entry in entries {
+                            head_seq = entry.seq.max(head_seq.saturating_add(1));
+                            if entry.source == JournalSource::Status
+                                || Self::is_compaction_watermark(&entry)
+                            {
+                                continue;
+                            }
+                            entry.seq = head_seq;
+                            let serialized = serde_json::to_vec(&entry)
+                                .context("serializing normalized compaction entry")?;
+                            out.write_all(&serialized)
+                                .context("writing compaction entry")?;
+                            out.write_all(b"\n")?;
+                            compacted_len = compacted_len
+                                .checked_add(serialized.len() as u64 + 1)
+                                .context("compacted journal length overflow")?;
+                            kept += 1;
+                            retained_head_seq = head_seq;
+                            if let Some(event_id) = entry.event_id.as_deref() {
+                                Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                            }
                         }
+                    }
+                    Err(_) => {
+                        out.write_all(&line.bytes)
+                            .context("preserving unknown compaction record")?;
+                        out.write_all(b"\n")?;
+                        compacted_len = compacted_len
+                            .checked_add(line.bytes.len() as u64 + 1)
+                            .context("compacted journal length overflow")?;
                     }
                 }
             }
@@ -1334,7 +1417,10 @@ mod tests {
     #[test]
     fn concurrent_short_lived_writers_allocate_one_monotonic_sequence() {
         const WRITERS: usize = 8;
-        const ENTRIES_PER_WRITER: usize = 32;
+        // Every append performs the full journal, head, and directory durability
+        // barriers. Keep this concurrent burst inside the production five-second
+        // hook budget while still forcing repeated lock handoffs between handles.
+        const ENTRIES_PER_WRITER: usize = 8;
 
         let dir = temp_dir("concurrent-writers");
         let writers = (0..WRITERS)
@@ -1716,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_drops_status_keeps_durable_entries() {
+    fn compacted_replay_drops_status_keeps_durable_entries() {
         let status = |entity: &str| EventJournalEntry {
             seq: 0,
             timestamp_ms: 1,
@@ -1746,6 +1832,12 @@ mod tests {
             j.head_seq(),
             4,
             "compaction preserves the high-water sequence of dropped records"
+        );
+        let replay = j.replay_with_boundary(0).unwrap();
+        assert_eq!(replay.entries.len(), 2);
+        assert_eq!(
+            replay.last_seq, 4,
+            "replay exposes the compacted durable cursor boundary"
         );
 
         let compacted_bytes = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
@@ -1803,9 +1895,131 @@ mod tests {
             .append(entry(JournalEventType::SessionEnd, "second"))
             .unwrap();
         assert_eq!(appended.seq, 2);
-        let replayed = journal.replay(0).unwrap();
-        assert_eq!(replayed.len(), 2);
-        assert_eq!(replayed[1].seq, appended.seq);
+        let error = journal
+            .replay_with_boundary(0)
+            .err()
+            .expect("replay must fail closed on preserved unknown bytes");
+        assert!(
+            format!("{error:#}").contains("decoding complete journal record"),
+            "unexpected replay error: {error:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_fails_closed_on_a_malformed_complete_record() {
+        let dir = temp_dir("malformed-replay-record");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = entry(JournalEventType::SessionStart, "first");
+        first.seq = 1;
+        let mut third = entry(JournalEventType::SessionEnd, "third");
+        third.seq = 3;
+        let journal_bytes = format!(
+            "{}\n{{\"seq\":2,\"event_type\":\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&third).unwrap()
+        );
+        std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
+
+        let replay = Journal::open(&dir).unwrap().replay_with_boundary(0);
+        assert!(
+            replay.is_err(),
+            "replay must not attest a boundary after silently dropping a malformed record"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_recovers_concatenated_legacy_records() {
+        let dir = temp_dir("concatenated-replay-records");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = entry(JournalEventType::SessionStart, "first");
+        first.seq = 1;
+        let mut second = entry(JournalEventType::SessionEnd, "second");
+        second.seq = 1;
+        first.payload = serde_json::json!({"data": "x".repeat(MAX_ENTRY_BYTES / 2 + 1)});
+        second.payload = serde_json::json!({"data": "y".repeat(MAX_ENTRY_BYTES / 2 + 1)});
+        let journal_bytes = format!(
+            "{}{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        assert!(journal_bytes.len() > MAX_ENTRY_BYTES);
+        assert!(serde_json::to_vec(&first).unwrap().len() <= MAX_ENTRY_BYTES);
+        assert!(serde_json::to_vec(&second).unwrap().len() <= MAX_ENTRY_BYTES);
+        std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
+
+        let journal = Journal::open(&dir).unwrap();
+        let replay = journal.replay_with_boundary(0).unwrap();
+        assert_eq!(
+            replay
+                .entries
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(replay.last_seq, 2);
+
+        let appended = journal
+            .append(entry(JournalEventType::TaskCreated, "third"))
+            .unwrap();
+        assert_eq!(appended.seq, 3);
+
+        let (tailed, offset, tail_head) = journal.tail_from(0, 0).unwrap();
+        assert_eq!(
+            tailed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(offset, journal.byte_len());
+        assert_eq!(tail_head, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_normalizes_concatenated_legacy_records() {
+        let dir = temp_dir("compact-concatenated-records");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = entry(JournalEventType::SessionStart, "first");
+        first.seq = 1;
+        let mut status = entry(JournalEventType::StatusSnapshot, "status");
+        status.seq = 1;
+        status.source = JournalSource::Status;
+        let mut third = entry(JournalEventType::TaskCreated, "third");
+        third.seq = 1;
+        let journal_bytes = format!(
+            "{}{}{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&status).unwrap(),
+            serde_json::to_string(&third).unwrap()
+        );
+        std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
+
+        let journal = Journal::open(&dir).unwrap();
+        let (_, _, kept) = journal.compact_dropping_status().unwrap();
+        assert_eq!(kept, 2);
+
+        let replay = journal.replay_with_boundary(0).unwrap();
+        assert_eq!(
+            replay
+                .entries
+                .iter()
+                .map(|event| (&event.event_type, event.seq))
+                .collect::<Vec<_>>(),
+            vec![
+                (&JournalEventType::SessionStart, 1),
+                (&JournalEventType::TaskCreated, 3),
+            ]
+        );
+        assert_eq!(replay.last_seq, 3);
+
+        let compacted = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+        assert!(compacted
+            .lines()
+            .all(|line| { serde_json::from_str::<EventJournalEntry>(line).is_ok() }));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

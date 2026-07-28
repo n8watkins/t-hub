@@ -1,0 +1,23 @@
+{
+  "session_id": "019c881d-6f54-7ec1-9516-0ca28d18f145",
+  "turn_id": "019c881d-760b-7f63-97cb-3ed509b6f145",
+  "transcript_path": "/tmp/credential-bearing-rollout.jsonl",
+  "cwd": "/tmp/private-worktree",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5",
+  "permission_mode": "plan",
+  "tool_name": "request_user_input",
+  "tool_use_id": "question-request-0145",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "credential-bearing-question"
+      }
+    ]
+  },
+  "tool_response": {
+    "answers": {
+      "credential-bearing-header": "credential-bearing-answer"
+    }
+  }
+}

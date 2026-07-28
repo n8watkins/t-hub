@@ -100,6 +100,33 @@ beforeEach(() => {
 });
 
 describe("HistoryList", () => {
+  it("retries a retryable cold-scan timeout without becoming permanently unavailable", async () => {
+    const recovered = entry("history-recovered", "codex", "resumable", "Recovered Codex");
+    mocks.historyList
+      .mockRejectedValueOnce(
+        Object.assign(new Error("control_timeout: cold History scan"), {
+          retryable: true,
+        }),
+      )
+      .mockResolvedValueOnce(result([recovered]));
+
+    render(<HistoryList />);
+
+    expect(await screen.findByText("Recovered Codex")).toBeTruthy();
+    expect(mocks.historyList).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("History is unavailable.")).toBeNull();
+  });
+
+  it("keeps an authoritative History failure visible with a manual retry action", async () => {
+    mocks.historyList.mockRejectedValue(new Error("history_invalid_filter: invalid"));
+
+    render(<HistoryList />);
+
+    expect(await screen.findByText("History is unavailable.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(mocks.historyList).toHaveBeenCalledOnce();
+  });
+
   it("renders distinct same-cwd Claude and Codex rows with correct lifecycle actions", async () => {
     const closed = entry("history-codex", "codex", "resumable", "Closed Codex");
     const active = entry("history-claude", "claude", "active", "Active Claude");

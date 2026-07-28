@@ -27,6 +27,26 @@ describe("Cortana startup recovery", () => {
     expect(isAmbiguousCortanaFailure({ retryable: true, message: "bridge reset" })).toBe(true);
   });
 
+  it("keeps durable operation ownership through inconclusive retirement evidence", () => {
+    const ids = ["durable-retirement", "next-health-check"];
+    const operation = createCortanaRecoveryOperation(() => ids.shift() ?? "conflicting-operation");
+
+    operation.failure({
+      retryable: true,
+      message: "prepared managed unit was unverifiable",
+    });
+    expect(operation.currentId()).toBe("durable-retirement");
+
+    operation.failure({
+      retryable: true,
+      message: "exact tmux generation liveness is indeterminate",
+    });
+    expect(operation.currentId()).toBe("durable-retirement");
+
+    operation.authoritativeResult();
+    expect(operation.currentId()).toBe("next-health-check");
+  });
+
   it("rotates the operation identity after authoritative recovery failures", () => {
     expect(isAmbiguousCortanaFailure("Cortana recovery evidence is ambiguous")).toBe(false);
     expect(isAmbiguousCortanaFailure(new Error("unsupported durable harness"))).toBe(false);

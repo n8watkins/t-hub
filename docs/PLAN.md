@@ -41,7 +41,8 @@ A senior engineer can run a full workday with 6–12 visible Claude sessions and
 ## Workstreams
 
 ### A. WSL control agent + event spine
-- Build the bundled Linux binary `t-hub-agent` and the long-lived `wsl.exe -d <distro> -- t-hub-agent --stdio` bridge over newline-delimited JSON (NDJSON), versioned protocol messages.
+- Build the bundled Linux binary `t-hub-agent` and a long-lived bridge over newline-delimited JSON (NDJSON), versioned protocol messages.
+  The current packaged deployment and launch contract is owned by [SESSION_AWARENESS.md](./SESSION_AWARENESS.md).
 - Implement the **hook → WSL journal → agent → core → UI** path end-to-end. Hooks append to a durable WSL-side append-only journal (`EventJournalEntry`) and notify the agent; the agent forwards to the Windows core; the core fans out to UI events. Journal survives Windows app closure and is replayed on reconnect.
 - Agent responsibilities for 0.5: tmux/session registry & commands, WSL metrics (RAM/swap/CPU/load/distro state/process counts), `git`/worktree queries, hook/status ingestion.
 - **Watch-item from REVIEW:** the single stdio NDJSON pipe can head-of-line block (a bulk read stalls a metrics ping). Design request prioritization or a separate channel for bulk reads vs. control/metrics **now**, even if minimally.

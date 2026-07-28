@@ -1485,7 +1485,7 @@ pub(super) fn spawn_managed_tmux_terminal_with_id(
     command: Option<&str>,
     env: &[(String, String)],
     launch: &tmux::ManagedRuntimeLaunchSpec,
-) -> Result<(String, String, tmux::ManagedRuntimeOwnerToken), String> {
+) -> Result<(String, String, tmux::ManagedRuntimeOwnerToken), tmux::TmuxError> {
     let tmux_session = format!("th_{id}");
     let mut session_env = env.to_vec();
     if !session_env
@@ -1500,17 +1500,24 @@ pub(super) fn spawn_managed_tmux_terminal_with_id(
         command,
         &session_env,
         launch,
-    )
-    .map_err(|error| format!("failed to create cgroup-owned tmux session: {error}"))?;
+    )?;
     if !tmux::has_session(&tmux_session) {
         tmux::retire_managed_runtime(&tmux_session, &owner).map_err(|cleanup| {
-            format!(
-                "managed tmux session '{tmux_session}' was unobservable and exact owner cleanup failed: {cleanup}"
-            )
+            let mut error = cleanup;
+            error.message = format!(
+                "managed tmux session '{tmux_session}' was unobservable and exact owner cleanup failed: {}",
+                error.message
+            );
+            error
         })?;
-        return Err(format!(
-            "managed tmux session '{tmux_session}' did not materialize after ownership verification"
-        ));
+        return Err(tmux::TmuxError {
+            op: "new-managed-session",
+            code: None,
+            io_kind: None,
+            message: format!(
+                "managed tmux session '{tmux_session}' did not materialize after ownership verification"
+            ),
+        });
     }
     Ok((id.to_string(), tmux_session, owner))
 }

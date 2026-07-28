@@ -890,7 +890,7 @@ fn read_sessions_windows_fast(
             continue;
         }
         // Newest sessions first; keep just this project's newest few.
-        sessions.sort_by(|a, b| b.2.cmp(&a.2));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.2));
         sessions.truncate(per_project_limit);
         let newest = sessions.first().map(|s| s.2).unwrap_or(0);
         buckets.push((newest, sessions));
@@ -898,7 +898,7 @@ fn read_sessions_windows_fast(
 
     // Keep the newest `project_limit` projects (by their most-recent session),
     // then flatten back to a session list for the prefix-read phase.
-    buckets.sort_by(|a, b| b.0.cmp(&a.0));
+    buckets.sort_by_key(|bucket| std::cmp::Reverse(bucket.0));
     buckets.truncate(project_limit);
     let kept_projects = buckets.len();
     let metas: Vec<(String, std::path::PathBuf, i64)> = buckets

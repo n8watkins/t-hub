@@ -208,6 +208,68 @@ fn codex_0145_structured_question_is_sanitized_needs_question() {
 }
 
 #[test]
+fn codex_0145_native_question_hooks_persist_sanitized_request_and_resolution() {
+    let journal_dir = temp_dir();
+    let fixtures = [
+        (
+            "PreToolUse",
+            include_bytes!("fixtures/codex-0.145.0-request-user-input-pre.json").as_slice(),
+        ),
+        (
+            "PostToolUse",
+            include_bytes!("fixtures/codex-0.145.0-request-user-input-post.json").as_slice(),
+        ),
+    ];
+
+    for (event, fixture) in fixtures {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_t-hub-agent"))
+            .args(["--codex-hook", event, "--journal-dir"])
+            .arg(&journal_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(fixture).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{event} hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "hook stdout must remain clean");
+    }
+
+    let journal = std::fs::read_to_string(journal_dir.join("events.ndjson")).unwrap();
+    let entries: Vec<EventJournalEntry> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].event_type, JournalEventType::Elicitation);
+    assert_eq!(entries[0].payload["lifecycle"], "question_requested");
+    assert_eq!(
+        entries[0].payload["question_request"]["provider_request_id"],
+        "question-request-0145"
+    );
+    assert_eq!(entries[0].payload["question_request"]["question_count"], 1);
+    assert_eq!(
+        entries[0].payload["question_request"]["auto_resolution_configured"],
+        true
+    );
+    assert_eq!(entries[1].event_type, JournalEventType::CoreAction);
+    assert_eq!(entries[1].payload["lifecycle"], "question_resolved");
+    assert_eq!(
+        entries[1].payload["question_request_id"],
+        "question-request-0145"
+    );
+    assert!(entries.iter().all(|entry| entry.event_id.is_some()));
+    assert!(!journal.contains("credential-bearing"));
+
+    std::fs::remove_dir_all(journal_dir).ok();
+}
+
+#[test]
 fn current_app_server_thread_started_persists_session_start() {
     let journal_dir = temp_dir();
     let mut child = Command::new(env!("CARGO_BIN_EXE_t-hub-agent"))

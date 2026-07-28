@@ -1,8 +1,8 @@
 # T-Hub
 
-T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
+T-Hub is a **terminal-first command center for running and supervising many persistent Codex and Claude coding-agent sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
-## Status - post-Powder agent-session candidate (v0.3.106)
+## Status - post-Powder agent-session candidate
 
 The current product is a local agent-session cockpit for Codex and Claude.
 Durable Captain and agent records, checkpoints, lifecycle events, cursor-based recovery, and the CLI/MCP control channel are the active coordination surface.
@@ -10,8 +10,15 @@ Powder is retired from active product flows.
 Legacy Powder registry fields remain readable as inert compatibility data.
 
 - **Tauri 2 + React 18 + TypeScript + Tailwind** desktop shell with an xterm.js tile grid (Fit + WebGL + Search + Unicode 11), deterministic insertion/focus, and durable layout/workspace persistence.
-- **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
-- **Agent supervision:** a `t-hub-agent` sidecar + Claude Code hooks feed a journal/statusline spine — context + cost readout, autocontinue, supervision tree. Hooks install consent-gated from **Settings → Hooks** and self-heal on startup.
+  On startup, workspace placements are reconciled against live T-Hub tmux sessions so stale tiles do not return after an app, WSL, or computer restart.
+  The Workspaces header offers a trash action only when empty workspaces can be closed safely; it never kills or detaches a session and always preserves at least one work workspace.
+  History remains visible below the independently scrolling workspace list so active and resumable conversations stay available.
+- **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal, with one PTY client per visible tile.
+  Closing a tile **detaches** (the process survives); stop **kills** the session.
+  `#[cfg(windows)]` executes tmux directly through `wsl.exe --cd ~ -e tmux`; `#[cfg(unix)]` invokes tmux directly.
+- **Agent supervision:** a `t-hub-agent` sidecar plus provider lifecycle hooks feed the journal and supervision tree, while the Claude statusline supplies context and cost readouts.
+  Claude and Codex hook installation is consent-gated in **Settings → Hooks**.
+  Claude entries self-heal on startup; the Codex panel preserves unrelated configuration, warns about other hook sources that can duplicate events, and directs trust or enablement changes through Codex's own `/hooks` review.
 - **Git worktree workflow:** `Ctrl+B w` creates a worktree tab from a branch name (with a repo picker when the focused tile isn't in a repo), landing it as a sibling `<repo>-worktrees/<branch>`; `Ctrl+B c` opens a plain tab and `Ctrl+B l` lists/re-opens existing worktrees.
 - **Rebindable hybrid keymap:** direct hotkeys + a tmux-style `Ctrl+B` prefix tier + a `Ctrl+K` fuzzy command palette — all bindings are user-editable from Settings and persist.
 - **Event→action rules engine:** user-configurable rules fire when a supervised session's FR-012 status transitions (optionally from a specific prior status) and run one action — notify, type text, spawn, restart, or run a command in the session.
@@ -22,9 +29,10 @@ Legacy Powder registry fields remain readable as inert compatibility data.
 - **MCP control channel:** the `t-hub-mcp` server forwards `tools/call` to the running app over a local control socket.
 The catalog includes `start_agent`, `list_agents`, `get_agent`, `agent_checkpoint`, and `agent_events` alongside terminal, workspace, and Captain operations.
 Retired Powder tools are not advertised.
-- **~58 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
+- **Tauri commands** across the backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production - see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
 - **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL).
-Run the focused agent-session gates before release, then the complete Rust, CLI, MCP, frontend, formatting, Clippy, and zero-network gates.
+Run `pnpm test` for the fast local profile, `pnpm test:standard` for the approximately one-minute cross-target profile, and `pnpm test:full` for the complete process and browser profile.
+See [docs/TESTING.md](./docs/TESTING.md) for backend, frontend, browser, contract, host-contract, and process-only commands, measured costs, and release guidance.
 
 ## Repository layout
 
@@ -36,16 +44,16 @@ apps/
     src/                       React frontend (xterm tiles, auto-grid canvas, Zustand stores)
       ipc/types.ts             The IPC contract (commands + events) — single source of truth
       ipc/client.ts            Typed wrappers over Tauri invoke/listen
-      components/              45 components (Terminal, Sidebar, UsageStrip, ThemeEditor,
+      components/              React components (Terminal, Sidebar, UsageStrip, ThemeEditor,
                                CommandPalette, WorktreePrompt, WorktreesList, RecoveryReview, …)
       store/                  Zustand stores (workspace, settings, activity, supervision,
                                keybindings, rules, fileOpen, sessionContext, …)
       lib/                    Side-effect mounts + helpers (commands · chord · keymapExecutor ·
                                prefixKeyHandler · notify · rulesMount · worktreeTarget · recentRepos · …)
-    src-tauri/                 Rust/Tauri backend (~58 commands across these modules)
+    src-tauri/                 Rust/Tauri backend
       src/commands.rs          0.1 terminal-nucleus commands (mirrors ipc/types.ts)
       src/commands_05.rs       Agent-bridge / supervision / status / hooks commands
-      src/tmux.rs              `tmux -L t-hub` wrappers (isolated socket; `wsl.exe -e bash`)
+      src/tmux.rs              `tmux -L t-hub` wrappers (isolated socket; direct `wsl.exe -e tmux`)
       src/pty.rs               portable-pty ↔ tmux-attach bridge
       src/git.rs               git info/commit + worktree list/add/remove commands
       src/agent/               core↔agent transport + journal spine
@@ -66,6 +74,7 @@ pnpm-workspace.yaml            Workspace manifest (lists apps/desktop)
 ### Windows 11 (primary target)
 1. Install the Rust **MSVC** toolchain, the [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-studio-build-tools/), and the WebView2 runtime (preinstalled on Win11).
 2. Ensure your WSL distro has `tmux` (the app reaches in via `wsl.exe`).
+   Building an installer also requires a Rust toolchain in WSL so the matching bundled Linux helper can be compiled, or an externally built helper supplied through `T_HUB_AGENT_RESOURCE_SOURCE`.
 3. `pnpm install` then `pnpm tauri dev` (or `pnpm tauri build` for an installer).
 
 ### Inside WSL2 via WSLg (Linux dev build)
@@ -82,7 +91,7 @@ Then `pnpm tauri dev` (a window opens through WSLg).
 ## Roadmap & docs
 
 - **[docs/POST-POWDER-ROADMAP.md](./docs/POST-POWDER-ROADMAP.md)** - the authoritative agent-session roadmap and acceptance gates.
-- **[docs/AGENT-SESSION-SMOKE-0.3.106.md](./docs/AGENT-SESSION-SMOKE-0.3.106.md)** - the bounded release smoke procedure for Windows and WSL.
+- **[docs/AGENT-SESSION-SMOKE-0.3.106.md](./docs/AGENT-SESSION-SMOKE-0.3.106.md)** - the historical bounded smoke procedure for the 0.3.106 Windows and WSL release.
 
 - **[docs/PRODUCTION-READINESS.md](./docs/PRODUCTION-READINESS.md)** - the active stabilization program, CI target, security workstreams, and measurable Alpha/Beta/Stable release gates.
 - **[docs/PLAN.md](./docs/PLAN.md)** — the original phased plan (0.5 → 2.0). Most of the 0.5 supervision track has since shipped; kept as the design-rationale record.

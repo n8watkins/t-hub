@@ -35,6 +35,20 @@ type HeaderMetrics = {
   overlaps: string[][];
 };
 
+type BrowserStoreModules = {
+  workspace: typeof import("../src/store/workspace");
+  captain: typeof import("../src/store/captain");
+  theme: typeof import("../src/store/theme");
+  panels: typeof import("../src/store/panels");
+  settings: typeof import("../src/store/settings");
+  sessionContext: typeof import("../src/store/sessionContext");
+  supervision: typeof import("../src/store/supervision");
+};
+
+type BrowserHost = typeof window & {
+  __BROWSER_STORES__?: BrowserStoreModules;
+};
+
 async function installTauriMock(page: Page): Promise<void> {
   if (mockedPages.has(page)) return;
   mockedPages.add(page);
@@ -73,16 +87,18 @@ async function installTauriMock(page: Page): Promise<void> {
             };
           }
           if (args?.command === "history_list") {
-            return {
-              schemaVersion: 1,
-              generatedAt: new Date(0).toISOString(),
-              revision: "browser-fixture",
-              entries: [],
-              count: 0,
-              total: 0,
-              truncated: false,
-              sources: [],
-            };
+            return (
+              host.__BROWSER_HISTORY__ ?? {
+                schemaVersion: 1,
+                generatedAt: new Date(0).toISOString(),
+                revision: "browser-fixture",
+                entries: [],
+                count: 0,
+                total: 0,
+                truncated: false,
+                sources: [],
+              }
+            );
           }
           if (args?.command === "list_tabs") {
             return { seq: 0, activeTabId: null, tabs: [] };
@@ -192,7 +208,42 @@ async function installTauriMock(page: Page): Promise<void> {
         currentWebview: { windowLabel: "main", label: "main" },
       },
     };
+    void Promise.all([
+      import("/src/store/workspace.ts"),
+      import("/src/store/captain.ts"),
+      import("/src/store/theme.ts"),
+      import("/src/store/panels.ts"),
+      import("/src/store/settings.ts"),
+      import("/src/store/sessionContext.ts"),
+      import("/src/store/supervision.ts"),
+    ]).then(
+      ([
+        workspace,
+        captain,
+        theme,
+        panels,
+        settings,
+        sessionContext,
+        supervision,
+      ]) => {
+        host.__BROWSER_STORES__ = {
+          workspace,
+          captain,
+          theme,
+          panels,
+          settings,
+          sessionContext,
+          supervision,
+        };
+      },
+    );
   });
+}
+
+async function waitForBrowserStores(page: Page): Promise<void> {
+  await page.waitForFunction(
+    () => Boolean((window as BrowserHost).__BROWSER_STORES__),
+  );
 }
 
 async function assertNoBrowserErrors(page: Page): Promise<void> {
@@ -210,26 +261,19 @@ async function seedTiles(page: Page, count: number): Promise<void> {
   await installTauriMock(page);
   await page.goto("/");
   await expect(page.locator("body")).not.toHaveText("");
+  await waitForBrowserStores(page);
 
   await page.evaluate(
-    async ({ tileCount, statuses }) => {
-      const [
-        { useWorkspace },
-        { useCaptain },
-        { useTheme },
-        { usePanels },
-        { useSettings },
-        { useSessionContext },
-        { useSupervision },
-      ] = await Promise.all([
-        import("/src/store/workspace.ts"),
-        import("/src/store/captain.ts"),
-        import("/src/store/theme.ts"),
-        import("/src/store/panels.ts"),
-        import("/src/store/settings.ts"),
-        import("/src/store/sessionContext.ts"),
-        import("/src/store/supervision.ts"),
-      ]);
+    ({ tileCount, statuses }) => {
+      const stores = (window as BrowserHost).__BROWSER_STORES__;
+      if (!stores) throw new Error("Browser stores are not ready");
+      const { useWorkspace } = stores.workspace;
+      const { useCaptain } = stores.captain;
+      const { useTheme } = stores.theme;
+      const { usePanels } = stores.panels;
+      const { useSettings } = stores.settings;
+      const { useSessionContext } = stores.sessionContext;
+      const { useSupervision } = stores.supervision;
       const ids = Array.from(
         { length: tileCount },
         (_, index) => `header${String(index + 1).padStart(3, "0")}`,
@@ -436,6 +480,110 @@ test("measures all visible chrome across 1, 2, 4, 8, and 16 tile grids", async (
   }
 });
 
+test("keeps History visible beside a long, cleanable workspace list", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await page.addInitScript(() => {
+    const actions = {
+      focus: { status: "unavailable", reason: "Conversation is closed." },
+      resume: { status: "supported", reason: null },
+      recover: { status: "unavailable", reason: "Not required." },
+      archive: { status: "supported", reason: null },
+      unarchive: { status: "unavailable", reason: "Conversation is active." },
+    };
+    (
+      window as typeof window & { __BROWSER_HISTORY__?: unknown }
+    ).__BROWSER_HISTORY__ = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      revision: "sidebar-history-fixture",
+      entries: Array.from({ length: 4 }, (_, index) => ({
+        historyId: `history-${index}`,
+        harness: index % 2 === 0 ? "codex" : "claude",
+        provider: index % 2 === 0 ? "codex" : "claude",
+        providerSessionId: `provider-${index}`,
+        conversationId: `conversation-${index}`,
+        cwd: `/home/natkins/projects/history-${index}`,
+        projectId: null,
+        projectName: `History project ${index + 1}`,
+        captainId: null,
+        role: null,
+        workspaceId: null,
+        worktreeId: null,
+        branch: null,
+        label: `History E2E ${index + 1}`,
+        lastText: "A resumable browser fixture",
+        startedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        continuityState: "resumable",
+        actions,
+      })),
+      count: 4,
+      total: 4,
+      truncated: false,
+      sources: [
+        { harness: "claude", status: "ready", reason: null },
+        { harness: "codex", status: "ready", reason: null },
+      ],
+    };
+  });
+  await installTauriMock(page);
+  await page.goto("/");
+  await expect(page.locator("body")).not.toHaveText("");
+  await waitForBrowserStores(page);
+
+  await page.evaluate(() => {
+    const stores = (window as BrowserHost).__BROWSER_STORES__;
+    if (!stores) throw new Error("Browser stores are not ready");
+    const { CAPTAINS_TAB_ID, CAPTAINS_TAB_NAME, useWorkspace } =
+      stores.workspace;
+    const workspaces = Array.from({ length: 14 }, (_, index) => ({
+      id: `sidebar-work-${index}`,
+      name: `Workspace ${index + 1}`,
+      kind: "work" as const,
+      order: [],
+    }));
+    useWorkspace.setState({
+      tabs: [
+        ...workspaces,
+        {
+          id: CAPTAINS_TAB_ID,
+          name: CAPTAINS_TAB_NAME,
+          kind: "captain",
+          order: [],
+        },
+      ],
+      activeTabId: "sidebar-work-0",
+      focusedId: null,
+      terminals: {},
+      poppedOutTabs: [],
+    });
+  });
+
+  await expect(page.getByText("History E2E 1", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Close 13 empty workspaces" }),
+  ).toBeVisible();
+  const firstWorkspace = page.locator('[data-th-ws-row="sidebar-work-0"]');
+  const workspaceScroller = firstWorkspace
+    .locator("xpath=ancestor::section[1]")
+    .locator(".th-scroll");
+  await expect(firstWorkspace).toBeVisible();
+  expect(
+    await workspaceScroller.evaluate(
+      (element) => element.scrollHeight > element.clientHeight,
+    ),
+  ).toBe(true);
+
+  await page
+    .getByRole("button", { name: "Close 13 empty workspaces" })
+    .click();
+  await expect(page.locator("[data-th-ws-row]")).toHaveCount(1);
+  await expect(page.getByText("History E2E 1", { exact: true })).toBeVisible();
+  await screenshot(page, testInfo, "sidebar-history-visible.png");
+});
+
 test("renders deterministic identity, Git, status, and context variants", async ({
   page,
 }) => {
@@ -494,8 +642,10 @@ test("switches densities at adjacent container widths without losing chrome", as
 });
 
 async function selectedPanel(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const { usePanels } = await import("/src/store/panels.ts");
+  return page.evaluate(() => {
+    const stores = (window as BrowserHost).__BROWSER_STORES__;
+    if (!stores) throw new Error("Browser stores are not ready");
+    const { usePanels } = stores.panels;
     return usePanels.getState().tab.header001 ?? "terminal";
   });
 }
@@ -582,8 +732,10 @@ test("enters and activates every panel tab by keyboard at full and icon widths",
   await seedTiles(page, 1);
   await assertKeyboardFlow(page, 680);
   await screenshot(page, testInfo, "keyboard-full.png");
-  await page.evaluate(async () => {
-    const { usePanels } = await import("/src/store/panels.ts");
+  await page.evaluate(() => {
+    const stores = (window as BrowserHost).__BROWSER_STORES__;
+    if (!stores) throw new Error("Browser stores are not ready");
+    const { usePanels } = stores.panels;
     usePanels.getState().setTab("header001", "terminal");
   });
   await assertKeyboardFlow(page, 152);

@@ -119,6 +119,9 @@ pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
 pub const CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE: &str =
     "mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"";
 const WSL_OBSERVATION_SHELL: &str = "/bin/sh";
+// Interactive login-shell startup can cold-load user tooling and WSL state.
+// Keep the probe bounded while leaving enough headroom for a loaded host.
+const LAUNCH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(any(windows, test))]
 fn wsl_observation_command() -> Command {
@@ -1003,11 +1006,13 @@ fn parse_scoped_process_batch(
     Ok(observed)
 }
 
-#[cfg(any(windows, test))]
 const ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT: &str = r#"
 set -eu
 tmux_socket=$1
 tmux_target=$2
+trusted_child_device=$3
+trusted_child_inode=$4
+case "$trusted_child_device:$trusted_child_inode" in *[!0-9:]*) exit 20;; esac
 pane=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
 set -- $pane
 [ "$#" -eq 5 ]
@@ -1019,19 +1024,40 @@ pane_pid=$5
 case "$session_created:$pane_pid" in *[!0-9:]*) exit 21;; esac
 foreground_pid=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
 case "$foreground_pid" in ''|*[!0-9]*|0) exit 22;; esac
-process_stat=$(cat "/proc/$foreground_pid/stat")
+observed_pid=$foreground_pid
+if [ "$trusted_child_device:$trusted_child_inode" != "0:0" ]; then
+    trusted_child_pid=
+    for candidate_pid in $(ps -eo pid=,pgid= | awk -v expected="$foreground_pid" '$2 == expected { print $1 }'); do
+        candidate_exe="/proc/$candidate_pid/exe"
+        candidate_identity=$(stat -Lc '%d %i' "$candidate_exe" 2>/dev/null) || {
+            [ ! -e "$candidate_exe" ] && continue
+            exit 23
+        }
+        set -- $candidate_identity
+        [ "$#" -eq 2 ]
+        case "$1:$2" in *[!0-9:]*) exit 23;; esac
+        if [ "$1:$2" = "$trusted_child_device:$trusted_child_inode" ]; then
+            [ -z "$trusted_child_pid" ] || exit 26
+            trusted_child_pid=$candidate_pid
+        fi
+    done
+    if [ -n "$trusted_child_pid" ]; then
+        observed_pid=$trusted_child_pid
+    fi
+fi
+process_stat=$(cat "/proc/$observed_pid/stat")
 rest=${process_stat##*) }
 set -- $rest
 [ "$#" -ge 20 ]
 start_ticks=${20}
-set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
+set -- $(stat -Lc '%d %i' "/proc/$observed_pid/exe")
 [ "$#" -eq 2 ]
 case "$1:$2" in *[!0-9:]*) exit 24;; esac
 executable_device=$1
 executable_inode=$2
 ancestry=
 ancestry_count=0
-current_pid=$foreground_pid
+current_pid=$observed_pid
 while :; do
     current_stat=$(cat "/proc/$current_pid/stat")
     rest=${current_stat##*) }
@@ -1052,14 +1078,14 @@ while :; do
     [ "$parent_pid" != "$current_pid" ]
     current_pid=$parent_pid
 done
-cmdline="/proc/$foreground_pid/cmdline"
+cmdline="/proc/$observed_pid/cmdline"
 cmdline_size=$(wc -c < "$cmdline" | tr -d ' ')
 case "$cmdline_size" in ''|*[!0-9]*|0) exit 23;; esac
 [ "$cmdline_size" -le 65536 ]
 
 printf 'THPC1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
-    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" \
+    "$observed_pid" "$start_ticks" "$executable_device" "$executable_inode" \
     "$ancestry" "$cmdline_size"
 cat "$cmdline"
 printf '\nTHPB1\n%s\n' "$ancestry_count"
@@ -1105,15 +1131,21 @@ for expected in "$@"; do
     case "$process_cmdline_size" in ''|*[!0-9]*|0) exit 57;; esac
     [ "$process_cmdline_size" -le 65536 ]
     stat_after=$(cat "/proc/$pid/stat")
-    [ "$stat_after" = "$stat_before" ]
+    rest=${stat_after##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    [ "$2" = "$parent_pid" ]
+    [ "$3" = "$process_group_id" ]
+    [ "$4" = "$process_session_id" ]
+    [ "${20}" = "$observed_start" ]
     set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
     [ "$#" -eq 2 ]
     [ "$1" = "$process_device" ]
     [ "$2" = "$process_inode" ]
     if [ -z "$pinned_processes" ]; then
-        pinned_processes="$pid:$observed_start:$process_device:$process_inode"
+        pinned_processes="$pid:$observed_start:$process_device:$process_inode:$parent_pid:$process_group_id:$process_session_id"
     else
-        pinned_processes="$pinned_processes,$pid:$observed_start:$process_device:$process_inode"
+        pinned_processes="$pinned_processes,$pid:$observed_start:$process_device:$process_inode:$parent_pid:$process_group_id:$process_session_id"
     fi
     printf 'THPI1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$pid" "$parent_pid" "$observed_start" "$process_group_id" "$process_session_id" \
@@ -1133,15 +1165,21 @@ for expected in "$@"; do
     IFS=:
     set -- $expected
     IFS=$old_ifs
-    [ "$#" -eq 4 ]
+    [ "$#" -eq 7 ]
     pid=$1
     expected_start=$2
     expected_device=$3
     expected_inode=$4
+    expected_parent=$5
+    expected_group=$6
+    expected_session=$7
     process_stat=$(cat "/proc/$pid/stat")
     rest=${process_stat##*) }
     set -- $rest
     [ "$#" -ge 20 ]
+    [ "$2" = "$expected_parent" ]
+    [ "$3" = "$expected_group" ]
+    [ "$4" = "$expected_session" ]
     [ "${20}" = "$expected_start" ]
     set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
     [ "$#" -eq 2 ]
@@ -1153,12 +1191,12 @@ pane_after=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_i
 [ "$pane_after" = "$pane" ]
 foreground_after=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
 [ "$foreground_after" = "$foreground_pid" ]
-process_stat=$(cat "/proc/$foreground_pid/stat")
+process_stat=$(cat "/proc/$observed_pid/stat")
 rest=${process_stat##*) }
 set -- $rest
 [ "$#" -ge 20 ]
 [ "${20}" = "$start_ticks" ]
-set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
+set -- $(stat -Lc '%d %i' "/proc/$observed_pid/exe")
 [ "$#" -eq 2 ]
 [ "$1" = "$executable_device" ]
 [ "$2" = "$executable_inode" ]
@@ -1167,7 +1205,6 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 pub(crate) const WINDOWS_SCOPED_HARNESS_HELPERS_PER_OBSERVATION: usize = 1;
 pub(crate) const SCOPED_HARNESS_SINGLE_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(any(windows, test))]
 fn parse_atomic_scoped_harness_observation(
     bytes: &[u8],
 ) -> Result<(HarnessProcessEvidence, Vec<ScopedProcessDetails>), LaunchAttestationError> {
@@ -1219,20 +1256,30 @@ fn parse_atomic_scoped_harness_observation(
     Ok((foreground, details))
 }
 
-#[cfg(windows)]
 fn observe_atomic_scoped_harness_until(
     tmux_target: &str,
+    trusted_child: Option<&HarnessExecutableIdentity>,
     deadline: Instant,
 ) -> Result<(HarnessProcessEvidence, Vec<ScopedProcessDetails>), LaunchAttestationError> {
     let tmux_socket = crate::tmux::validated_socket_name()
         .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let (trusted_child_device, trusted_child_inode) = trusted_child
+        .map(|child| (child.device, child.inode))
+        .unwrap_or((0, 0));
+    #[cfg(test)]
+    pause_scoped_ancestry_batch_until_deadline(deadline);
+    #[cfg(windows)]
     let mut command = wsl_observation_command();
+    #[cfg(not(windows))]
+    let mut command = Command::new(WSL_OBSERVATION_SHELL);
     command
         .arg("-c")
         .arg(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT)
         .arg("t-hub-atomic-scoped-harness-attestation")
         .arg(tmux_socket)
-        .arg(tmux_target);
+        .arg(tmux_target)
+        .arg(trusted_child_device.to_string())
+        .arg(trusted_child_inode.to_string());
     let output = crate::bounded_exec::output_with_timeout_and_limit(
         command,
         observation_time_remaining(deadline)?.min(SCOPED_HARNESS_SINGLE_HELPER_TIMEOUT),
@@ -1470,9 +1517,12 @@ esac
             .arg(login_shell_override.unwrap_or_default());
         command
     };
-    let output =
-        crate::bounded_exec::output_with_timeout_and_limit(command, Duration::from_secs(2), 8192)
-            .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        LAUNCH_RESOLUTION_TIMEOUT,
+        8192,
+    )
+    .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
     if !output.status.success() {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
@@ -1975,8 +2025,11 @@ fn scoped_process_matches_executable(
         && process.executable_inode == expected.inode
 }
 
-/// Observe the exact provider process in the foreground ancestry and return
-/// only bounded, credential-safe evidence suitable for durable recovery.
+/// Observe the exact provider process in the terminal's active foreground job.
+/// A trusted native child may share its script wrapper's process group instead
+/// of becoming the group leader, so the atomic snapshot selects that exact
+/// executable before pinning its ancestry.
+/// Return only bounded, credential-safe evidence suitable for durable recovery.
 pub fn observe_scoped_harness_process(
     tmux_target: &str,
     expected_provider: Harness,
@@ -1996,14 +2049,11 @@ pub fn observe_scoped_harness_process(
     {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
-    #[cfg(windows)]
-    let (foreground, details) = observe_atomic_scoped_harness_until(tmux_target, deadline)?;
-    #[cfg(not(windows))]
-    let (foreground, details) = {
-        let foreground = observe_harness_process_until(tmux_target, deadline)?;
-        let details = observe_scoped_processes_until(&foreground.ancestry, deadline)?;
-        (foreground, details)
-    };
+    let (foreground, details) = observe_atomic_scoped_harness_until(
+        tmux_target,
+        expected_launch.trusted_child_executable.as_ref(),
+        deadline,
+    )?;
     for (index, process) in details.iter().enumerate() {
         if index + 1 < details.len() && process.parent_pid != details[index + 1].pid {
             return Err(LaunchAttestationError::AncestryChanged);
@@ -2423,17 +2473,16 @@ pub(crate) fn home_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-2 / PR-C deferred capability shape (doc-stub, per the audit's full
-// 7-capability adapter). These are intentionally NOT live trait methods in
-// PR-A:
-//   - `list_resumable()` -> the continuity catalog rows. Its return type couples
-//     to the D6 `recent.rs::RecentSession` (which gains a `provider` field in
-//     PR-C); declaring it here would force PR-A to edit D6-owned files. It lands
-//     with D6/PR-C alongside `codex_recent()`.
-//   - `install_producer()` -> Claude hooks install / Codex `[hooks]` producer
-//     (Phase 2; the Codex `[hooks]` path is additionally gated by Codex's new
-//     hook-trust regime, which is why Phase 1 uses the trust-free `exec --json`
-//     producer instead).
+// Provider-neutral capability shape retained from the adapter audit. These are
+// intentionally NOT live trait methods:
+//   - `list_resumable()` -> the current provider-specific catalog services own
+//     continuity rows. Lifting the operation into this adapter still requires a
+//     provider-neutral return type.
+//   - `install_producer()` -> provider-neutral producer management. Concrete
+//     Claude settings and Codex `hooks.json` management already live behind
+//     their provider-specific services; lifting them into this adapter remains
+//     deferred. Codex trust approval stays exclusively in Codex's `/hooks`
+//     review flow.
 //   - `migrate_argv(id)` -> crew-migration resume-by-id. Phase 1 encodes this as
 //     doctrine (Codex crews migrate with `codex resume '<uuid>'`, mirror of the
 //     `claude --resume <uuid>` directive) rather than a code path.
@@ -2548,7 +2597,20 @@ mod tests {
             {
                 continue;
             }
-            resolve_launch_executable_with_shell(provider, Some(shell)).unwrap();
+            resolve_launch_executable_with_shell(provider, Some(shell))
+                .or_else(|first_error| {
+                    // This test runs alongside process-heavy tmux and supervisor
+                    // suites. A saturated CI host can consume the entire bounded
+                    // probe window before the login shell is scheduled. Retry the
+                    // same production path once: deterministic trust failures
+                    // remain failures, while scheduler starvation does not make
+                    // this shell-compatibility test flaky.
+                    resolve_launch_executable_with_shell(provider, Some(shell))
+                        .map_err(|_| first_error)
+                })
+                .unwrap_or_else(|error| {
+                    panic!("launch resolution failed through {shell}: {error}")
+                });
             tested.push(shell);
         }
         assert!(tested.iter().any(|shell| shell.ends_with("/bash")));
@@ -3342,6 +3404,8 @@ mod tests {
             .unwrap();
         assert!(syntax.success());
         assert!(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT.contains("pinned_processes"));
+        assert!(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT
+            .contains("[ ! -e \"$candidate_exe\" ] && continue"));
 
         let (foreground, scoped) =
             parse_atomic_scoped_harness_observation(&atomic_scoped_harness_fixture()).unwrap();

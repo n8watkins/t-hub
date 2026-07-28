@@ -18,6 +18,9 @@ use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+#[cfg(any(windows, test))]
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
 use crate::bounded_exec::{output_with_timeout, output_with_timeout_and_limit};
 
 /// The isolated tmux socket name; always passed as `tmux -L <socket>`.
@@ -80,6 +83,7 @@ fn validate_socket_name(value: &str) -> Result<&str, TmuxError> {
         return Err(TmuxError {
             op: "validate-socket",
             code: None,
+            io_kind: None,
             message: "configured tmux socket name is outside the safe socket-name contract".into(),
         });
     }
@@ -288,8 +292,73 @@ pub struct TmuxError {
     pub op: &'static str,
     /// Process exit code, if the process ran and exited with a code.
     pub code: Option<i32>,
+    /// Structured local I/O failure, when the command did not produce an exit
+    /// status. In particular, `TimedOut` means the observation is inconclusive,
+    /// not proof that the inspected runtime changed or disappeared.
+    pub io_kind: Option<std::io::ErrorKind>,
     /// Trimmed stderr from tmux (its diagnostic message), or the io error text.
     pub message: String,
+}
+
+impl TmuxError {
+    /// True when a bounded subprocess observation could not produce
+    /// authoritative evidence.
+    pub fn is_retryable_observation(&self) -> bool {
+        matches!(
+            self.io_kind,
+            Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+        )
+    }
+}
+
+fn managed_helper_failure(
+    op: &'static str,
+    code: Option<i32>,
+    message: impl Into<String>,
+) -> TmuxError {
+    TmuxError {
+        op,
+        code,
+        io_kind: matches!(
+            code,
+            Some(77 | 80 | 83 | 84 | 90 | 92 | 94 | 100 | 101 | 118)
+        )
+        .then_some(std::io::ErrorKind::WouldBlock),
+        message: message.into(),
+    }
+}
+
+fn exact_effect_observation_failure(
+    op: &'static str,
+    code: Option<i32>,
+    message: impl Into<String>,
+) -> TmuxError {
+    TmuxError {
+        op,
+        code,
+        io_kind: matches!(code, Some(41 | 43)).then_some(std::io::ErrorKind::WouldBlock),
+        message: message.into(),
+    }
+}
+
+fn incomplete_managed_retirement(liveness: SessionLiveness) -> TmuxError {
+    let (io_kind, message) = match liveness {
+        SessionLiveness::Unknown => (
+            Some(std::io::ErrorKind::WouldBlock),
+            "managed cgroup emptied but exact tmux generation liveness is indeterminate",
+        ),
+        SessionLiveness::Alive => (
+            None,
+            "managed cgroup emptied but the exact tmux generation did not retire",
+        ),
+        SessionLiveness::Gone => unreachable!("gone managed retirement is complete"),
+    };
+    TmuxError {
+        op: "retire-managed-runtime",
+        code: None,
+        io_kind,
+        message: message.into(),
+    }
 }
 
 /// The identity of exactly one tmux pane at one instant.
@@ -505,6 +574,7 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
     let output = output_with_timeout(tmux(args)?, tmux_cmd_timeout()).map_err(|e| TmuxError {
         op,
         code: None,
+        io_kind: Some(e.kind()),
         message: format!("failed to spawn tmux: {e}"),
     })?;
 
@@ -514,6 +584,7 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
         Err(TmuxError {
             op,
             code: output.status.code(),
+            io_kind: None,
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
     }
@@ -566,18 +637,21 @@ fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
     let line = lines.next().ok_or_else(|| TmuxError {
         op: "list-panes",
         code: None,
+        io_kind: None,
         message: "target pane generation is unavailable".into(),
     })?;
     if lines.next().is_some() {
         return Err(TmuxError {
             op: "list-panes",
             code: None,
+            io_kind: None,
             message: "target resolved to more than one pane".into(),
         });
     }
     parse_pane_generation(line).ok_or_else(|| TmuxError {
         op: "list-panes",
         code: None,
+        io_kind: None,
         message: "target pane generation is malformed".into(),
     })
 }
@@ -612,6 +686,7 @@ pub(crate) fn respawn_pane_exact(
         return Err(TmuxError {
             op: "respawn-pane",
             code: None,
+            io_kind: None,
             message: "target pane generation changed unexpectedly during respawn".into(),
         });
     }
@@ -651,6 +726,7 @@ pub fn set_session_environment(name: &str, key: &str, value: &str) -> Result<(),
         return Err(TmuxError {
             op: "set-environment",
             code: None,
+            io_kind: None,
             message: "environment name must be a valid identifier no longer than 128 bytes".into(),
         });
     }
@@ -658,6 +734,7 @@ pub fn set_session_environment(name: &str, key: &str, value: &str) -> Result<(),
         return Err(TmuxError {
             op: "set-environment",
             code: None,
+            io_kind: None,
             message: "session target or environment value is outside the bounded input contract"
                 .into(),
         });
@@ -672,6 +749,7 @@ pub fn set_session_environment(name: &str, key: &str, value: &str) -> Result<(),
             return Err(TmuxError {
                 op: "set-environment",
                 code: None,
+                io_kind: None,
                 message: "injected session environment update failure".into(),
             });
         }
@@ -723,12 +801,28 @@ fn session_env_with_agent_journal(
     effective
 }
 
+#[cfg(any(windows, test))]
+fn windows_safe_pane_command(command: &str) -> String {
+    // Rust and wsl.exe apply different Windows command-line quoting rules.
+    // Carry only a quote-free base64 token across that boundary, then reconstruct
+    // the exact pane command in a temporary WSL file before executing it.
+    let encoded = STANDARD.encode(command);
+    format!(
+        "p=$(mktemp) || exit; trap 'rm -f $p' EXIT HUP INT TERM; printf %s {encoded} | base64 -d >$p || exit; ${{SHELL:-/bin/sh}} $p"
+    )
+}
+
 pub fn new_session_with_env(
     name: &str,
     cwd: &str,
     command: Option<&str>,
     env: &[(String, String)],
 ) -> Result<(), TmuxError> {
+    #[cfg(windows)]
+    let windows_command = command.map(windows_safe_pane_command);
+    #[cfg(windows)]
+    let command = windows_command.as_deref();
+
     // `-c CWD` only when we actually have a (WSL-side) directory; on Windows the
     // default is empty so the pane starts in wsl.exe's launch dir rather than an
     // invalid Windows path.
@@ -822,7 +916,7 @@ pub fn new_session_with_env(
 /// Create a detached pane whose first user process is already inside a unique
 /// transient user-systemd scope, then publish ownership only after every kernel,
 /// systemd, nonce, process, and tmux identity agrees.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(any(not(test), windows), allow(dead_code))]
 pub(crate) fn new_managed_session_with_env(
     name: &str,
     cwd: &str,
@@ -862,6 +956,7 @@ pub(crate) fn new_prepared_managed_session_with_env(
         return Err(TmuxError {
             op: "new-managed-session",
             code: None,
+            io_kind: None,
             message: "prepared managed runtime identity is malformed".into(),
         });
     }
@@ -872,6 +967,7 @@ pub(crate) fn new_prepared_managed_session_with_env(
         return Err(TmuxError {
             op: "new-managed-session",
             code: None,
+            io_kind: None,
             message: "managed runtime ownership environment is reserved".into(),
         });
     }
@@ -909,6 +1005,7 @@ pub(crate) fn new_prepared_managed_session_with_env(
     let mut error = last_error.unwrap_or(TmuxError {
         op: "new-managed-session",
         code: None,
+        io_kind: None,
         message: "managed runtime ownership was not established before publication".into(),
     });
     if let Err(cleanup) = unit_cleanup {
@@ -1174,6 +1271,7 @@ pub fn maintain_session(name: &str) -> Result<(), TmuxError> {
         return Err(TmuxError {
             op: "maintain-session",
             code: None,
+            io_kind: None,
             message: "session target must be one exact T-Hub tmux session".into(),
         });
     }
@@ -1183,6 +1281,7 @@ pub fn maintain_session(name: &str) -> Result<(), TmuxError> {
             return Err(TmuxError {
                 op: "maintain-session",
                 code: None,
+                io_kind: None,
                 message: "session is definitively gone".into(),
             });
         }
@@ -1190,6 +1289,7 @@ pub fn maintain_session(name: &str) -> Result<(), TmuxError> {
             return Err(TmuxError {
                 op: "maintain-session",
                 code: None,
+                io_kind: None,
                 message: "session liveness is indeterminate; retry without mutating it".into(),
             });
         }
@@ -1215,6 +1315,7 @@ pub fn kill_session(name: &str) -> Result<(), TmuxError> {
         .map_err(|e| TmuxError {
             op: "kill-session",
             code: None,
+            io_kind: Some(e.kind()),
             message: format!("failed to spawn tmux: {e}"),
         })?;
 
@@ -1231,6 +1332,7 @@ pub fn kill_session(name: &str) -> Result<(), TmuxError> {
     Err(TmuxError {
         op: "kill-session",
         code: output.status.code(),
+        io_kind: None,
         message: stderr.trim().to_string(),
     })
 }
@@ -1244,6 +1346,7 @@ fn exact_effect_target(name: &str) -> Result<(), TmuxError> {
         return Err(TmuxError {
             op: "exact-session-effect",
             code: None,
+            io_kind: None,
             message: "target is outside the exact session effect contract".into(),
         });
     }
@@ -1287,6 +1390,11 @@ sys.argv = [sys.argv[0], *sys.argv[2:]]
 def proc_stat(pid):
     try:
         raw = open(f"/proc/{pid}/stat", "r", encoding="ascii").read()
+    except (FileNotFoundError, ProcessLookupError):
+        refuse(74)
+    except (PermissionError, OSError):
+        refuse(41)
+    try:
         fields = raw.rsplit(") ", 1)[1].split()
         if len(fields) < 20:
             refuse(40)
@@ -1294,8 +1402,8 @@ def proc_stat(pid):
             "pid": int(pid), "ppid": int(fields[1]), "pgrp": int(fields[2]),
             "sid": int(fields[3]), "tpgid": int(fields[5]), "start": int(fields[19]),
         }
-    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
-        refuse(41)
+    except (ValueError, IndexError):
+        refuse(40)
 
 def prefixed(value, prefix):
     if not value.startswith(prefix):
@@ -1473,6 +1581,7 @@ fn trusted_python_identity() -> Result<ManagedExecutableIdentity, TmuxError> {
     Err(TmuxError {
         op: "trusted-python",
         code: None,
+        io_kind: None,
         message: "trusted absolute Python interpreter is unavailable".into(),
     })
 }
@@ -1486,6 +1595,7 @@ fn revalidate_python_identity(expected: &ManagedExecutableIdentity) -> Result<()
         Err(TmuxError {
             op: "trusted-python",
             code: None,
+            io_kind: None,
             message: "trusted Python interpreter identity changed".into(),
         })
     }
@@ -1501,6 +1611,7 @@ fn trusted_wsl_path() -> Result<std::path::PathBuf, TmuxError> {
         return Err(TmuxError {
             op: "trusted-wsl",
             code: None,
+            io_kind: None,
             message: "Windows system directory is unavailable".into(),
         });
     }
@@ -1508,17 +1619,20 @@ fn trusted_wsl_path() -> Result<std::path::PathBuf, TmuxError> {
     let canonical_system = std::fs::canonicalize(&system_directory).map_err(|error| TmuxError {
         op: "trusted-wsl",
         code: None,
+        io_kind: None,
         message: format!("Windows system directory could not be validated: {error}"),
     })?;
     let wsl =
         std::fs::canonicalize(system_directory.join("wsl.exe")).map_err(|error| TmuxError {
             op: "trusted-wsl",
             code: None,
+            io_kind: None,
             message: format!("Windows WSL host executable could not be validated: {error}"),
         })?;
     let metadata = std::fs::metadata(&wsl).map_err(|error| TmuxError {
         op: "trusted-wsl",
         code: None,
+        io_kind: None,
         message: format!("Windows WSL host executable metadata is unavailable: {error}"),
     })?;
     let parent_matches = wsl.parent().is_some_and(|parent| {
@@ -1533,6 +1647,7 @@ fn trusted_wsl_path() -> Result<std::path::PathBuf, TmuxError> {
         return Err(TmuxError {
             op: "trusted-wsl",
             code: None,
+            io_kind: None,
             message: "Windows WSL host executable is outside the system directory".into(),
         });
     }
@@ -1561,18 +1676,21 @@ raise SystemExit(1)"#;
             .map_err(|error| TmuxError {
                 op: "trusted-python",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("trusted Python interpreter resolution failed: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(TmuxError {
             op: "trusted-python",
             code: output.status.code(),
+            io_kind: None,
             message: "trusted absolute Python interpreter is unavailable".into(),
         });
     }
     serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
         op: "trusted-python",
         code: None,
+        io_kind: None,
         message: "trusted Python interpreter identity was malformed".into(),
     })
 }
@@ -1586,6 +1704,7 @@ fn revalidate_python_identity(expected: &ManagedExecutableIdentity) -> Result<()
         Err(TmuxError {
             op: "trusted-python",
             code: None,
+            io_kind: None,
             message: "trusted Python interpreter identity changed".into(),
         })
     }
@@ -1806,7 +1925,7 @@ def observe(tools, unit, nonce, pid):
         for control in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
             control_details = os.stat(control, dir_fd=descriptor, follow_symlinks=False)
             if not stat.S_ISREG(control_details.st_mode):
-                refuse(90)
+                refuse(130)
         os.close(descriptor)
     except (FileNotFoundError, PermissionError, OSError):
         refuse(90)
@@ -2066,18 +2185,21 @@ fn resolve_managed_system_tools() -> Result<ManagedSystemTools, TmuxError> {
             .map_err(|error| TmuxError {
                 op: "managed-runtime-tools",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("managed system helper resolution failed: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(TmuxError {
             op: "managed-runtime-tools",
             code: output.status.code(),
+            io_kind: None,
             message: "trusted absolute systemd helpers are unavailable".into(),
         });
     }
     serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
         op: "managed-runtime-tools",
         code: None,
+        io_kind: None,
         message: "managed system helper identity was malformed".into(),
     })
 }
@@ -2087,6 +2209,7 @@ fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<()
     let encoded = serde_json::to_string(tools).map_err(|_| TmuxError {
         op: "managed-runtime-preflight",
         code: None,
+        io_kind: None,
         message: "managed system helper identity could not be encoded".into(),
     })?;
     command.args(["preflight", &encoded]);
@@ -2095,16 +2218,17 @@ fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<()
             .map_err(|error| TmuxError {
                 op: "managed-runtime-preflight",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("managed runtime ownership probe failed: {error}"),
             })?;
     if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
-        Err(TmuxError {
-            op: "managed-runtime-preflight",
-            code: output.status.code(),
-            message: "user systemd with delegated cgroup-v2 freeze and kill is unavailable".into(),
-        })
+        Err(managed_helper_failure(
+            "managed-runtime-preflight",
+            output.status.code(),
+            "user systemd with delegated cgroup-v2 freeze and kill is unavailable",
+        ))
     }
 }
 
@@ -2131,6 +2255,7 @@ fn observe_managed_runtime_owner(
     let encoded_tools = serde_json::to_string(tools).map_err(|_| TmuxError {
         op: "observe-managed-runtime-owner",
         code: None,
+        io_kind: None,
         message: "managed system helper identity could not be encoded".into(),
     })?;
     command.args([
@@ -2145,19 +2270,21 @@ fn observe_managed_runtime_owner(
             .map_err(|error| TmuxError {
                 op: "observe-managed-runtime-owner",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("managed runtime ownership inspection failed: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(TmuxError {
-            op: "observe-managed-runtime-owner",
-            code: output.status.code(),
-            message: "systemd, cgroup, process, nonce, and tmux ownership did not agree".into(),
-        });
+        return Err(managed_helper_failure(
+            "observe-managed-runtime-owner",
+            output.status.code(),
+            "systemd, cgroup, process, nonce, and tmux ownership did not agree",
+        ));
     }
     let observed: ManagedRuntimeObservation =
         serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
             op: "observe-managed-runtime-owner",
             code: None,
+            io_kind: None,
             message: "managed runtime ownership observation was malformed".into(),
         })?;
     Ok(ManagedRuntimeOwnerToken {
@@ -2188,6 +2315,7 @@ pub(crate) fn retire_prepared_managed_runtime(
     let encoded = serde_json::to_string(launch).map_err(|_| TmuxError {
         op: "retire-prepared-managed-runtime",
         code: None,
+        io_kind: None,
         message: "prepared managed runtime identity could not be encoded".into(),
     })?;
     let mut command = managed_cgroup_effect_command(&launch.tools.python)?;
@@ -2197,16 +2325,17 @@ pub(crate) fn retire_prepared_managed_runtime(
             .map_err(|error| TmuxError {
                 op: "retire-prepared-managed-runtime",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("prepared managed runtime cleanup failed: {error}"),
             })?;
     if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
-        Err(TmuxError {
-            op: "retire-prepared-managed-runtime",
-            code: output.status.code(),
-            message: "prepared managed unit was populated, reused, or unverifiable".into(),
-        })
+        Err(managed_helper_failure(
+            "retire-prepared-managed-runtime",
+            output.status.code(),
+            "prepared managed unit was populated, reused, or unverifiable",
+        ))
     }
 }
 
@@ -2220,6 +2349,7 @@ pub(crate) fn revalidate_managed_runtime_owner(
         return Err(TmuxError {
             op: "revalidate-managed-runtime-owner",
             code: None,
+            io_kind: None,
             message: "managed tmux generation changed".into(),
         });
     }
@@ -2235,6 +2365,7 @@ pub(crate) fn revalidate_managed_runtime_owner(
         Err(TmuxError {
             op: "revalidate-managed-runtime-owner",
             code: None,
+            io_kind: None,
             message: "managed systemd or cgroup owner generation changed".into(),
         })
     }
@@ -2255,6 +2386,18 @@ fn same_managed_tmux_generation(
 pub(crate) fn observe_session_effect_identity(
     name: &str,
 ) -> Result<SessionEffectIdentity, TmuxError> {
+    #[cfg(test)]
+    {
+        let mut pending = OBSERVE_SESSION_EFFECT_FAILURE.lock().unwrap();
+        if pending.as_deref() == Some(name) {
+            pending.take();
+            return Err(exact_effect_observation_failure(
+                "observe-session-effect",
+                Some(41),
+                "exact session effect identity is unavailable or ambiguous",
+            ));
+        }
+    }
     exact_effect_target(name)?;
     let socket = validated_socket_name()?;
     let mut command = exact_effect_command()?;
@@ -2264,24 +2407,35 @@ pub(crate) fn observe_session_effect_identity(
             .map_err(|error| TmuxError {
                 op: "observe-session-effect",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("failed to inspect exact session effect identity: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(TmuxError {
-            op: "observe-session-effect",
-            code: output.status.code(),
-            message: "exact session effect identity is unavailable or ambiguous".into(),
-        });
+        return Err(exact_effect_observation_failure(
+            "observe-session-effect",
+            output.status.code(),
+            "exact session effect identity is unavailable or ambiguous",
+        ));
     }
     serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
         op: "observe-session-effect",
         code: None,
+        io_kind: None,
         message: "exact session effect identity is malformed".into(),
     })
 }
 
 #[cfg(test)]
 type ExactEffectHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static OBSERVE_SESSION_EFFECT_FAILURE: LazyLock<std::sync::Mutex<Option<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn fail_next_session_effect_observation(name: &str) {
+    *OBSERVE_SESSION_EFFECT_FAILURE.lock().unwrap() = Some(name.to_string());
+}
 
 #[cfg(test)]
 static BEFORE_EXACT_EFFECT_HOOK: LazyLock<std::sync::Mutex<Option<(String, ExactEffectHook)>>> =
@@ -2300,13 +2454,13 @@ pub(crate) fn set_before_exact_effect_hook(target: &str, hook: ExactEffectHook) 
     *BEFORE_EXACT_EFFECT_HOOK.lock().unwrap() = Some((target.to_string(), hook));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_after_final_scan_seam(target: &str, path: &std::path::Path) {
     *AFTER_FINAL_SCAN_SEAM.lock().unwrap() =
         Some((target.to_string(), path.to_string_lossy().into_owned()));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_managed_retire_crash(target: &str, stage: &'static str, marker: &std::path::Path) {
     assert!(matches!(stage, "freeze" | "kill"));
     *MANAGED_RETIRE_CRASH.lock().unwrap() = Some((
@@ -2330,6 +2484,7 @@ pub(crate) fn kill_session_tree_exact(
         return Err(TmuxError {
             op: "kill-session-tree-exact",
             code: None,
+            io_kind: None,
             message: "exact session effect identity changed before retirement".into(),
         });
     }
@@ -2347,6 +2502,7 @@ pub(crate) fn kill_session_tree_exact(
     let encoded = serde_json::to_string(&expected).map_err(|_| TmuxError {
         op: "kill-session-tree-exact",
         code: None,
+        io_kind: None,
         message: "exact session effect identity could not be encoded".into(),
     })?;
     let mut command = exact_effect_command()?;
@@ -2364,6 +2520,7 @@ pub(crate) fn kill_session_tree_exact(
     let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
         op: "kill-session-tree-exact",
         code: None,
+        io_kind: Some(error.kind()),
         message: format!("failed to retire exact session process identity: {error}"),
     })?;
     if output.status.success() && output.stderr.is_empty() {
@@ -2372,6 +2529,7 @@ pub(crate) fn kill_session_tree_exact(
         Err(TmuxError {
             op: "kill-session-tree-exact",
             code: output.status.code(),
+            io_kind: None,
             message: "exact session effect identity changed during retirement".into(),
         })
     }
@@ -2390,6 +2548,7 @@ pub(crate) fn retire_managed_runtime(
         return Err(TmuxError {
             op: "retire-managed-runtime",
             code: None,
+            io_kind: None,
             message: "managed runtime owner token version is unsupported".into(),
         });
     }
@@ -2400,6 +2559,7 @@ pub(crate) fn retire_managed_runtime(
             return Err(TmuxError {
                 op: "retire-managed-runtime",
                 code: None,
+                io_kind: Some(std::io::ErrorKind::WouldBlock),
                 message: "tmux generation liveness is indeterminate before retirement".into(),
             });
         }
@@ -2411,12 +2571,14 @@ pub(crate) fn retire_managed_runtime(
         return Err(TmuxError {
             op: "retire-managed-runtime",
             code: None,
+            io_kind: None,
             message: "tmux generation changed before managed retirement".into(),
         });
     }
     let encoded = serde_json::to_string(owner).map_err(|_| TmuxError {
         op: "retire-managed-runtime",
         code: None,
+        io_kind: None,
         message: "managed runtime owner token could not be encoded".into(),
     })?;
     let mut command = managed_cgroup_effect_command(&owner.tools.python)?;
@@ -2443,28 +2605,27 @@ pub(crate) fn retire_managed_runtime(
             .map_err(|error| TmuxError {
                 op: "retire-managed-runtime",
                 code: None,
+                io_kind: Some(error.kind()),
                 message: format!("managed cgroup retirement failed: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(TmuxError {
-            op: "retire-managed-runtime",
-            code: output.status.code(),
-            message: "managed owner changed or cgroup freeze/kill did not complete".into(),
-        });
+        return Err(managed_helper_failure(
+            "retire-managed-runtime",
+            output.status.code(),
+            "managed owner changed or cgroup freeze/kill did not complete",
+        ));
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         match session_liveness(name) {
             SessionLiveness::Gone => return Ok(()),
-            SessionLiveness::Unknown => break,
+            SessionLiveness::Unknown => {
+                return Err(incomplete_managed_retirement(SessionLiveness::Unknown));
+            }
             SessionLiveness::Alive => std::thread::sleep(Duration::from_millis(10)),
         }
     }
-    Err(TmuxError {
-        op: "retire-managed-runtime",
-        code: None,
-        message: "managed cgroup emptied but the exact tmux generation did not retire".into(),
-    })
+    Err(incomplete_managed_retirement(SessionLiveness::Alive))
 }
 
 /// Best-effort retirement for a legacy pane through enumerated pidfds.
@@ -2478,7 +2639,17 @@ pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
         if session_liveness(name) == SessionLiveness::Gone {
             return Ok(());
         }
-        let identity = observe_session_effect_identity(name)?;
+        let identity = match observe_session_effect_identity(name) {
+            Ok(identity) => identity,
+            Err(error) => {
+                last_error = Some(error);
+                if session_liveness(name) != SessionLiveness::Alive {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
         match kill_session_tree_exact(name, identity) {
             Ok(()) => {
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2492,6 +2663,7 @@ pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
                 last_error = Some(TmuxError {
                     op: "kill-session-tree",
                     code: None,
+                    io_kind: None,
                     message: "verified pane tree remained alive after pidfd retirement".into(),
                 });
                 break;
@@ -2510,11 +2682,13 @@ pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
         SessionLiveness::Alive => Err(last_error.unwrap_or(TmuxError {
             op: "kill-session-tree",
             code: None,
+            io_kind: None,
             message: "verified pane tree remained alive after pidfd retirement".into(),
         })),
         SessionLiveness::Unknown => Err(TmuxError {
             op: "kill-session-tree",
             code: None,
+            io_kind: None,
             message: "pane liveness is indeterminate after pidfd retirement".into(),
         }),
     }
@@ -2541,6 +2715,7 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
             TmuxError {
                 op: "list-sessions",
                 code: None,
+                io_kind: Some(e.kind()),
                 message: format!("failed to spawn tmux: {e}"),
             }
         })?;
@@ -2573,6 +2748,7 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     Err(TmuxError {
         op: "list-sessions",
         code: output.status.code(),
+        io_kind: None,
         message: stderr.trim().to_string(),
     })
 }
@@ -2644,6 +2820,7 @@ pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
     .map_err(|e| TmuxError {
         op: "active-codex-rollouts",
         code: None,
+        io_kind: Some(e.kind()),
         message: format!("failed to inspect Codex runtime identity: {e}"),
     })?;
     if !output.status.success() {
@@ -2654,6 +2831,7 @@ pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
         return Err(TmuxError {
             op: "active-codex-rollouts",
             code: output.status.code(),
+            io_kind: None,
             message: stderr.trim().to_string(),
         });
     }
@@ -2663,6 +2841,7 @@ pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
             return Err(TmuxError {
                 op: "active-codex-rollouts",
                 code: None,
+                io_kind: None,
                 message: "runtime scan returned a malformed identity row".into(),
             });
         };
@@ -2671,6 +2850,7 @@ pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
             return Err(TmuxError {
                 op: "active-codex-rollouts",
                 code: None,
+                io_kind: None,
                 message: "runtime scan returned an invalid identity row".into(),
             });
         }
@@ -2678,6 +2858,7 @@ pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
             return Err(TmuxError {
                 op: "active-codex-rollouts",
                 code: None,
+                io_kind: None,
                 message: "runtime scan result bound exceeded".into(),
             });
         }
@@ -2733,6 +2914,7 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
     .map_err(|e| TmuxError {
         op: "list-panes",
         code: None,
+        io_kind: Some(e.kind()),
         message: format!("failed to spawn tmux: {e}"),
     })?;
     if !output.status.success() {
@@ -2743,6 +2925,7 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
         return Err(TmuxError {
             op: "list-panes",
             code: output.status.code(),
+            io_kind: None,
             message: stderr.trim().to_string(),
         });
     }
@@ -2910,6 +3093,45 @@ pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pane_command_windows_transport_preserves_arbitrary_quotes() {
+        let command = "printf '%s\\n' \"double quoted\" 'single quoted' \"$HOME\"";
+        let transported = windows_safe_pane_command(command);
+        let encoded = transported
+            .split_once("printf %s ")
+            .and_then(|(_, suffix)| suffix.split_once(" | base64 -d"))
+            .map(|(encoded, _)| encoded)
+            .unwrap();
+
+        assert!(!transported.contains('"'));
+        assert_eq!(STANDARD.decode(encoded).unwrap(), command.as_bytes());
+    }
+
+    /// The path to use when re-executing this test binary to run one of the
+    /// subprocess helpers below.
+    ///
+    /// `std::env::current_exe()` reports the path the binary was *launched*
+    /// from. A concurrent `cargo` build against the same target directory can
+    /// replace or unlink that path while the test is still running, after which
+    /// spawning it fails with `ENOENT` and the test fails for a reason that has
+    /// nothing to do with what it covers. On Linux `/proc/self/exe` is a
+    /// kernel-resolved handle to this process's own image and stays executable
+    /// across that replacement, so prefer it and fall back to `current_exe()`
+    /// wherever it is unavailable.
+    fn test_binary_path() -> std::path::PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            // Stat the link itself, not its target: once the original binary is
+            // unlinked the target no longer resolves, but the magic symlink is
+            // still there and still executable.
+            let proc_self_exe = std::path::Path::new("/proc/self/exe");
+            if proc_self_exe.symlink_metadata().is_ok() {
+                return proc_self_exe.to_path_buf();
+            }
+        }
+        std::env::current_exe().expect("locating this test binary to re-exec a subprocess helper")
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_path_shims_cannot_intercept_systemd_helpers() {
@@ -2944,7 +3166,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let original_path = std::env::var("PATH").unwrap_or_default();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(test_binary_path())
             .args([
                 "--exact",
                 "tmux::tests::managed_path_shims_cannot_intercept_systemd_helpers",
@@ -3186,7 +3408,7 @@ mod tests {
             "line\nbreak".to_string(),
             "-option-like".to_string(),
         ];
-        let test_binary = std::env::current_exe().unwrap();
+        let test_binary = test_binary_path();
         for value in hostile {
             let output = Command::new(&test_binary)
                 .args([
@@ -3287,6 +3509,21 @@ mod tests {
         );
         assert!(parse_pane_generation("$0|0|@0|%0|456").is_none());
         assert!(parse_pane_generation("$0|123|@0|%0|0").is_none());
+    }
+
+    #[test]
+    fn legacy_tree_retirement_retries_a_transient_identity_observation_failure() {
+        if !tmux_available() {
+            eprintln!("legacy tree retirement retry test skipped: tmux unavailable");
+            return;
+        }
+        let session = TestSession::new();
+        new_session_with_env(&session.name, "/tmp", Some("sleep 60"), &[]).unwrap();
+        fail_next_session_effect_observation(&session.name);
+
+        kill_session_tree(&session.name).unwrap();
+
+        assert_eq!(session_liveness(&session.name), SessionLiveness::Gone);
     }
 
     #[test]
@@ -3459,6 +3696,60 @@ while True:
 
         retire_prepared_managed_runtime(&launch).unwrap();
         retire_prepared_managed_runtime(&launch).unwrap();
+    }
+
+    #[test]
+    fn cortana_retryable_managed_evidence_classifies_only_inconclusive_helpers() {
+        for code in [77, 80, 83, 84, 90, 92, 94, 100, 101, 118] {
+            for op in [
+                "managed-runtime-preflight",
+                "observe-managed-runtime-owner",
+                "retire-prepared-managed-runtime",
+                "retire-managed-runtime",
+            ] {
+                let error = managed_helper_failure(op, Some(code), "unreadable helper evidence");
+                assert!(error.is_retryable_observation(), "{op} helper exit {code}");
+            }
+        }
+
+        for code in [76, 78, 79, 81, 82, 89, 91, 93, 120, 130] {
+            for op in [
+                "managed-runtime-preflight",
+                "observe-managed-runtime-owner",
+                "retire-prepared-managed-runtime",
+                "retire-managed-runtime",
+            ] {
+                let error = managed_helper_failure(op, Some(code), "definitive ownership failure");
+                assert!(!error.is_retryable_observation(), "{op} helper exit {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn cortana_retryable_prepared_observation_classifies_exact_effect_evidence() {
+        for code in [41, 43] {
+            let error = exact_effect_observation_failure(
+                "observe-session-effect",
+                Some(code),
+                "unreadable exact effect evidence",
+            );
+            assert!(error.is_retryable_observation(), "helper exit {code}");
+        }
+
+        for code in [40, 42, 44, 45, 46, 47, 74] {
+            let error = exact_effect_observation_failure(
+                "observe-session-effect",
+                Some(code),
+                "definitive exact effect failure",
+            );
+            assert!(!error.is_retryable_observation(), "helper exit {code}");
+        }
+    }
+
+    #[test]
+    fn managed_retirement_unknown_completion_is_retryable_but_alive_is_not() {
+        assert!(incomplete_managed_retirement(SessionLiveness::Unknown).is_retryable_observation());
+        assert!(!incomplete_managed_retirement(SessionLiveness::Alive).is_retryable_observation());
     }
 
     #[cfg(unix)]

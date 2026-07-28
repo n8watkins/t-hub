@@ -323,9 +323,17 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
     // straight to the fallback shell (the "Resume opens a plain terminal, not
     // Claude" bug). `-i` forces ~/.zshrc to load, so the command resolves exactly
     // as when typed by hand. Verified in a clean env (no inherited PATH).
+    //
+    // Keep the generated wrapping syntax free of double quotes. This preserves the
+    // built-in Windows startup fix and minimizes the command-line surface before
+    // tmux.rs base64-encodes the complete pane command for the `wsl.exe` boundary.
+    // User-supplied double quotes remain valid because that transport preserves the
+    // complete command verbatim. `$SHELL` is a bare path with no spaces, so leaving
+    // `${SHELL:-/bin/sh}` unquoted is safe, while `sh_single_quote` protects the
+    // interactive-login command argument.
     Some(format!(
-        "exec \"${{SHELL:-/bin/sh}}\" -ilc {}",
-        sh_single_quote(&format!("{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"))
+        "exec ${{SHELL:-/bin/sh}} -ilc {}",
+        sh_single_quote(&format!("{startup}; exec ${{SHELL:-/bin/sh}} -l"))
     ))
 }
 
@@ -707,6 +715,23 @@ pub(crate) fn forward_captains_sync(
     fanout.emit_event(crate::control::APPLY_EVENT_CHANNEL, &payload);
 }
 
+fn forward_tabs_sync(
+    app: &tauri::AppHandle,
+    snapshot: &crate::control::RegistrySnapshot,
+    fanout: &crate::control::EventFanout,
+) {
+    let sync = match serde_json::to_value(snapshot) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("t-hub: workspace snapshot serialize failed: {error}");
+            return;
+        }
+    };
+    let payload = serde_json::json!({ "command": "sync_tabs", "args": { "sync": sync } });
+    let _ = app.emit(crate::control::APPLY_EVENT_CHANNEL, &payload);
+    fanout.emit_event(crate::control::APPLY_EVENT_CHANNEL, &payload);
+}
+
 #[tauri::command]
 pub async fn kill_terminal(
     app: tauri::AppHandle,
@@ -761,7 +786,10 @@ pub async fn kill_terminal(
 pub async fn list_terminals(
     app: tauri::AppHandle,
     remote: tauri::State<'_, RemotePtyManager>,
+    registry: tauri::State<'_, std::sync::Arc<crate::control::TabRegistry>>,
+    fanout: tauri::State<'_, std::sync::Arc<crate::control::EventFanout>>,
 ) -> Result<Vec<TerminalInfo>, String> {
+    let registry_seq = registry.snapshot_full().seq;
     // Snapshot what the reconciliation needs from the in-memory map BEFORE we
     // hop to a blocking thread: a `tmux_session -> canonical id` map. The closure
     // is `'static`, so it can't borrow `&State`; this owned snapshot is all the
@@ -907,6 +935,16 @@ pub async fn list_terminals(
         // (no-ops on a dropped connection), so it can't block or double-free. We
         // never touch tmux here — the session is already gone.
         drop(dead);
+    }
+
+    if registry.startup_is_authoritative() {
+        let live_tile_ids = infos
+            .iter()
+            .map(|terminal| terminal.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(snapshot) = registry.prune_gone_tiles_if_seq(registry_seq, &live_tile_ids) {
+            forward_tabs_sync(&app, &snapshot, &fanout);
+        }
     }
 
     Ok(infos)
@@ -1396,21 +1434,43 @@ mod tests {
         // A startup command rides inside the interactive login shell wrap.
         let cmd = pane_command(None, Some("claude --resume 'abc-123'")).unwrap();
         assert!(
-            cmd.starts_with("exec \"${SHELL:-/bin/sh}\" -ilc "),
+            cmd.starts_with("exec ${SHELL:-/bin/sh} -ilc "),
             "got: {cmd}"
         );
         assert!(
             cmd.contains("claude --resume '\\''abc-123'\\''"),
             "got: {cmd}"
         );
-        assert!(cmd.contains("exec \"${SHELL:-/bin/sh}\" -l"), "got: {cmd}");
+        assert!(cmd.contains("exec ${SHELL:-/bin/sh} -l"), "got: {cmd}");
+    }
+
+    /// REGRESSION (startupCommand no-op bug): built-in pane-command wrappers must
+    /// remain double-quote-free. The Windows tmux layer additionally base64-encodes
+    /// the complete command so custom commands can preserve their own quotes.
+    #[test]
+    fn pane_command_has_no_double_quotes() {
+        // Realistic startup commands (the "+" presets + `claude --resume <uuid>`);
+        // none contain a `"` of their own, so the wrap must not introduce one.
+        for startup in [
+            "claude",
+            "claude --resume 138adaa9-35a7-4fa6-909d-3e0d8adeef29",
+            "claude --resume 'abc-123'",
+            "echo 'hi there'",
+        ] {
+            let cmd = pane_command(None, Some(startup)).unwrap();
+            assert!(
+                !cmd.contains('"'),
+                "pane command must be double-quote-free (wsl.exe mangles \\\"); got: {cmd}"
+            );
+        }
     }
 
     /// The wrap single-quotes the startup command, so embedded quotes survive
     /// the `sh -c` round trip via the `'\''` idiom.
     #[test]
     fn pane_command_quotes_embedded_quotes() {
-        let cmd = pane_command(None, Some("echo 'hi there'")).unwrap();
+        let cmd = pane_command(None, Some("echo 'hi there' \"and here\"")).unwrap();
         assert!(cmd.contains("echo '\\''hi there'\\''"), "got: {cmd}");
+        assert!(cmd.contains("\"and here\""), "got: {cmd}");
     }
 }

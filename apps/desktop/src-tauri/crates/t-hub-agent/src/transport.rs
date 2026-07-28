@@ -259,16 +259,14 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
             }
 
             CoreToAgent::ReplayJournal { after_seq } => {
-                let entries = match journal.replay(after_seq) {
+                let replay = match journal.replay_with_boundary(after_seq) {
                     Ok(e) => e,
                     Err(e) => {
                         eprintln!("t-hub-agent: journal replay failed: {e:#}");
-                        Vec::new()
+                        continue;
                     }
                 };
-                let mut last_seq = after_seq;
-                for entry in entries {
-                    last_seq = entry.seq;
+                for entry in replay.entries {
                     let f = AgentFrame {
                         channel: Channel::Events,
                         msg: AgentToCore::Journal {
@@ -281,9 +279,20 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                         return Ok(());
                     }
                 }
+                let boundary = AgentFrame {
+                    channel: Channel::Events,
+                    msg: AgentToCore::ReplayBoundary {
+                        last_seq: replay.last_seq,
+                    },
+                };
+                if tx.send(boundary).is_err() {
+                    return Ok(());
+                }
                 let done = AgentFrame {
                     channel: Channel::Events,
-                    msg: AgentToCore::ReplayComplete { last_seq },
+                    msg: AgentToCore::ReplayComplete {
+                        last_seq: replay.last_seq,
+                    },
                 };
                 if tx.send(done).is_err() {
                     return Ok(());

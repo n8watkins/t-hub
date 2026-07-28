@@ -58,7 +58,10 @@ mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
 mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS proxy (no browser Origin)
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
-pub mod worktree_coordinator; // durable Cargo-cleanup reservations and activity admission
+/// Durable Cargo-cleanup reservations and activity admission.
+pub mod worktree_coordinator;
+#[cfg(any(windows, test))]
+mod wsl; // Shared Windows-to-WSL command construction.
 
 use agent::AgentBridge;
 use claude::StatusBridge;
@@ -115,29 +118,21 @@ fn default_distro() -> String {
 /// never blocked on the WSL hop / handshake. A connect failure is logged (the
 /// UI shows the connection state); it does not abort startup. The bridge owns
 /// reconnect behavior internally.
-fn spawn_agent_connect(state: &AppState) {
+fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBuf>) {
     let bridge = state.agent.clone();
+    bridge.set_bundled_agent_path(bundled_agent);
     let distro = default_distro();
     std::thread::Builder::new()
         .name("t-hub-agent-connect".into())
         .spawn(move || {
-            // Log the resolved launch argv up front so a missing/unresolvable
-            // agent binary is diagnosable from the core's stderr. On Windows
-            // this is the `wsl.exe -d <distro> --cd ~ -e bash -lc "exec
-            // t-hub-agent --stdio"` login-shell form — `-e` execs REAL bash, not
-            // the default login shell (zsh); see agent::launch_argv. (Or the
-            // verbatim T_HUB_AGENT_BIN override.) On unix it's the direct spawn.
-            let argv = agent::launch_argv(&distro);
-            eprintln!("t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}");
+            eprintln!("t-hub: connecting agent bridge (distro={distro:?})");
             if let Err(e) = bridge.connect(&distro) {
                 // A failure here never aborts startup: the bridge degrades to a
-                // Failed/Disconnected state the sidebar renders. The most common
-                // cause is the agent binary not being on the login-shell PATH
-                // (install it to ~/.local/bin) — surface that hint.
+                // Failed/Disconnected state the sidebar renders.
                 eprintln!(
                     "t-hub: agent bridge connect failed: {e} \
-                     (is `t-hub-agent` installed to ~/.local/bin inside the \
-                     distro, or T_HUB_AGENT_BIN set?)"
+                     (is the digest-versioned helper executable inside the distro, \
+                     or is a supported developer override set?)"
                 );
             }
         })
@@ -155,18 +150,40 @@ fn spawn_agent_connect(state: &AppState) {
 /// `termhub` build), it migrates them to the current marker + resolved agent
 /// path. The outcome is summarized via `diag::diag_log`.
 #[cfg(not(feature = "devbuild"))]
-fn spawn_reconcile_managed_hooks() {
+fn spawn_reconcile_managed_hooks(state: &AppState) {
+    #[cfg(windows)]
+    let bridge = state.agent.clone();
+    #[cfg(windows)]
+    let distro = default_distro();
+    #[cfg(not(windows))]
+    let _ = state;
     std::thread::Builder::new()
         .name("t-hub-claude-reconcile".into())
-        .spawn(|| match claude::install::reconcile_managed_hooks() {
-            Ok(()) => diag::diag_log(
-                "claude/reconcile: startup reconcile ok (migrated managed hooks if any; \
-                 no-op when none were installed)"
-                    .to_string(),
-            ),
-            Err(e) => diag::diag_log(format!(
-                "claude/reconcile: startup reconcile failed (non-fatal, launch continues): {e}"
-            )),
+        .spawn(move || {
+            #[cfg(windows)]
+            let agent_bin = match bridge.deploy_packaged_agent(&distro) {
+                Ok(deployed) => deployed.wsl_path,
+                Err(error) => {
+                    diag::diag_log(format!(
+                        "claude/reconcile: verified helper deployment failed \
+                         (non-fatal, launch continues): {error}"
+                    ));
+                    return;
+                }
+            };
+            #[cfg(not(windows))]
+            let agent_bin = "t-hub-agent".to_string();
+
+            match claude::install::reconcile_managed_hooks(&agent_bin) {
+                Ok(()) => diag::diag_log(
+                    "claude/reconcile: startup reconcile ok (migrated managed hooks if any; \
+                     no-op when none were installed)"
+                        .to_string(),
+                ),
+                Err(e) => diag::diag_log(format!(
+                    "claude/reconcile: startup reconcile failed (non-fatal, launch continues): {e}"
+                )),
+            }
         })
         .ok();
 }
@@ -238,6 +255,14 @@ fn report_workspace_tabs(
     captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
+    if let Err(error) = registry.require_authoritative_startup() {
+        return serde_json::json!({
+            "stale": true,
+            "seq": registry.snapshot_full().seq,
+            "tabs": registry.snapshot_full().tabs,
+            "error": error,
+        });
+    }
     match control::apply_workspace_report(&registry, &captains, tabs, active_tab_id, base_seq) {
         Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled)) => {
             if captains_changed {
@@ -389,6 +414,7 @@ fn start_control_listener(
     {
         use tauri::Manager;
         app.manage(std::sync::Arc::new(ctx.clone()));
+        app.manage(worktrees.clone());
     }
     match control::start(ctx) {
         Ok(h) => {
@@ -677,7 +703,12 @@ pub fn run() {
             // the resolved path; diagnoses "app runs but diag is stale").
             diag::log_startup();
             // Kick off the agent connection in the background once state exists.
-            spawn_agent_connect(&state);
+            let bundled_agent = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|resource_dir| agent::bundled_agent_path(&resource_dir));
+            spawn_agent_connect(&state, bundled_agent);
 
             // Managed TTS-engine lifecycle (proposal /tmp/flap-probe/
             // LIFECYCLE-PROPOSAL.md). The status snapshot is ALWAYS managed as
@@ -724,7 +755,7 @@ pub fn run() {
             // managed exists (no silent new consent). Detached + error-swallowed so
             // it can never block or abort launch (a WSL hop / file write runs here).
             #[cfg(not(feature = "devbuild"))]
-            spawn_reconcile_managed_hooks();
+            spawn_reconcile_managed_hooks(&state);
             #[cfg(feature = "devbuild")]
             diag::diag_log(
                 "claude_hooks: startup reconciliation disabled for isolated devbuild".to_string(),
@@ -747,9 +778,10 @@ pub fn run() {
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
             // Fleet Workspace identity is durable in the same registry as its
             // Captain/Assignment owner. TabRegistry is only the live projection
-            // cache and is seeded before the listener or UI can call list_tabs.
-            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
-            tab_registry.replace(captains_registry.workspace_projection());
+            // cache. Keep it unpublished until one background tmux snapshot has
+            // reconciled durable placement, so setup and the UI event loop never
+            // wait on WSL and stale local reports cannot race startup authority.
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new_pending_startup());
             app.manage(tab_registry.clone());
             // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
             // dead session (captain or crew) from the registry - the UI kills tiles
@@ -780,39 +812,72 @@ pub fn run() {
             // site that both owns the store and can supply the tmux predicate; the
             // store stays tmux-free + unit-testable.
             //
-            // Snapshot the identity generation before the asynchronous liveness
-            // read. The compare-and-prune step keeps identities minted or rebound
-            // while this background task is running.
+            // Snapshot the identity generation before the background prune.
+            // The compare-and-prune step keeps identities minted or rebound while
+            // this background task is running.
             {
                 let prune_generation = identity_store.prune_generation();
                 let identity_store = identity_store.clone();
-                std::thread::Builder::new()
-                    .name("t-hub-identity-prune".into())
-                    .spawn(move || match tmux::list_sessions() {
-                        Ok(live) => {
-                            let live: std::collections::HashSet<String> =
-                                live.into_iter().collect();
-                            match identity_store.prune_dead_generation(&prune_generation, |tile| {
-                                live.contains(&tmux::target_for_id(tile))
-                            }) {
-                                Ok(pruned) if pruned > 0 => eprintln!(
-                                    "t-hub-identity: load-time prune retired {pruned} dead/unbound \
-                                     identit{} (session gone without a clean close)",
-                                    if pruned == 1 { "y" } else { "ies" }
-                                ),
-                                Err(error) => eprintln!(
-                                    "t-hub-identity: load-time prune was rolled back after \
-                                     persistence failed: {error}"
-                                ),
-                                _ => {}
+                let captains_registry = captains_registry.clone();
+                let tab_registry = tab_registry.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let mut retry_delay = std::time::Duration::from_millis(250);
+                    loop {
+                        let reconciliation_basis =
+                            captains_registry.startup_workspace_reconciliation_basis();
+                        let sessions = match tmux::list_sessions() {
+                            Ok(sessions) => sessions,
+                            Err(error) => {
+                                eprintln!(
+                                    "t-hub-workspaces: startup reconciliation is waiting for \
+                                     terminal liveness: {error}"
+                                );
+                                std::thread::sleep(retry_delay);
+                                retry_delay = retry_delay
+                                    .saturating_mul(2)
+                                    .min(std::time::Duration::from_secs(5));
+                                continue;
                             }
+                        };
+                        let live = sessions
+                            .into_iter()
+                            .collect::<std::collections::HashSet<_>>();
+                        let reconciliation = captains_registry.reconcile_startup_workspace_tiles(
+                            &reconciliation_basis,
+                            |tile| live.contains(&tmux::target_for_id(tile)),
+                            |projection| tab_registry.publish_startup(projection),
+                        );
+                        match reconciliation {
+                            Ok(None) => continue,
+                            Ok(Some(pruned)) if !pruned.is_empty() => eprintln!(
+                                "t-hub-workspaces: load-time prune removed {} gone terminal \
+                                 placement{}",
+                                pruned.len(),
+                                if pruned.len() == 1 { "" } else { "s" }
+                            ),
+                            Err(error) => eprintln!(
+                                "t-hub-workspaces: load-time prune persistence failed; the \
+                                 live-only startup exclusion remains active: {error}"
+                            ),
+                            _ => {}
                         }
-                        Err(error) => eprintln!(
-                            "t-hub-identity: load-time prune SKIPPED - tmux session list \
-                             unavailable (indeterminate, not pruning): {error}"
-                        ),
-                    })
-                    .ok();
+                        match identity_store.prune_dead_generation(&prune_generation, |tile| {
+                            live.contains(&tmux::target_for_id(tile))
+                        }) {
+                            Ok(pruned) if pruned > 0 => eprintln!(
+                                "t-hub-identity: load-time prune retired {pruned} dead/unbound \
+                                 identit{} (session gone without a clean close)",
+                                if pruned == 1 { "y" } else { "ies" }
+                            ),
+                            Err(error) => eprintln!(
+                                "t-hub-identity: load-time prune was rolled back after \
+                                 persistence failed: {error}"
+                            ),
+                            _ => {}
+                        }
+                        break;
+                    }
+                });
             }
             // Comms-plane Phase 2 observability (§2.8): fan out each message's
             // lifecycle transition on `control://inbox` (counts/ids/lengths only,

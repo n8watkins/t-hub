@@ -108,10 +108,10 @@ export interface AgentStateInfo {
   journalCursor: number;
 }
 
-/** Payload of the `agent://journal` event: a journal entry the core consumed. */
+/** Payload of `agent://journal`: a newly committed live journal entry. */
 export interface JournalEvent {
   entry: EventJournalEntry;
-  /** True only while the backend is consuming a reconnect/startup replay. */
+  /** Compatibility field. Cold replay is coalesced, so emitted events set this to false. */
   replayed: boolean;
   /** Exact post-reducer announcement authority correlated to `entry`. */
   voice_announcement?: {

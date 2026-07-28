@@ -42,7 +42,7 @@ import {
   useCodexUsage,
 } from "./UsageStrip";
 import { useMemo, useState } from "react";
-import { LayoutGrid } from "lucide-react";
+import { LayoutGrid, Trash2 } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { CaptainsList, OrchestratorRow } from "./CaptainsList";
 import { WorkspacesList } from "./WorkspacesList";
@@ -163,6 +163,11 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
   const workspaceCount = useWorkspace(
     (s) => s.tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length,
   );
+  const closableEmptyWorkspaceCount = useWorkspace((s) => {
+    const workspaces = s.tabs.filter((t) => t.id !== CAPTAINS_TAB_ID);
+    const emptyCount = workspaces.filter((t) => t.order.length === 0).length;
+    return Math.min(emptyCount, Math.max(0, workspaces.length - 1));
+  });
   const [historyCount, setHistoryCount] = useState(0);
   // Pinned captains drive the Captains section; zero pins = no section at all
   // (the titlebar anchor's tooltip explains how to pin).
@@ -189,11 +194,11 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
           titlebar's LEFT cluster (see Titlebar.tsx LeftChrome), so the sidebar
           starts straight at its content and reclaims that vertical space. */}
 
-      {/* Body: two stacked sections - Workspaces (EVERY tab + its terminals; the
-          one navigation surface now) and provider-neutral History. Each grows and scrolls internally; the whole body scrolls as
-          a safety net on a short window. The old separate "Projects" section is
-          gone — a workspace's terminals live under it in Workspaces. */}
-      <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
+      {/* Body: Workspaces owns the flexible middle and scrolls internally, while
+          provider-neutral History stays visible at the bottom. The old shared
+          scrollbar let a long workspace list push the History header and rows
+          below the viewport, making an intact catalog look missing. */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {/* Agents - the fleet hierarchy: the orchestrator (top) over the pinned
             captains, above Workspaces (command view over terrain view). Clicking
             an agent navigates to the reserved Captains workspace tab and focuses
@@ -234,7 +239,9 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
         <Section
           title="Workspaces"
           count={workspaceCount}
-          className="border-b"
+          className="min-h-0 flex-1 border-b"
+          fillBody
+          bodyClassName="th-scroll h-full min-h-0 overflow-y-auto"
           leading={
             onToggleSidebar ? (
               <button
@@ -249,15 +256,34 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
             ) : undefined
           }
           action={
-            <button
-              type="button"
-              onClick={() => useWorkspace.getState().addTab()}
-              aria-label="New workspace"
-              title="New workspace"
-              className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
-            >
-              <PlusIcon />
-            </button>
+            <div className="flex items-center gap-0.5">
+              {closableEmptyWorkspaceCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    useWorkspace.getState().closeEmptyWorkspaces()
+                  }
+                  aria-label={`Close ${closableEmptyWorkspaceCount} empty workspace${
+                    closableEmptyWorkspaceCount === 1 ? "" : "s"
+                  }`}
+                  title={`Close ${closableEmptyWorkspaceCount} empty workspace${
+                    closableEmptyWorkspaceCount === 1 ? "" : "s"
+                  }`}
+                  className="flex h-6 w-6 items-center justify-center rounded text-neutral-400 transition-colors hover:bg-red-600/30 hover:text-white"
+                >
+                  <Trash2 size={13} aria-hidden />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => useWorkspace.getState().addTab()}
+                aria-label="New workspace"
+                title="New workspace"
+                className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+              >
+                <PlusIcon />
+              </button>
+            </div>
           }
         >
           <WorkspacesList />
@@ -269,7 +295,7 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
         <Section
           title="History"
           count={historyCount}
-          className="border-b"
+          className="shrink-0 border-b"
           collapsible
           storageKey="t-hub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
@@ -860,6 +886,7 @@ function Section({
   storageKey,
   bodyClassName,
   bodyStyle,
+  fillBody = false,
   leading,
   action,
 }: {
@@ -875,6 +902,9 @@ function Section({
    *  scrolling region so a long list can't consume the whole sidebar. */
   bodyClassName?: string;
   bodyStyle?: React.CSSProperties;
+  /** Let the body consume the section's remaining height. Used by Workspaces so
+   *  its list scrolls without pushing the following History section offscreen. */
+  fillBody?: boolean;
   /** Optional control rendered before the title (non-collapsible sections only),
    *  e.g. the sidebar collapse toggle next to "Workspaces". */
   leading?: React.ReactNode;
@@ -920,7 +950,7 @@ function Section({
       {/* Animate open/close by transitioning the grid row 0fr↔1fr; the body
           stays mounted and the inner wrapper clips it as it collapses. */}
       <div
-        className="grid"
+        className={fillBody ? "grid min-h-0 flex-1" : "grid"}
         style={{
           gridTemplateRows: isOpen ? "1fr" : "0fr",
           transition: "grid-template-rows 200ms ease",

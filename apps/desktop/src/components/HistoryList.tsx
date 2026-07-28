@@ -7,7 +7,10 @@ import {
   type HistoryEntry,
   type HistoryListResult,
 } from "../ipc/history";
-import { onControlEvent } from "../ipc/controlClient";
+import {
+  isRetryableControlError,
+  onControlEvent,
+} from "../ipc/controlClient";
 import type { JournalEvent, SessionStatusEvent } from "../ipc/protocol";
 import { runWhenIdle } from "../lib/windowInteraction";
 import { useWorkspace } from "../store/workspace";
@@ -22,6 +25,8 @@ const TERMINAL_SESSION_STATUSES = new Set<SessionStatusEvent["status"]>([
   "expired",
   "unknown",
 ]);
+const HISTORY_STARTUP_DELAY_MS = import.meta.env.PROD ? 5_000 : 0;
+const HISTORY_RETRY_DELAY_MS = import.meta.env.PROD ? 3_000 : 0;
 
 export interface HistoryListProps {
   onCount?: (count: number) => void;
@@ -59,18 +64,20 @@ export function HistoryList({ onCount }: HistoryListProps) {
   const [error, setError] = useState<string | null>(null);
   const refreshGeneration = useRef(0);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<boolean> => {
     const generation = ++refreshGeneration.current;
     try {
       const next = await historyList();
-      if (generation !== refreshGeneration.current) return;
+      if (generation !== refreshGeneration.current) return false;
       setCatalog((current) =>
         current?.revision === next.revision ? current : next,
       );
       setError(null);
+      return false;
     } catch (reason) {
-      if (generation !== refreshGeneration.current) return;
+      if (generation !== refreshGeneration.current) return false;
       setError(reason instanceof Error ? reason.message : String(reason));
+      return isRetryableControlError(reason);
     } finally {
       if (generation === refreshGeneration.current) setLoaded(true);
     }
@@ -78,9 +85,31 @@ export function HistoryList({ onCount }: HistoryListProps) {
 
   useEffect(() => {
     discardLegacyRecentState();
-    void refresh();
-    const onFocus = () => runWhenIdle(() => void refresh());
-    const onHistoryChanged = () => void refresh();
+    let stopped = false;
+    let startupReady = false;
+    let pendingRefresh = true;
+    let retryTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const runRefresh = () => {
+      if (stopped) return;
+      if (!startupReady) {
+        pendingRefresh = true;
+        return;
+      }
+      pendingRefresh = false;
+      void refresh().then((retryable) => {
+        if (!retryable || stopped || retryTimer !== undefined) return;
+        retryTimer = globalThis.setTimeout(() => {
+          retryTimer = undefined;
+          runWhenIdle(runRefresh);
+        }, HISTORY_RETRY_DELAY_MS);
+      });
+    };
+    const startupTimer = globalThis.setTimeout(() => {
+      startupReady = true;
+      if (pendingRefresh) runWhenIdle(runRefresh);
+    }, HISTORY_STARTUP_DELAY_MS);
+    const onFocus = () => runWhenIdle(runRefresh);
+    const onHistoryChanged = () => runWhenIdle(runRefresh);
     const offControl = onControlEvent("history://changed", onHistoryChanged);
     const offSessionStatus = onControlEvent("session://status", (payload) => {
       if (
@@ -91,7 +120,7 @@ export function HistoryList({ onCount }: HistoryListProps) {
           (payload as { status: SessionStatusEvent["status"] }).status,
         )
       ) {
-        runWhenIdle(() => void refresh());
+        runWhenIdle(runRefresh);
       }
     });
     const offJournal = onControlEvent("agent://journal", (payload) => {
@@ -101,7 +130,7 @@ export function HistoryList({ onCount }: HistoryListProps) {
         "entry" in payload &&
         (payload as JournalEvent).entry?.event_type === "sessionEnd"
       ) {
-        runWhenIdle(() => void refresh());
+        runWhenIdle(runRefresh);
       }
     });
     let terminalIds = Object.keys(useWorkspace.getState().terminals).sort().join("\0");
@@ -109,11 +138,14 @@ export function HistoryList({ onCount }: HistoryListProps) {
       const nextTerminalIds = Object.keys(state.terminals).sort().join("\0");
       if (nextTerminalIds === terminalIds) return;
       terminalIds = nextTerminalIds;
-      runWhenIdle(() => void refresh());
+      runWhenIdle(runRefresh);
     });
     window.addEventListener("focus", onFocus);
     window.addEventListener("t-hub:history-changed", onHistoryChanged);
     return () => {
+      stopped = true;
+      globalThis.clearTimeout(startupTimer);
+      if (retryTimer !== undefined) globalThis.clearTimeout(retryTimer);
       offControl();
       offSessionStatus();
       offJournal();
@@ -138,11 +170,18 @@ export function HistoryList({ onCount }: HistoryListProps) {
   if (!catalog && error) {
     return (
       <div
-        className="px-3 py-2 text-xs"
+        className="flex items-center justify-between gap-2 px-3 py-2 text-xs"
         style={{ color: "var(--th-danger, #f87171)" }}
         role="alert"
       >
-        History is unavailable.
+        <span>History is unavailable.</span>
+        <button
+          type="button"
+          className="rounded px-1.5 py-0.5 text-[11px] hover:bg-white/10"
+          onClick={() => void refresh()}
+        >
+          Retry
+        </button>
       </div>
     );
   }
@@ -170,7 +209,11 @@ export function HistoryList({ onCount }: HistoryListProps) {
         </div>
       ) : (
         entries.map((entry) => (
-          <HistoryRow key={entry.historyId} entry={entry} onChanged={refresh} />
+          <HistoryRow
+            key={entry.historyId}
+            entry={entry}
+            onChanged={() => refresh().then(() => undefined)}
+          />
         ))
       )}
     </div>

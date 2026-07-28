@@ -6,29 +6,29 @@
 //!   - performs the [`Hello`]/[`Ready`] handshake;
 //!   - correlates [`AgentRequest`]s with [`AgentResponse`]s by [`RequestId`];
 //!   - consumes streamed/replayed [`EventJournalEntry`]s, advances the journal
-//!     cursor, feeds [`crate::supervision::Supervisor`], and fans entries out to
-//!     the UI via the [`crate::events`] journal/agent channels;
+//!     cursor, feeds [`crate::supervision::Supervisor`], publishes live entries,
+//!     and coalesces cold replay into bounded state snapshots;
 //!   - exposes WSL metrics / git / registry RPCs to the rest of the core.
 //!
-//! ## Status
-//! This file defines the **contract** for the bridge: the public types,
-//! [`AgentBridge`] handle, and method signatures the Tauri commands call. The
-//! transport internals (spawning the child, reader/writer threads, the priority
-//! scheduler that exploits [`t_hub_protocol::Channel`]/`Priority`, reconnect +
-//! replay) are implemented by SUBAGENT(agent-bridge). The stubs compile and
-//! return a clear "not yet connected" error so the command surface is wired and
-//! typecheckable today.
-//!
-//! Boundary: SUBAGENT(agent-bridge) owns this directory (`agent/`). It must not
-//! change `t-hub-protocol`, `model.rs`, or `supervision.rs` (it *calls* them).
+//! This file defines the public bridge contract and owns the serialized
+//! connection lifecycle, handshake, replay verification, request correlation,
+//! and journal ingestion.
+//! Child-process and reader-thread mechanics live in `connection.rs`.
 
 mod connection;
 pub mod emit;
+mod install;
 
 pub use connection::ConnectionState;
 pub use emit::EventEmitter;
+pub(crate) use install::bundled_agent_path;
+#[cfg(windows)]
+use install::{deploy_bundled_agent, DeployOutcome, DeployedAgent};
 
-use std::sync::{mpsc, Arc, LazyLock, Weak};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{mpsc, Arc, LazyLock, Weak},
+};
 
 use parking_lot::Mutex;
 use t_hub_protocol::{
@@ -38,7 +38,7 @@ use t_hub_protocol::{
 };
 
 use crate::supervision::Supervisor;
-use connection::{spawn_child, spawn_reader, write_frame, TransportHandles};
+use connection::{spawn_child, spawn_reader, write_frame, ReaderJournalFlow, TransportHandles};
 use emit::{
     JournalEventPayload, JournalVoiceAnnouncement, JournalVoiceAnnouncementKind,
     SessionStatusPayload, SessionTitlePayload, EVT_AGENT_STATE, EVT_JOURNAL, EVT_SESSION_STATUS,
@@ -52,27 +52,28 @@ use emit::{
 ///
 /// ## Windows agent resolution
 ///
-/// The bundled `t-hub-agent` is installed to `~/.local/bin/t-hub-agent`
-/// inside the distro. A bare `wsl.exe -d <distro> -- t-hub-agent` runs a
-/// **non-login, non-interactive** shell, so the user's profile is never sourced
-/// and `~/.local/bin` is *not* on `PATH` — the spawn fails and no live WSL
-/// health / agent state ever reaches the sidebar. To make resolution robust we
-/// launch through a **login shell** (`bash -lc`), which sources the profile and
-/// puts `~/.local/bin` on `PATH`:
+/// The bundled `t-hub-agent` is installed to
+/// `~/.local/lib/t-hub/agents/<sha256>/t-hub-agent` inside the distro.
+/// The packaged app deploys and hash-verifies that exact versioned path before
+/// connecting.
+/// Different packaged builds therefore cannot replace one another's verified
+/// helper while running side by side.
+/// The bridge executes the verified path directly without a shell or `PATH`
+/// lookup:
 ///
 /// ```text
-/// wsl.exe -d <distro> --cd ~ -e bash -lc "exec t-hub-agent --stdio"
+/// wsl.exe -d <distro> --cd ~ -e \
+///     /home/<user>/.local/lib/t-hub/agents/<sha256>/t-hub-agent --stdio
 /// ```
 ///
-/// `exec` replaces the login shell with the agent so there's no extra process
-/// in the tree and stdio is wired straight through. The `--cd ~` lands the
-/// child in the user's home, matching the profile-relative `~/.local/bin`.
+/// `wsl.exe -e` executes the exact helper so stdio is wired straight through
+/// and no mutable shell expansion can change the attested executable.
 ///
-/// The `T_HUB_AGENT_BIN` escape hatch (honored here on Windows and in
-/// [`connection::spawn_child`] on every platform) bypasses the login-shell hop
-/// entirely: when set, its value is used **verbatim** as the program to spawn,
-/// so a developer can point the bridge at an arbitrary binary without touching
-/// PATH or the distro.
+/// The `T_HUB_AGENT_BIN` escape hatch is honored on unix, Windows dev builds,
+/// and in tests. It bypasses the login-shell hop entirely: when set, its value
+/// is used **verbatim** as the program to spawn, so a developer can point the
+/// bridge at an arbitrary binary without touching PATH or the distro. Packaged
+/// Windows builds ignore it and always launch the deployed, verified helper.
 ///
 /// Called by SUBAGENT(agent-bridge)'s transport when it spawns the child.
 fn direct_agent_argv(program: &str, journal_dir: Option<&str>) -> Vec<String> {
@@ -86,7 +87,11 @@ fn direct_agent_argv(program: &str, journal_dir: Option<&str>) -> Vec<String> {
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn windows_agent_argv(distro: &str, journal_dir: Option<&str>) -> Vec<String> {
+fn windows_agent_argv(
+    distro: &str,
+    verified_agent: &str,
+    journal_dir: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "wsl.exe".to_string(),
         "-d".to_string(),
@@ -94,25 +99,18 @@ fn windows_agent_argv(distro: &str, journal_dir: Option<&str>) -> Vec<String> {
         "--cd".to_string(),
         "~".to_string(),
         "-e".to_string(),
-        "bash".to_string(),
-        "-lc".to_string(),
+        verified_agent.to_string(),
     ];
     if let Some(dir) = journal_dir {
-        // The value is passed as a positional argument rather than interpolated
-        // into shell source, so spaces and shell metacharacters remain inert.
-        argv.extend([
-            "exec t-hub-agent --journal-dir \"$1\" --stdio".to_string(),
-            "t-hub-agent".to_string(),
-            dir.to_string(),
-        ]);
-    } else {
-        argv.push("exec t-hub-agent --stdio".to_string());
+        argv.push("--journal-dir".to_string());
+        argv.push(dir.to_string());
     }
+    argv.push("--stdio".to_string());
     argv
 }
 
 #[allow(dead_code)]
-pub fn launch_argv(distro: &str) -> Vec<String> {
+pub fn launch_argv(distro: &str, verified_agent: Option<&str>) -> Result<Vec<String>, String> {
     let journal_dir = std::env::var("T_HUB_AGENT_JOURNAL_DIR")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -121,26 +119,37 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         // Escape hatch: if T_HUB_AGENT_BIN is set, spawn it verbatim (no
         // wsl.exe / login-shell hop). This keeps the override usable on Windows
         // where it would otherwise be misapplied as wsl.exe's argv[0].
-        if let Some(bin) = std::env::var("T_HUB_AGENT_BIN")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            return direct_agent_argv(&bin, journal_dir.as_deref());
+        if let Some(bin) = agent_bin_override() {
+            return Ok(direct_agent_argv(&bin, journal_dir.as_deref()));
         }
-        // Login shell so the user's profile is sourced and `~/.local/bin`
-        // (where the orchestrator installs the agent) is on PATH. `exec` so the
-        // agent replaces the shell rather than running as a child of it. `-e`
-        // makes wsl.exe exec bash DIRECTLY — a bare `--` routes the command through
-        // the user's DEFAULT login shell (zsh here), NOT bash (see the note on
-        // tmux.rs::pane_info_command). bash's login PATH also has ~/.local/bin, so
-        // the agent still resolves; `-e` just keeps us in the shell we intend.
-        windows_agent_argv(distro, journal_dir.as_deref())
+        let verified_agent = verified_agent.ok_or_else(|| {
+            "verified digest-versioned WSL helper path is unavailable".to_string()
+        })?;
+        Ok(windows_agent_argv(
+            distro,
+            verified_agent,
+            journal_dir.as_deref(),
+        ))
     }
     #[cfg(unix)]
     {
         let _ = distro; // distro is irrelevant when launching directly.
         let _ = journal_dir; // inherited env resolves a relative path against HOME.
-        direct_agent_argv("t-hub-agent", None)
+        let _ = verified_agent;
+        Ok(direct_agent_argv("t-hub-agent", None))
+    }
+}
+
+pub(crate) fn agent_bin_override() -> Option<String> {
+    #[cfg(any(not(windows), test, feature = "devbuild"))]
+    {
+        std::env::var("T_HUB_AGENT_BIN")
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(all(windows, not(test), not(feature = "devbuild")))]
+    {
+        None
     }
 }
 
@@ -184,6 +193,10 @@ impl Drop for TestEnvVar {
 }
 
 struct BridgeInner {
+    /// Serializes connection lifecycle changes so superseded attempts cannot
+    /// publish state for a newer transport.
+    lifecycle: Mutex<()>,
+    bundled_agent: Mutex<Option<std::path::PathBuf>>,
     /// The supervision reducer, fed by incoming journal events. Shared so the
     /// supervision Tauri commands can read snapshots without a round-trip.
     supervisor: Mutex<Supervisor>,
@@ -193,6 +206,10 @@ struct BridgeInner {
     /// Highest journal sequence the core has durably consumed (the replay
     /// cursor). Advanced as entries arrive; persisted by workstream G later.
     journal_cursor: Mutex<u64>,
+    /// Cold-start replay rebuilds backend authority without forwarding every
+    /// historical event into the webview. The latest title/status plus the set
+    /// of affected sessions are flushed once after ReplayComplete.
+    replay_accumulator: Mutex<ReplayAccumulator>,
     /// Live transport handles (stdin writer + correlation map). `None` when
     /// disconnected. Set by `connect()`, read by `request()`.
     transport: Mutex<Option<Arc<TransportHandles>>>,
@@ -213,6 +230,13 @@ struct BridgeInner {
     /// orchestrator. `None` pre-setup and under unit tests (then a no-op). Kept
     /// trait-free (a boxed closure) so the `agent` module needs no fleet types.
     status_observer: Mutex<Option<StatusObserver>>,
+}
+
+#[derive(Default)]
+struct ReplayAccumulator {
+    sessions: BTreeSet<String>,
+    status_sessions: BTreeSet<String>,
+    titles: BTreeMap<String, SessionTitlePayload>,
 }
 
 /// A callback fired on every session status emit: `(session_uuid, status)`. The
@@ -282,9 +306,12 @@ impl Default for AgentBridge {
     fn default() -> Self {
         let bridge = Self {
             inner: Arc::new(BridgeInner {
+                lifecycle: Mutex::new(()),
+                bundled_agent: Mutex::new(None),
                 supervisor: Mutex::new(Supervisor::new()),
                 state: Mutex::new(ConnectionState::Disconnected),
                 journal_cursor: Mutex::new(0),
+                replay_accumulator: Mutex::new(ReplayAccumulator::default()),
                 transport: Mutex::new(None),
                 emitter: Mutex::new(None),
                 status: Mutex::new(None),
@@ -299,6 +326,21 @@ impl Default for AgentBridge {
 impl AgentBridge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_bundled_agent_path(&self, path: Option<std::path::PathBuf>) {
+        *self.inner.bundled_agent.lock() = path;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn deploy_packaged_agent(&self, distro: &str) -> Result<DeployedAgent, String> {
+        let resource = self
+            .inner
+            .bundled_agent
+            .lock()
+            .clone()
+            .ok_or_else(|| "bundled WSL helper resource path is unavailable".to_string())?;
+        deploy_bundled_agent(distro, &resource).map_err(|error| format!("{error:#}"))
     }
 
     /// Current connection state (for the UI health area / diagnostics).
@@ -384,21 +426,110 @@ impl AgentBridge {
     /// Spawns the child from [`launch_argv`] with piped stdin/stdout (stderr
     /// inherited). Starts a reader thread that dispatches incoming
     /// [`t_hub_protocol::AgentToCore`] frames. Sends `Hello`, waits for
-    /// `Ready`, and if the agent's `journal_head_seq` is ahead of our cursor,
-    /// sends `ReplayJournal` and waits for `ReplayComplete` before setting the
-    /// state to `Live`.
+    /// `Ready`, verifies the exact protocol version, and if the agent's
+    /// `journal_head_seq` is ahead of our cursor, sends `ReplayJournal`.
+    /// Replayed state remains buffered until a durable `ReplayBoundary` and
+    /// matching `ReplayComplete` reach at least the advertised head, after
+    /// which the buffered entries are committed and the state becomes `Live`.
     ///
-    /// The `T_HUB_AGENT_BIN` env var overrides argv[0] for tests / dev
-    /// (see [`connection::spawn_child`]).
+    /// The `T_HUB_AGENT_BIN` developer escape hatch is limited to Windows dev
+    /// builds and tests, and overrides the child program on unix (see
+    /// [`launch_argv`] and [`connection::spawn_child`]).
     pub fn connect(&self, distro: &str) -> Result<(), String> {
+        self.connect_with_timeouts(
+            distro,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    fn connect_with_timeouts(
+        &self,
+        distro: &str,
+        ready_timeout: std::time::Duration,
+        replay_timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let _lifecycle = self.inner.lifecycle.lock();
+        self.connect_locked(distro, ready_timeout, replay_timeout)
+    }
+
+    fn connect_locked(
+        &self,
+        distro: &str,
+        ready_timeout: std::time::Duration,
+        replay_timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        if self.inner.transport.lock().is_some() {
+            return Err("agent bridge already connected".to_string());
+        }
+
+        #[cfg(windows)]
+        let verified_agent = if agent_bin_override().is_none() {
+            match self.deploy_packaged_agent(distro) {
+                Ok(deployed) => {
+                    match deployed.outcome {
+                        DeployOutcome::AlreadyCurrent => {
+                            eprintln!("t-hub: bundled WSL helper verified ({})", deployed.wsl_path);
+                        }
+                        DeployOutcome::Installed => {
+                            eprintln!(
+                                "t-hub: installed and verified bundled WSL helper ({})",
+                                deployed.wsl_path
+                            );
+                        }
+                    }
+                    Some(deployed.wsl_path)
+                }
+                Err(error) => {
+                    self.set_state(ConnectionState::Failed);
+                    return Err(format!(
+                        "bundled WSL helper deployment failed; refusing to connect with an \
+                         unverified helper: {error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let verified_agent: Option<String> = None;
+
         // Build argv and spawn child.
-        let argv = launch_argv(distro);
-        let mut child = spawn_child(argv).map_err(|e| format!("failed to spawn agent: {e}"))?;
+        let argv = match launch_argv(distro, verified_agent.as_deref()) {
+            Ok(argv) => argv,
+            Err(error) => {
+                self.set_state(ConnectionState::Failed);
+                return Err(error);
+            }
+        };
+        let mut child = match spawn_child(argv) {
+            Ok(child) => child,
+            Err(error) => {
+                self.set_state(ConnectionState::Failed);
+                return Err(format!("failed to spawn agent: {error}"));
+            }
+        };
 
         // Take ownership of the stdio handles before the child handle moves
         // into TransportHandles.
-        let child_stdin = child.stdin.take().ok_or("child has no stdin pipe")?;
-        let child_stdout = child.stdout.take().ok_or("child has no stdout pipe")?;
+        let child_stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_state(ConnectionState::Failed);
+                return Err("child has no stdin pipe".to_string());
+            }
+        };
+        let child_stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_state(ConnectionState::Failed);
+                return Err("child has no stdout pipe".to_string());
+            }
+        };
 
         // Build the shared correlation map and next-id counter.
         let pending = Arc::new(connection::CorrelationMap::new(
@@ -406,27 +537,37 @@ impl AgentBridge {
         ));
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
+        // One-shot channels for the handshake/replay synchronisation.
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (replay_done_tx, replay_done_rx) = mpsc::channel::<Result<u64, String>>();
+        let journal_flow = ReaderJournalFlow::new();
+
+        let reader = match spawn_reader(
+            child_stdout,
+            Arc::clone(&pending),
+            self.clone(),
+            Arc::clone(&journal_flow),
+            ready_tx,
+            replay_done_tx,
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_state(ConnectionState::Failed);
+                return Err(format!("failed to spawn agent reader: {error}"));
+            }
+        };
+
         // Build transport handles (Arc so request() can clone a reference).
         let handles = Arc::new(TransportHandles {
             stdin: Mutex::new(child_stdin),
             pending: Arc::clone(&pending),
             next_id: Arc::clone(&next_id),
             child: Mutex::new(child),
+            journal_flow: Arc::clone(&journal_flow),
+            reader: Mutex::new(Some(reader)),
         });
-
-        // One-shot channels for the handshake/replay synchronisation.
-        let (ready_tx, ready_rx) = mpsc::channel::<u64>();
-        let (replay_done_tx, replay_done_rx) = mpsc::channel::<u64>();
-
-        // Spawn the reader thread.  It captures a clone of `self` (AgentBridge
-        // is Clone/Arc-backed) so it can call consume_journal_entry.
-        spawn_reader(
-            child_stdout,
-            Arc::clone(&pending),
-            self.clone(),
-            ready_tx,
-            replay_done_tx,
-        );
 
         // Set state and store transport handles.
         self.set_state(ConnectionState::Handshaking);
@@ -441,48 +582,166 @@ impl AgentBridge {
                     core_version: format!("t-hub {}", env!("CARGO_PKG_VERSION")),
                 }),
             };
-            let mut stdin_guard = handles.stdin.lock();
-            write_frame(&mut *stdin_guard, &hello)
-                .map_err(|e| format!("failed to write Hello: {e}"))?;
+            let write_result = {
+                let mut stdin_guard = handles.stdin.lock();
+                write_frame(&mut *stdin_guard, &hello)
+            };
+            if let Err(error) = write_result {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("failed to write Hello: {error}"),
+                ));
+            }
         }
 
         // Wait for Ready (10 s timeout). On failure, mark Failed (and emit) so
         // the UI shows the dead connection rather than a stuck "handshaking".
-        let journal_head_seq = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(seq) => seq,
+        let ready = match ready_rx.recv_timeout(ready_timeout) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("agent handshake failed: {error}"),
+                ));
+            }
             Err(_) => {
-                self.set_state(ConnectionState::Failed);
-                return Err("timed out waiting for Ready from agent".to_string());
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    "timed out waiting for Ready from agent".to_string(),
+                ));
             }
         };
+        if ready.protocol_version != PROTOCOL_VERSION {
+            return Err(self.fail_connection(
+                &handles,
+                &journal_flow,
+                format!(
+                    "agent protocol version mismatch: expected {PROTOCOL_VERSION}, received {}",
+                    ready.protocol_version
+                ),
+            ));
+        }
+        let journal_head_seq = ready.journal_head_seq;
 
         // If the agent has journal entries we haven't consumed, request replay.
         let cursor = self.journal_cursor();
-        if journal_head_seq > cursor {
+        let replayed = journal_head_seq > cursor;
+        if replayed {
+            if let Err(error) = journal_flow.begin_replay(cursor) {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("invalid journal replay start: {error}"),
+                ));
+            }
             self.set_state(ConnectionState::Replaying);
 
             let replay_frame = CoreFrame {
                 channel: Channel::Control,
                 msg: CoreToAgent::ReplayJournal { after_seq: cursor },
             };
-            {
+            let write_result = {
                 let mut stdin_guard = handles.stdin.lock();
                 write_frame(&mut *stdin_guard, &replay_frame)
-                    .map_err(|e| format!("failed to write ReplayJournal: {e}"))?;
+            };
+            if let Err(error) = write_result {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("failed to write ReplayJournal: {error}"),
+                ));
             }
 
-            // Wait for ReplayComplete (30 s — replay can be large).
-            if replay_done_rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .is_err()
-            {
-                self.set_state(ConnectionState::Failed);
-                return Err("timed out waiting for ReplayComplete from agent".to_string());
+            match replay_done_rx.recv_timeout(replay_timeout) {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return Err(self.fail_connection(
+                        &handles,
+                        &journal_flow,
+                        format!("incomplete journal replay: {error}"),
+                    ));
+                }
+                Err(_) => {
+                    return Err(self.fail_connection(
+                        &handles,
+                        &journal_flow,
+                        "timed out waiting for ReplayComplete from agent".to_string(),
+                    ));
+                }
             }
+            if let Err(error) = journal_flow.complete_replay(self, journal_head_seq) {
+                return Err(self.fail_connection(
+                    &handles,
+                    &journal_flow,
+                    format!("invalid journal replay: {error}"),
+                ));
+            }
+        } else if let Err(error) = journal_flow.complete_without_replay(self) {
+            return Err(self.fail_connection(
+                &handles,
+                &journal_flow,
+                format!("invalid agent handshake completion: {error}"),
+            ));
         }
 
-        self.set_state(ConnectionState::Live);
         Ok(())
+    }
+
+    fn fail_connection(
+        &self,
+        handles: &Arc<TransportHandles>,
+        journal_flow: &ReaderJournalFlow,
+        error: String,
+    ) -> String {
+        journal_flow.cancel();
+        let was_current = {
+            let mut transport = self.inner.transport.lock();
+            if transport
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, handles))
+            {
+                transport.take();
+                true
+            } else {
+                false
+            }
+        };
+        handles.shutdown();
+        if was_current {
+            self.set_state(ConnectionState::Failed);
+        }
+        error
+    }
+
+    fn fail_reader_transport(&self, journal_flow: &Arc<ReaderJournalFlow>, error: &str) {
+        journal_flow.retire();
+        let handles = {
+            let mut transport = self.inner.transport.lock();
+            if transport
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.journal_flow, journal_flow))
+            {
+                transport.take()
+            } else {
+                None
+            }
+        };
+        let Some(handles) = handles else {
+            return;
+        };
+
+        handles.pending.lock().clear();
+        {
+            let mut child = handles.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(handles.reader.lock().take());
+        self.set_state(ConnectionState::Failed);
+        eprintln!("agent-bridge: live transport failed closed: {error}");
     }
 
     /// Tear down the live connection so a fresh [`connect`](Self::connect) can't
@@ -499,21 +758,15 @@ impl AgentBridge {
     ///      `Sender` wakes its blocked `request()` caller right away (its
     ///      `recv_timeout` returns `Err` instead of hanging the full 10 s), so no
     ///      in-flight sender is orphaned waiting on a reply that can never come.
-    ///   3. **Kill the child** (`Child::kill`). Closing its stdout is what makes
-    ///      the detached `agent-reader` thread hit EOF and exit — that's how the
-    ///      old reader thread is reclaimed. `spawn_reader` returns no `JoinHandle`
-    ///      (the thread is detached and self-terminating on EOF), so we cannot
-    ///      `join()` it; killing the child is the deterministic teardown signal.
-    ///      We then `wait()` to reap the zombie.
-    ///
-    /// LIMITATION: the reader thread is detached, so we can't *block* until it has
-    /// fully unwound — we kill the child (its EOF trigger) and rely on it exiting
-    /// promptly. In practice it returns from `BufReader::lines()` the moment stdout
-    /// closes. Because each `connect()` builds a brand-new `pending` map + reader
-    /// thread (nothing is shared with the previous connection), a not-yet-exited
-    /// old reader can only touch its OWN now-empty map — it can't corrupt the new
-    /// connection's state.
+    ///   3. **Retire the reader flow, kill and reap the child, then join the
+    ///      reader thread.** A replacement transport is not published until the
+    ///      old reader can no longer mutate the shared reducer or journal cursor.
     pub fn disconnect(&self) {
+        let _lifecycle = self.inner.lifecycle.lock();
+        self.disconnect_locked();
+    }
+
+    fn disconnect_locked(&self) {
         // 1. Detach the live transport so new requests can't use it.
         let old = self.inner.transport.lock().take();
         let Some(handles) = old else {
@@ -522,18 +775,7 @@ impl AgentBridge {
             return;
         };
 
-        // 2. Clear pending correlations: dropping the senders unblocks any waiting
-        //    request() callers (recv_timeout -> Err) instead of orphaning them.
-        handles.pending.lock().clear();
-
-        // 3. Kill + reap the child so its stdout closes and the detached reader
-        //    thread hits EOF and exits. Best-effort: a kill on an already-dead
-        //    child is a benign error.
-        {
-            let mut child = handles.child.lock();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        handles.shutdown();
 
         // Drop this Arc reference. If a concurrent request() still holds a clone,
         // the struct's memory outlives this call, but the child is already killed
@@ -553,8 +795,13 @@ impl AgentBridge {
     /// fresh handshake only replays entries newer than what we already consumed
     /// (no duplicate ingestion).
     pub fn reconnect(&self, distro: &str) -> Result<(), String> {
-        self.disconnect();
-        self.connect(distro)
+        let _lifecycle = self.inner.lifecycle.lock();
+        self.disconnect_locked();
+        self.connect_locked(
+            distro,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
     }
 
     /// Send a request and await its correlated response (blocking, 10 s timeout).
@@ -767,18 +1014,22 @@ impl AgentBridge {
         map_terminal_snapshot_response(response)
     }
 
-    /// Consume one journal entry: advance the cursor, feed supervision, emit the
-    /// live UI events, and return the affected session id.
+    /// Consume one journal entry: advance the cursor, feed supervision, publish
+    /// live UI events or accumulate replay state, and return the affected session
+    /// id.
     ///
     /// This is the core's single ingestion point for the spine. It is where the
-    /// previously-missing **live emit** happens — when an entry is consumed it
-    /// now fans out:
+    /// previously-missing **live emit** happens. A live entry fans out:
     ///   - `agent://journal` (the entry, forwarded verbatim);
     ///   - `agent://state` (if the cursor advanced — the health area shows it);
     ///   - `supervision://tree` + `session://status` (for the affected session,
     ///     after the supervision reducer has updated);
     ///   - `status://snapshot` (when the entry is a `StatusSnapshot`, routed
     ///     through the status bridge if one is wired).
+    ///
+    /// Replayed entries reconstruct authority without forwarding historical
+    /// `agent://journal` events. [`AgentBridge::flush_replay`] publishes one
+    /// bounded final state snapshot per affected session after replay commits.
     ///
     /// All emission is best-effort and a no-op before [`AgentBridge::set_emitter`]
     /// (so the unit tests that call this directly still pass). Returns the
@@ -815,20 +1066,25 @@ impl AgentBridge {
             entry.event_type,
             t_hub_protocol::JournalEventType::StatusSnapshot
         ) {
-            self.ingest_status_from_journal(entry);
+            let affected = self.ingest_status_from_journal(entry, !replayed);
+            if replayed {
+                if let Some(session_id) = affected.as_deref() {
+                    self.inner
+                        .replay_accumulator
+                        .lock()
+                        .status_sessions
+                        .insert(session_id.to_string());
+                }
+            }
             // Return the entry's own session id for callers/tests; no tree/status
             // emit (the reducer status is unchanged by a status snapshot).
-            return entry.entity_id.clone().or_else(|| {
-                entry
-                    .payload
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
+            return affected;
         }
 
         // 1. The replay cursor moved, so the health area's journalCursor changed.
-        self.emit_agent_state();
+        if !replayed {
+            self.emit_agent_state();
+        }
 
         // NOTE: StatusSnapshot entries never reach here — they are short-circuited
         // at the top of this method onto a dedicated minimal path (status bridge +
@@ -840,7 +1096,17 @@ impl AgentBridge {
         //     Legacy entries that already contain a prompt remain readable.
         //     Carries `cwd` so the frontend can correlate the Claude session id
         //     to a T-Hub terminal.
-        self.emit_session_title(entry);
+        if let Some(title) = self.session_title_payload(entry) {
+            if replayed {
+                self.inner
+                    .replay_accumulator
+                    .lock()
+                    .titles
+                    .insert(title.session_id.clone(), title);
+            } else {
+                self.inner.emit(EVT_TITLE, &title);
+            }
+        }
 
         // 4. Feed the supervision reducer. Pull the subagent base fields out of
         //    the payload (hooks put `agent_id` / `agent_type` in stdin inside
@@ -859,7 +1125,9 @@ impl AgentBridge {
             .payload
             .get("notification_type")
             .and_then(|v| v.as_str());
-        let previous_status = session_id.map(|sid| self.with_supervisor(|s| s.status(sid)));
+        let previous_status = (!replayed)
+            .then(|| session_id.map(|sid| self.with_supervisor(|s| s.status(sid))))
+            .flatten();
 
         // Structured provider lifecycle events carry the exact tmux binding.
         // Feed that binding into the existing session-to-terminal authority so
@@ -868,6 +1136,13 @@ impl AgentBridge {
             if let (Some(sid), Some(status_bridge)) = (session_id, self.inner.status.lock().clone())
             {
                 status_bridge.ingest(sid, &entry.payload, entry.timestamp_ms);
+                if replayed {
+                    self.inner
+                        .replay_accumulator
+                        .lock()
+                        .status_sessions
+                        .insert(sid.to_string());
+                }
             }
         }
 
@@ -882,6 +1157,27 @@ impl AgentBridge {
                 Some(&entry.payload),
             )
         });
+
+        if replayed {
+            if let Some(session_id) = affected.as_deref().or(session_id) {
+                self.inner
+                    .replay_accumulator
+                    .lock()
+                    .sessions
+                    .insert(session_id.to_string());
+            }
+            if matches!(
+                entry.event_type,
+                t_hub_protocol::JournalEventType::SessionEnd
+            ) {
+                if let (Some(sid), Some(status_bridge)) =
+                    (session_id, self.inner.status.lock().clone())
+                {
+                    status_bridge.evict(sid);
+                }
+            }
+            return affected;
+        }
 
         // Emit the committed journal entry only after its exact reducer result
         // is known. Voice consumes this correlated authority instead of racing a
@@ -984,42 +1280,37 @@ impl AgentBridge {
     /// `agent://title` for the session (GOAL NAMES). No-op for entries that carry
     /// no usable title signal, or that have no session id. Best-effort + behind
     /// the optional emitter, like every other emit on this path.
-    fn emit_session_title(&self, entry: &EventJournalEntry) {
+    fn session_title_payload(&self, entry: &EventJournalEntry) -> Option<SessionTitlePayload> {
         let session_id = entry
             .entity_id
             .as_deref()
             .or_else(|| entry.payload.get("session_id").and_then(|v| v.as_str()));
-        let Some(sid) = session_id else { return };
-        let Some(title) = derive_session_title(entry.event_type, &entry.payload) else {
-            return;
-        };
+        let sid = session_id?;
+        let title = derive_session_title(entry.event_type, &entry.payload)?;
         let cwd = entry
             .payload
             .get("cwd")
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned());
-        self.inner.emit(
-            EVT_TITLE,
-            &SessionTitlePayload {
-                session_id: sid.to_string(),
-                cwd,
-                title,
-            },
-        );
+        Some(SessionTitlePayload {
+            session_id: sid.to_string(),
+            cwd,
+            title,
+        })
     }
 
     /// Route a `StatusSnapshot` journal entry into the status bridge (if wired)
     /// and emit `status://snapshot`. The payload carries the raw statusline JSON
     /// (the hook/agent put it there); we ingest it under the entry's session id.
-    fn ingest_status_from_journal(&self, entry: &EventJournalEntry) {
+    fn ingest_status_from_journal(&self, entry: &EventJournalEntry, emit: bool) -> Option<String> {
         let Some(status_bridge) = self.inner.status.lock().clone() else {
-            return; // no status bridge wired (pre-setup / tests)
+            return None; // no status bridge wired (pre-setup / tests)
         };
         let session_id = entry
             .entity_id
             .as_deref()
             .or_else(|| entry.payload.get("session_id").and_then(|v| v.as_str()));
-        let Some(sid) = session_id else { return };
+        let sid = session_id?;
         // The raw statusline lives under `payload.status` when the agent wraps it;
         // fall back to the whole payload for forward-compat.
         let raw = entry.payload.get("status").unwrap_or(&entry.payload);
@@ -1032,8 +1323,36 @@ impl AgentBridge {
         // just skip the redundant emit.
         let prev = status_bridge.get(sid);
         let snap = status_bridge.ingest(sid, raw, entry.timestamp_ms);
-        if prev.as_ref().is_none_or(|p| !p.same_status(&snap)) {
+        if emit && prev.as_ref().is_none_or(|p| !p.same_status(&snap)) {
             self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
+        }
+        Some(sid.to_string())
+    }
+
+    /// Publish one bounded summary after a cold journal replay.
+    ///
+    /// The reducer and status bridge consume every durable entry so authority is
+    /// reconstructed exactly, but forwarding each historical transition into
+    /// the webview can produce hundreds of thousands of events. Replay therefore
+    /// records only the latest title/status and the affected session ids, then
+    /// flushes one final snapshot of each after ReplayComplete.
+    fn flush_replay(&self) {
+        let replay = std::mem::take(&mut *self.inner.replay_accumulator.lock());
+
+        for title in replay.titles.into_values() {
+            self.inner.emit(EVT_TITLE, &title);
+        }
+
+        if let Some(status_bridge) = self.inner.status.lock().clone() {
+            for session_id in replay.status_sessions {
+                if let Some(snapshot) = status_bridge.get(&session_id) {
+                    self.inner.emit(EVT_STATUS_SNAPSHOT, &snapshot);
+                }
+            }
+        }
+
+        for session_id in replay.sessions {
+            self.emit_session(&session_id);
         }
     }
 }
@@ -1229,14 +1548,15 @@ mod tests {
     fn launch_argv_shape() {
         #[cfg(unix)]
         {
-            let argv = launch_argv("Ubuntu-24.04");
+            let argv = launch_argv("Ubuntu-24.04", None).unwrap();
             assert_eq!(argv, vec!["t-hub-agent", "--stdio"]);
         }
         #[cfg(windows)]
         {
-            // Default Windows path: a login shell so `~/.local/bin` is on PATH.
+            // Default Windows path: execute the deployed helper directly.
             std::env::remove_var("T_HUB_AGENT_BIN");
-            let argv = launch_argv("Ubuntu-24.04");
+            let verified = "/home/natkins/.local/lib/t-hub/agents/0123456789abcdef/t-hub-agent";
+            let argv = launch_argv("Ubuntu-24.04", Some(verified)).unwrap();
             assert_eq!(
                 argv,
                 vec![
@@ -1246,15 +1566,14 @@ mod tests {
                     "--cd",
                     "~",
                     "-e",
-                    "bash",
-                    "-lc",
-                    "exec t-hub-agent --stdio",
+                    verified,
+                    "--stdio",
                 ]
             );
 
             // Escape hatch: T_HUB_AGENT_BIN is spawned verbatim (no wsl.exe).
             std::env::set_var("T_HUB_AGENT_BIN", "C:/tmp/t-hub-agent.exe");
-            let argv = launch_argv("Ubuntu-24.04");
+            let argv = launch_argv("Ubuntu-24.04", None).unwrap();
             assert_eq!(argv, vec!["C:/tmp/t-hub-agent.exe", "--stdio"]);
             std::env::remove_var("T_HUB_AGENT_BIN");
         }
@@ -1271,8 +1590,9 @@ mod tests {
                 "--stdio",
             ]
         );
+        let verified = "/home/natkins/.local/lib/t-hub/agents/0123456789abcdef/t-hub-agent";
         assert_eq!(
-            windows_agent_argv("Ubuntu-24.04", Some(".t-hub-dev/journal dir")),
+            windows_agent_argv("Ubuntu-24.04", verified, Some(".t-hub-dev/journal dir")),
             vec![
                 "wsl.exe",
                 "-d",
@@ -1280,11 +1600,10 @@ mod tests {
                 "--cd",
                 "~",
                 "-e",
-                "bash",
-                "-lc",
-                "exec t-hub-agent --journal-dir \"$1\" --stdio",
-                "t-hub-agent",
+                verified,
+                "--journal-dir",
                 ".t-hub-dev/journal dir",
+                "--stdio",
             ]
         );
     }
@@ -1299,6 +1618,729 @@ mod tests {
             classify_request_receive_error(9, mpsc::RecvTimeoutError::Disconnected),
             AgentRequestError::Disconnected(message) if message.contains("id=9")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ready_timeout_terminates_helper_and_discards_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-stalled-agent-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("stalled-agent");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$T_HUB_TEST_PID_FILE\"\nwhile IFS= read -r _; do :; done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        let error = bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap_err();
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(error.contains("timed out waiting for Ready"));
+        assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert!(bridge.inner.transport.lock().is_none());
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "stalled helper process {pid} survived the failed handshake"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_replay_terminates_helper_and_fails_connection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-incomplete-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("incomplete-replay-agent");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":10}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"replay_complete","last_seq":10}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        let result = bridge.connect_with_timeouts(
+            "ignored",
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        );
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if result.is_ok() {
+            bridge.disconnect();
+        }
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("incomplete journal replay"));
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "incomplete replay helper process {pid} survived the failed handshake"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compacted_replay_boundary_advances_cursor_without_event() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-compacted-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("compacted-replay-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":10}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"replay_boundary","last_seq":10}}'
+printf '%s\n' '{{"channel":"events","type":"replay_complete","last_seq":10}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap();
+        assert_eq!(bridge.state(), ConnectionState::Live);
+        assert_eq!(bridge.journal_cursor(), 10);
+        bridge.disconnect();
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_accepts_growth_after_ready_and_deduplicates_live_frames() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-growing-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("growing-replay-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"journal","seq":2,"entry":{{"seq":2,"timestamp_ms":2,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Recovered two"}}}},"replayed":false}}'
+printf '%s\n' '{{"channel":"events","type":"journal","seq":1,"entry":{{"seq":1,"timestamp_ms":1,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Recovered one"}}}},"replayed":true}}'
+printf '%s\n' '{{"channel":"events","type":"journal","seq":2,"entry":{{"seq":2,"timestamp_ms":2,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Recovered two"}}}},"replayed":true}}'
+printf '%s\n' '{{"channel":"events","type":"journal","seq":3,"entry":{{"seq":3,"timestamp_ms":3,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Live three"}}}},"replayed":false}}'
+printf '%s\n' '{{"channel":"events","type":"replay_boundary","last_seq":2}}'
+printf '%s\n' '{{"channel":"events","type":"replay_complete","last_seq":2}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap();
+
+        let titles = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::EVT_TITLE)
+            .map(|(_, payload)| payload["title"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["Recovered two", "Live three"]);
+        assert_eq!(bridge.state(), ConnectionState::Live);
+        assert_eq!(bridge.journal_cursor(), 3);
+        bridge.disconnect();
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_stdout_close_fails_the_live_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-agent-eof-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("closing-agent");
+        let close_file = temp_dir.join("close");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+while [ ! -e "$T_HUB_TEST_CLOSE_FILE" ]; do sleep 0.01; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let close_file_env = TestEnvVar::set("T_HUB_TEST_CLOSE_FILE", &close_file);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(bridge.state(), ConnectionState::Live);
+
+        std::fs::write(&close_file, b"close").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bridge.state() == ConnectionState::Live && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if has_transport {
+            bridge.disconnect();
+        }
+        drop(pid_file_env);
+        drop(close_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "closed helper process {pid} survived reader teardown"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsolicited_ready_then_exit_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-early-ready-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("early-ready-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        let _connect_result = bridge.connect_with_timeouts(
+            "ignored",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bridge.state() != ConnectionState::Failed && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if has_transport {
+            bridge.disconnect();
+        }
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_only_frame_after_completion_fails_the_live_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-late-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("late-replay-agent");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"journal","seq":1,"entry":{{"seq":1,"timestamp_ms":1,"source":"agent","entity_id":"verified-session","event_type":"user_prompt_submit","payload":{{"session_id":"verified-session","prompt":"Verified"}}}},"replayed":true}}'
+printf '%s\n' '{{"channel":"events","type":"replay_boundary","last_seq":1}}'
+printf '%s\n' '{{"channel":"events","type":"replay_complete","last_seq":1}}'
+sleep 0.1
+printf '%s\n' '{{"channel":"events","type":"journal","seq":2,"entry":{{"seq":2,"timestamp_ms":2,"source":"agent","entity_id":"injected-session","event_type":"user_prompt_submit","payload":{{"session_id":"injected-session","prompt":"Must not commit"}}}},"replayed":true}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while bridge.state() == ConnectionState::Live && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = bridge.state();
+        let cursor = bridge.journal_cursor();
+        let injected = bridge
+            .with_supervisor(|supervisor| supervisor.tree("injected-session"))
+            .is_some();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if has_transport {
+            bridge.disconnect();
+        }
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(state, ConnectionState::Failed);
+        assert_eq!(cursor, 1);
+        assert!(!injected);
+        assert!(!has_transport);
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "protocol-violating helper process {pid} survived transport failure"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protocol_mismatch_terminates_helper_and_fails_connection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-protocol-mismatch-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("protocol-mismatch-agent");
+        let pid_file = temp_dir.join("pid");
+        let incompatible_version = PROTOCOL_VERSION.saturating_add(1);
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{incompatible_version},"agent_version":"test","journal_head_seq":0}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        let result = bridge.connect_with_timeouts(
+            "ignored",
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        );
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if result.is_ok() {
+            bridge.disconnect();
+        }
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("agent protocol version mismatch"));
+        assert!(error.contains(&format!("expected {PROTOCOL_VERSION}")));
+        assert!(error.contains(&format!("received {incompatible_version}")));
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "protocol mismatch helper process {pid} survived the failed handshake"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_connects_publish_only_one_authoritative_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-concurrent-connect-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("concurrent-connect-agent");
+        let pid_file = temp_dir.join("pids");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$$" >> "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+sleep 0.2
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let attempts = (0..2)
+            .map(|_| {
+                let bridge = bridge.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    bridge.connect_with_timeouts(
+                        "ignored",
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(1),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect::<Vec<_>>();
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        bridge.disconnect();
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pids = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| error.contains("already connected"))
+                .count(),
+            1
+        );
+        assert_eq!(pids.len(), 1, "only one helper may be spawned: {pids:?}");
+        assert_eq!(state, ConnectionState::Live);
+        assert!(has_transport);
+        assert!(
+            pids.iter()
+                .all(|pid| !std::path::Path::new("/proc").join(pid).exists()),
+            "authoritative helper survived disconnect: {pids:?}"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_reconnect_discards_the_replacement_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-failed-reconnect-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("replacement-agent");
+        let attempts_file = temp_dir.join("attempts");
+        let pid_file = temp_dir.join("pids");
+        let incompatible_version = PROTOCOL_VERSION.saturating_add(1);
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$$" >> "$T_HUB_TEST_PID_FILE"
+attempts=0
+if [ -f "$T_HUB_TEST_ATTEMPTS_FILE" ]; then
+  attempts=$(cat "$T_HUB_TEST_ATTEMPTS_FILE")
+fi
+attempts=$((attempts + 1))
+printf '%s' "$attempts" > "$T_HUB_TEST_ATTEMPTS_FILE"
+IFS= read -r _
+if [ "$attempts" -eq 1 ]; then
+  printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":0}}'
+else
+  printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{incompatible_version},"agent_version":"test","journal_head_seq":0}}'
+fi
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let attempts_file_env = TestEnvVar::set("T_HUB_TEST_ATTEMPTS_FILE", &attempts_file);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(bridge.state(), ConnectionState::Live);
+
+        let error = bridge.reconnect("ignored").unwrap_err();
+        let state = bridge.state();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        drop(attempts_file_env);
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pids = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(error.contains("agent protocol version mismatch"));
+        assert_eq!(pids.len(), 2, "expected original and replacement helpers");
+        assert_eq!(state, ConnectionState::Failed);
+        assert!(!has_transport);
+        assert!(
+            pids.iter()
+                .all(|pid| !std::path::Path::new("/proc").join(pid).exists()),
+            "a helper survived the failed replacement: {pids:?}"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_frame_fails_an_active_journal_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-malformed-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("malformed-replay-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"journal","seq":1,"entry":{{"seq":1,"timestamp_ms":1,"source":"agent","entity_id":"failed-session","event_type":"user_prompt_submit","payload":{{"session_id":"failed-session","prompt":"Must not commit"}}}},"replayed":true}}'
+printf '%s\n' '{{malformed'
+printf '%s\n' '{{"channel":"control","type":"replay_boundary","last_seq":1}}'
+printf '%s\n' '{{"channel":"control","type":"replay_complete","last_seq":1}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        let error = bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        assert!(error.contains("incomplete journal replay: malformed agent frame"));
+        assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("failed-session"))
+            .is_none());
+        assert!(bridge.inner.transport.lock().is_none());
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 
     #[test]
@@ -1400,9 +2442,12 @@ mod tests {
         let env_lock = AGENT_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let journal = tempfile::tempdir().expect("create private agent journal");
         let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &agent_bin);
+        let journal_env = TestEnvVar::set("T_HUB_AGENT_JOURNAL_DIR", journal.path());
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("real agent must connect");
+        drop(journal_env);
         drop(agent_bin_env);
         drop(env_lock);
         let info = bridge
@@ -1608,6 +2653,7 @@ mod tests {
             &entry(2, "o1", None, JournalEventType::Elicitation),
             false,
         );
+        bridge.flush_replay();
 
         let journal_flags = rec
             .events
@@ -1618,9 +2664,366 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             journal_flags,
-            vec![true, false],
-            "a live tail frame interleaved before ReplayComplete stays live"
+            vec![false],
+            "historical replay stays silent while an interleaved live frame stays live"
         );
+    }
+
+    #[test]
+    fn cold_replay_coalesces_large_history_into_bounded_session_snapshots() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status));
+        rec.events.lock().clear();
+
+        let mut seq = 0;
+        for iteration in 0..2_000 {
+            seq += 1;
+            bridge.consume_journal_entry_with_provenance(
+                &EventJournalEntry {
+                    seq,
+                    timestamp_ms: seq,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "cwd": "/workspace/project",
+                        "prompt": format!("Replay prompt {iteration}")
+                    }),
+                    result: None,
+                },
+                true,
+            );
+            seq += 1;
+            bridge.consume_journal_entry_with_provenance(
+                &EventJournalEntry {
+                    seq,
+                    timestamp_ms: seq,
+                    source: JournalSource::Status,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::StatusSnapshot,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "status": {
+                            "context_window": {
+                                "used_percentage": iteration as f64 / 20.0
+                            }
+                        }
+                    }),
+                    result: None,
+                },
+                true,
+            );
+        }
+
+        assert!(
+            rec.events.lock().is_empty(),
+            "historical replay must not emit per-entry UI events"
+        );
+        assert_eq!(bridge.journal_cursor(), 4_000);
+
+        bridge.flush_replay();
+        let events = rec.events.lock().clone();
+        let channels = events
+            .iter()
+            .map(|(channel, _)| channel.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_TITLE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_STATUS_SNAPSHOT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_SESSION_STATUS)
+                .count(),
+            1
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .filter(|channel| **channel == super::EVT_JOURNAL)
+                .count(),
+            0
+        );
+        assert!(
+            events.len() <= 4,
+            "4,000 replay entries must coalesce to at most four UI events, got {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|(channel, _)| channel == super::EVT_TITLE)
+                .unwrap()
+                .1["title"],
+            "Replay prompt 1999"
+        );
+        assert_eq!(
+            status.get("session-1").unwrap().context_used_pct,
+            Some(99.95)
+        );
+    }
+
+    #[test]
+    fn replay_boundary_orders_historical_publication_before_buffered_live_frames() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(0).unwrap();
+
+        journal_flow
+            .ingest(
+                &bridge,
+                3,
+                EventJournalEntry {
+                    seq: 3,
+                    timestamp_ms: 3,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Live title"
+                    }),
+                    result: None,
+                },
+                false,
+            )
+            .unwrap();
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Recovered title"
+                    }),
+                    result: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(rec.events.lock().is_empty());
+
+        journal_flow.observe_replay_boundary(1).unwrap();
+        assert_eq!(journal_flow.finish_replay(1), Ok(1));
+        journal_flow.complete_replay(&bridge, 1).unwrap();
+
+        let titles = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::EVT_TITLE)
+            .map(|(_, payload)| payload["title"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["Recovered title", "Live title"]);
+        assert_eq!(bridge.journal_cursor(), 3);
+        assert_eq!(bridge.state(), ConnectionState::Live);
+    }
+
+    #[test]
+    fn replay_buffers_all_effects_until_verification() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(0).unwrap();
+
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Recovered title"
+                    }),
+                    result: None,
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(rec.events.lock().is_empty());
+
+        journal_flow
+            .ingest(
+                &bridge,
+                2,
+                EventJournalEntry {
+                    seq: 2,
+                    timestamp_ms: 2,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Live title"
+                    }),
+                    result: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("session-1"))
+            .is_none());
+
+        journal_flow.observe_replay_boundary(1).unwrap();
+        assert_eq!(journal_flow.finish_replay(1), Ok(1));
+        journal_flow.complete_replay(&bridge, 1).unwrap();
+
+        let titles = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::EVT_TITLE)
+            .map(|(_, payload)| payload["title"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["Recovered title", "Live title"]);
+        assert_eq!(bridge.journal_cursor(), 2);
+    }
+
+    #[test]
+    fn cancelled_replay_cannot_publish_or_restore_live_state() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(0).unwrap();
+        bridge.set_state(ConnectionState::Replaying);
+
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Recovered title"
+                    }),
+                    result: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert!(journal_flow.cancel());
+        bridge.set_state(ConnectionState::Failed);
+        assert!(journal_flow.complete_replay(&bridge, 1).is_err());
+
+        assert_eq!(bridge.state(), ConnectionState::Failed);
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("session-1"))
+            .is_none());
+        assert!(rec
+            .events
+            .lock()
+            .iter()
+            .all(|(channel, _)| channel != super::EVT_TITLE));
+    }
+
+    #[test]
+    fn completed_replay_wins_a_simultaneous_timeout_check() {
+        let bridge = AgentBridge::new();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.begin_replay(0).unwrap();
+
+        journal_flow.observe_replay_boundary(0).unwrap();
+        assert_eq!(journal_flow.finish_replay(0), Ok(0));
+        journal_flow.complete_replay(&bridge, 0).unwrap();
+
+        assert!(!journal_flow.cancel());
+        assert_eq!(bridge.state(), ConnectionState::Live);
+    }
+
+    #[test]
+    fn retired_reader_flow_cannot_mutate_the_shared_bridge() {
+        let bridge = AgentBridge::new();
+        let journal_flow = ReaderJournalFlow::new();
+        journal_flow.complete_without_replay(&bridge).unwrap();
+        journal_flow.retire();
+
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Superseded title"
+                    }),
+                    result: None,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(bridge.journal_cursor(), 0);
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.tree("session-1"))
+            .is_none());
+    }
+
+    #[test]
+    fn reader_failure_before_transport_publication_cancels_the_handshake() {
+        let bridge = AgentBridge::new();
+        let journal_flow = ReaderJournalFlow::new();
+        bridge.fail_reader_transport(&journal_flow, "reader exited before publication");
+
+        assert!(journal_flow.complete_without_replay(&bridge).is_err());
+        assert!(journal_flow.begin_replay(0).is_err());
+        assert_eq!(bridge.state(), ConnectionState::Disconnected);
     }
 
     #[test]

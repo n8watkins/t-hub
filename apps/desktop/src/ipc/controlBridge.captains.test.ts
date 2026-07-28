@@ -26,6 +26,7 @@ vi.mock("./controlClient", () => ({
 import {
   applyControl,
   adoptCaptainsSnapshot,
+  bootstrapCaptainsAfterWorkspace,
   bootstrapCaptains,
   __resetCaptainsReconcileForTest,
   __setCaptainsBootstrappingForTest,
@@ -207,6 +208,41 @@ describe("sync_captains forward suppression during bootstrap", () => {
 });
 
 describe("bootstrapCaptains", () => {
+  it("waits for authoritative workspace adoption before checking legacy pins", async () => {
+    seedCaptains(["capZ"]);
+    mockState.handlers = { list_captains: { seq: 2, captains: [] } };
+    let finishWorkspaceBootstrap: ((ready: boolean) => void) | undefined;
+    const workspaceBootstrap = new Promise<boolean>((resolve) => {
+      finishWorkspaceBootstrap = resolve;
+    });
+
+    const bootstrap = bootstrapCaptainsAfterWorkspace(workspaceBootstrap);
+    await Promise.resolve();
+    expect(controlRequests).toEqual([]);
+
+    useWorkspace.setState({
+      tabs: [{ id: "t1", name: "W1", order: [] }],
+      focusedId: null,
+    });
+    finishWorkspaceBootstrap?.(true);
+    await bootstrap;
+
+    expect(
+      controlRequests.some((r) => r.command === "claim_captain"),
+    ).toBe(false);
+    expect(useCaptain.getState().captainIds).toEqual([]);
+  });
+
+  it("does not reconcile legacy pins after indeterminate workspace bootstrap", async () => {
+    seedCaptains(["capZ"]);
+    mockState.handlers = { list_captains: { seq: 2, captains: [] } };
+
+    await bootstrapCaptainsAfterWorkspace(Promise.resolve(false));
+
+    expect(controlRequests).toEqual([]);
+    expect(useCaptain.getState().captainIds).toEqual(["capZ"]);
+  });
+
   it("claims live-tile pins the server lacks, then adopts the final snapshot", async () => {
     // Local has capA (server-unknown, live tile) and capB (already claimed).
     seedCaptains(["capA", "capB"]);
@@ -243,5 +279,7 @@ describe("bootstrapCaptains", () => {
     expect(
       controlRequests.some((r) => r.command === "claim_captain"),
     ).toBe(false);
+    expect(useCaptain.getState().captainIds).toEqual([]);
+    expect(useCaptain.getState().activeCaptainId).toBeNull();
   });
 });

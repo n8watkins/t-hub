@@ -14,12 +14,14 @@
 //!
 //!  reader thread:
 //!    BufReader::lines → decode_agent → dispatch:
-//!      Ready       → store journal_head_seq, set state Live/Replaying
-//!      Response    → deliver AgentResponse to a per-request mpsc Sender
-//!      Journal     → call AgentBridge::consume_journal_entry (cloned handle)
-//!      ReplayComplete → set state Live
-//!      Pong        → update last_pong_nonce (best-effort; no blocking)
-//!      Error       → eprintln
+//!      Ready          → send the advertised protocol version and journal head
+//!      Response       → deliver AgentResponse to a per-request mpsc Sender
+//!      Journal        → buffer until handshake/replay verification, then ingest
+//!      ReplayBoundary → record the durable replay boundary
+//!      ReplayComplete → verify completion against that boundary
+//!      Pong           → reserved for future liveness tracking
+//!      Error          → eprintln
+//!    malformed frames terminate the reader and fail an active handshake/replay
 //! ```
 //!
 //! ## Correlation map
@@ -31,10 +33,11 @@
 //!
 //! ## T_HUB_AGENT_BIN escape hatch
 //!
-//! When the env var `T_HUB_AGENT_BIN` is set, its value overrides argv[0]
-//! from [`super::launch_argv`]. This lets developers and tests point at a
-//! freshly built binary (e.g. `target/debug/t-hub-agent`) without altering
-//! `launch_argv` or PATH.
+//! On Windows dev builds and in tests, [`super::launch_argv`] consumes
+//! `T_HUB_AGENT_BIN` and returns a direct agent invocation instead of the
+//! packaged WSL launch. On unix, [`spawn_child`] also honors the value as an
+//! argv[0] override. This lets developers and tests point at a freshly built
+//! binary (for example, `target/debug/t-hub-agent`) without changing `PATH`.
 //!
 //! ## Channel / Priority note
 //!
@@ -51,15 +54,367 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{atomic::AtomicU64, mpsc::Sender, Arc},
+    thread::JoinHandle,
 };
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use t_hub_protocol::{decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame};
+use t_hub_protocol::{
+    decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame, EventJournalEntry, Ready,
+};
 
 // Re-export AgentBridge so the reader thread can call consume_journal_entry
 // without a circular import (the thread captures a clone of AgentBridge).
 use super::AgentBridge;
+
+pub(crate) struct ReaderJournalFlow {
+    state: Mutex<ReaderJournalState>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReaderFlowError {
+    message: String,
+}
+
+impl ReaderFlowError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+enum ReaderJournalState {
+    Buffering(Vec<BufferedJournal>),
+    Replaying {
+        replay_entries: Vec<BufferedJournal>,
+        live_entries: Vec<BufferedJournal>,
+        verified_seq: u64,
+        boundary_received: bool,
+        completion_received: bool,
+        protocol_error: Option<String>,
+    },
+    Live,
+    Cancelled,
+}
+
+struct BufferedJournal {
+    seq: u64,
+    entry: EventJournalEntry,
+    replayed: bool,
+}
+
+impl ReaderJournalFlow {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ReaderJournalState::Buffering(Vec::new())),
+        })
+    }
+
+    pub(crate) fn begin_replay(&self, after_seq: u64) -> Result<(), String> {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Buffering(entries) = &mut *state else {
+            return Err("replay requested after the reader flow terminated".to_string());
+        };
+        let entries = std::mem::take(entries);
+        let (replayed, live_entries): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|entry| entry.replayed);
+        *state = ReaderJournalState::Replaying {
+            replay_entries: Vec::new(),
+            live_entries,
+            verified_seq: after_seq,
+            boundary_received: false,
+            completion_received: false,
+            protocol_error: None,
+        };
+        for buffered in sorted_entries(replayed) {
+            Self::ingest_replayed(&mut state, buffered.seq, buffered.entry);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_without_replay(&self, bridge: &AgentBridge) -> Result<(), String> {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Buffering(entries) = &mut *state else {
+            return Err("handshake completed after the reader flow terminated".to_string());
+        };
+        let entries = std::mem::take(entries);
+        *state = ReaderJournalState::Live;
+
+        bridge.flush_replay();
+        bridge.set_state(ConnectionState::Live);
+        for buffered in sorted_entries(entries) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_replay(
+        &self,
+        bridge: &AgentBridge,
+        advertised_head: u64,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            completion_received,
+            protocol_error,
+            ..
+        } = &*state
+        else {
+            return Err("replay commit requested outside an active replay".to_string());
+        };
+        if let Some(error) = protocol_error {
+            return Err(error.clone());
+        }
+        if !boundary_received || !completion_received {
+            return Err("replay commit requested before verified completion".to_string());
+        }
+        if *verified_seq < advertised_head {
+            return Err(format!(
+                "agent completed at sequence {verified_seq}, below advertised head {advertised_head}"
+            ));
+        }
+        let replay_boundary = *verified_seq;
+
+        let ReaderJournalState::Replaying {
+            replay_entries,
+            live_entries,
+            ..
+        } = std::mem::replace(&mut *state, ReaderJournalState::Live)
+        else {
+            return Err("replay state changed before commit".to_string());
+        };
+
+        for buffered in sorted_entries(replay_entries) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
+        }
+        bridge.advance_cursor(replay_boundary);
+        bridge.flush_replay();
+        bridge.set_state(ConnectionState::Live);
+        for buffered in sorted_entries(live_entries) {
+            bridge.consume_journal_entry_with_provenance(&buffered.entry, false);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            ReaderJournalState::Buffering(_) | ReaderJournalState::Replaying { .. } => {
+                *state = ReaderJournalState::Cancelled;
+                true
+            }
+            ReaderJournalState::Live | ReaderJournalState::Cancelled => false,
+        }
+    }
+
+    pub(crate) fn retire(&self) {
+        *self.state.lock() = ReaderJournalState::Cancelled;
+    }
+
+    pub(crate) fn fail_protocol(&self, error: String) {
+        let mut state = self.state.lock();
+        match &mut *state {
+            ReaderJournalState::Replaying { protocol_error, .. } => {
+                if protocol_error.is_none() {
+                    *protocol_error = Some(error);
+                }
+            }
+            ReaderJournalState::Buffering(_) => {
+                *state = ReaderJournalState::Cancelled;
+            }
+            ReaderJournalState::Live => {
+                *state = ReaderJournalState::Cancelled;
+            }
+            ReaderJournalState::Cancelled => {}
+        }
+    }
+
+    pub(crate) fn ingest(
+        &self,
+        bridge: &AgentBridge,
+        seq: u64,
+        entry: EventJournalEntry,
+        replayed: bool,
+    ) -> Result<(), ReaderFlowError> {
+        let mut state = self.state.lock();
+        match &mut *state {
+            ReaderJournalState::Buffering(entries) => {
+                entries.push(BufferedJournal {
+                    seq,
+                    entry,
+                    replayed,
+                });
+                Ok(())
+            }
+            ReaderJournalState::Replaying { .. } if replayed => {
+                Self::ingest_replayed(&mut state, seq, entry);
+                Self::replay_result(&state)
+            }
+            ReaderJournalState::Replaying { live_entries, .. } => {
+                live_entries.push(BufferedJournal {
+                    seq,
+                    entry,
+                    replayed,
+                });
+                Ok(())
+            }
+            ReaderJournalState::Live => {
+                if replayed {
+                    *state = ReaderJournalState::Cancelled;
+                    Err(ReaderFlowError::new(
+                        "journal replay entry received after replay commit",
+                    ))
+                } else {
+                    bridge.consume_journal_entry_with_provenance(&entry, false);
+                    Ok(())
+                }
+            }
+            ReaderJournalState::Cancelled => Ok(()),
+        }
+    }
+
+    fn replay_result(state: &ReaderJournalState) -> Result<(), ReaderFlowError> {
+        let ReaderJournalState::Replaying { protocol_error, .. } = state else {
+            return Ok(());
+        };
+        match protocol_error {
+            Some(error) => Err(ReaderFlowError::new(error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn ingest_replayed(state: &mut ReaderJournalState, seq: u64, entry: EventJournalEntry) {
+        let ReaderJournalState::Replaying {
+            replay_entries,
+            verified_seq,
+            boundary_received,
+            completion_received,
+            protocol_error,
+            ..
+        } = state
+        else {
+            return;
+        };
+        if protocol_error.is_some() {
+            return;
+        }
+        if *completion_received {
+            *protocol_error = Some("journal replay entry received after completion".to_string());
+        } else if *boundary_received {
+            *protocol_error = Some("journal entry received after replay boundary".to_string());
+        } else if seq != entry.seq {
+            *protocol_error = Some(format!(
+                "journal frame sequence {seq} does not match entry sequence {}",
+                entry.seq
+            ));
+        } else if seq <= *verified_seq {
+            *protocol_error = Some(format!(
+                "journal replay sequence {seq} did not advance past {verified_seq}"
+            ));
+        } else {
+            *verified_seq = seq;
+            replay_entries.push(BufferedJournal {
+                seq,
+                entry,
+                replayed: true,
+            });
+        }
+    }
+
+    pub(crate) fn observe_replay_boundary(&self, last_seq: u64) -> Result<(), ReaderFlowError> {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            completion_received,
+            protocol_error,
+            ..
+        } = &mut *state
+        else {
+            return match &*state {
+                ReaderJournalState::Live => {
+                    *state = ReaderJournalState::Cancelled;
+                    Err(ReaderFlowError::new(
+                        "replay boundary received after replay commit",
+                    ))
+                }
+                ReaderJournalState::Cancelled => Ok(()),
+                ReaderJournalState::Buffering(_) => {
+                    *state = ReaderJournalState::Cancelled;
+                    Err(ReaderFlowError::new(
+                        "replay boundary received outside an active replay",
+                    ))
+                }
+                ReaderJournalState::Replaying { .. } => unreachable!(),
+            };
+        };
+        if protocol_error.is_some() {
+        } else if *completion_received {
+            *protocol_error = Some("replay boundary received after completion".to_string());
+        } else if *boundary_received {
+            *protocol_error = Some("duplicate replay boundary".to_string());
+        } else if last_seq < *verified_seq {
+            *protocol_error = Some(format!(
+                "replay boundary {last_seq} is below consumed sequence {verified_seq}"
+            ));
+        } else {
+            *verified_seq = last_seq;
+            *boundary_received = true;
+        }
+        Self::replay_result(&state)
+    }
+
+    pub(crate) fn finish_replay(&self, last_seq: u64) -> Result<u64, ReaderFlowError> {
+        let mut state = self.state.lock();
+        let ReaderJournalState::Replaying {
+            verified_seq,
+            boundary_received,
+            completion_received,
+            protocol_error,
+            ..
+        } = &mut *state
+        else {
+            return match &*state {
+                ReaderJournalState::Live => {
+                    *state = ReaderJournalState::Cancelled;
+                    Err(ReaderFlowError::new(
+                        "replay completion received after replay commit",
+                    ))
+                }
+                ReaderJournalState::Cancelled | ReaderJournalState::Buffering(_) => Err(
+                    ReaderFlowError::new("replay completed outside an active replay"),
+                ),
+                ReaderJournalState::Replaying { .. } => unreachable!(),
+            };
+        };
+        if let Some(error) = protocol_error {
+            return Err(ReaderFlowError::new(error.clone()));
+        }
+        if !*boundary_received {
+            return Err(ReaderFlowError::new(
+                "replay completed without a durable boundary",
+            ));
+        }
+        if *completion_received {
+            return Err(ReaderFlowError::new("duplicate replay completion"));
+        }
+        if last_seq != *verified_seq {
+            return Err(ReaderFlowError::new(format!(
+                "replay completion sequence {last_seq} does not match verified boundary {verified_seq}"
+            )));
+        }
+        *completion_received = true;
+        Ok(*verified_seq)
+    }
+}
+
+fn sorted_entries(mut entries: Vec<BufferedJournal>) -> Vec<BufferedJournal> {
+    entries.sort_by_key(|entry| entry.entry.seq);
+    entries
+}
 
 // ---------------------------------------------------------------------------
 // ConnectionState (fixed contract — do NOT alter)
@@ -110,6 +465,23 @@ pub(crate) struct TransportHandles {
     /// The child handle, kept alive so the process isn't reaped.
     #[allow(dead_code)]
     pub(crate) child: Mutex<Child>,
+    pub(crate) journal_flow: Arc<ReaderJournalFlow>,
+    pub(crate) reader: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TransportHandles {
+    pub(crate) fn shutdown(&self) {
+        self.journal_flow.retire();
+        self.pending.lock().clear();
+        {
+            let mut child = self.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.lock().take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,10 +509,12 @@ pub(crate) fn write_frame(w: &mut impl Write, frame: &CoreFrame) -> std::io::Res
 
 /// Resolve the program to exec and the remaining arguments from `argv`.
 ///
-/// If the env var `T_HUB_AGENT_BIN` is set, its value replaces `argv[0]`
-/// (the bare `t-hub-agent` or `wsl.exe` that `launch_argv` returns). This
-/// lets tests and developers point at a freshly built binary without touching
-/// PATH or `launch_argv`:
+/// If an allowed `T_HUB_AGENT_BIN` override is set, its value replaces
+/// `argv[0]`. Windows [`super::launch_argv`] has already reduced an override to
+/// the direct agent argument shape, while this fallback also supports unix
+/// development and tests.
+/// This lets tests and developers point at a freshly built binary without
+/// touching `PATH`:
 ///
 /// ```sh
 /// T_HUB_AGENT_BIN=/path/to/target/debug/t-hub-agent cargo test
@@ -154,10 +528,7 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
     }
 
     // T_HUB_AGENT_BIN: optional override for argv[0], documented above.
-    let program = std::env::var("T_HUB_AGENT_BIN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| argv[0].clone());
+    let program = super::agent_bin_override().unwrap_or_else(|| argv[0].clone());
 
     let args = &argv[1..];
 
@@ -167,10 +538,9 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()); // agent diagnostics go to core's stderr
 
-    // On Windows `program` is `wsl.exe` (from `launch_argv`); without
-    // CREATE_NO_WINDOW that raw spawn flashes a console (CMD) window. Gate behind
-    // cfg(windows) so the unix dev build (which spawns t-hub-agent directly) is
-    // unaffected.
+    // On Windows the default `program` is `wsl.exe`; a developer override may
+    // instead name a native wrapper or helper. Keep either child hidden.
+    // Gate behind cfg(windows) so the unix dev build is unaffected.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -189,34 +559,37 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
 /// 1. Reads lines from `child_stdout` via a `BufReader`.
 /// 2. `decode_agent`s each line.
 /// 3. Dispatches each [`AgentToCore`] variant:
-///    - `Ready`          → stores `journal_head_seq`; the caller sets state.
+///    - `Ready`          → sends the advertised protocol version and journal head.
 ///    - `Response`       → pops the sender from `pending` and delivers the body.
-///    - `Journal`        → calls `bridge.consume_journal_entry(&entry)`.
-///    - `ReplayComplete` → notifies the ready_tx channel so connect() can set Live.
+///    - `Journal`        → buffers or ingests according to the verified replay state.
+///    - `ReplayBoundary` → records the durable replay boundary.
+///    - `ReplayComplete` → verifies completion and notifies `connect()`.
 ///    - `Pong`           → no-op (RTT measurement is future work).
 ///    - `Error`          → `eprintln!`.
 ///    - `Unknown`        → ignored (forward-compat).
 ///
-/// The thread exits when the agent's stdout is closed (EOF) or on any
-/// unrecoverable read error.
+/// The thread exits when the agent's stdout is closed (EOF), on an unrecoverable
+/// read error, or on a malformed frame.
 pub(crate) fn spawn_reader(
     child_stdout: std::process::ChildStdout,
     pending: Arc<CorrelationMap>,
     bridge: AgentBridge,
-    // Sent once when Ready arrives: carries the agent's journal_head_seq.
-    ready_tx: Sender<u64>,
+    journal_flow: Arc<ReaderJournalFlow>,
+    // Sent once when Ready arrives.
+    ready_tx: Sender<Result<Ready, String>>,
     // Sent once when ReplayComplete arrives.
-    replay_done_tx: Sender<u64>,
-) {
+    replay_done_tx: Sender<Result<u64, String>>,
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("agent-reader".into())
         .spawn(move || {
             let reader = BufReader::new(child_stdout);
+            let mut exit_error = "agent stdout closed".to_string();
             for line_result in reader.lines() {
                 let line = match line_result {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("agent-bridge: reader I/O error: {e}");
+                        exit_error = format!("agent reader I/O error: {e}");
                         break;
                     }
                 };
@@ -226,8 +599,11 @@ pub(crate) fn spawn_reader(
                 let frame = match decode_agent(&line) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("agent-bridge: skipping malformed frame: {e} (line={line:?})");
-                        continue;
+                        let error = format!("malformed agent frame: {e} (line={line:?})");
+                        eprintln!("agent-bridge: {error}");
+                        journal_flow.fail_protocol(error.clone());
+                        exit_error = error;
+                        break;
                     }
                 };
 
@@ -237,9 +613,7 @@ pub(crate) fn spawn_reader(
                             "agent-bridge: agent ready (version={}, journal_head={})",
                             ready.agent_version, ready.journal_head_seq
                         );
-                        // Signal connect() with the journal head seq so it can
-                        // decide whether to request a replay.
-                        let _ = ready_tx.send(ready.journal_head_seq);
+                        let _ = ready_tx.send(Ok(ready));
                     }
 
                     AgentToCore::Response { id, body } => {
@@ -265,13 +639,33 @@ pub(crate) fn spawn_reader(
                         entry,
                         replayed,
                     } => {
-                        bridge.consume_journal_entry_with_provenance(&entry, replayed);
-                        let _ = seq; // cursor advancement is done inside consume_journal_entry
+                        if let Err(error) = journal_flow.ingest(&bridge, seq, entry, replayed) {
+                            eprintln!("agent-bridge: protocol violation: {}", error.message);
+                            exit_error = error.message;
+                            break;
+                        }
+                    }
+
+                    AgentToCore::ReplayBoundary { last_seq } => {
+                        if let Err(error) = journal_flow.observe_replay_boundary(last_seq) {
+                            eprintln!("agent-bridge: protocol violation: {}", error.message);
+                            exit_error = error.message;
+                            break;
+                        }
                     }
 
                     AgentToCore::ReplayComplete { last_seq } => {
                         eprintln!("agent-bridge: replay complete (last_seq={last_seq})");
-                        let _ = replay_done_tx.send(last_seq);
+                        match journal_flow.finish_replay(last_seq) {
+                            Ok(verified_seq) => {
+                                let _ = replay_done_tx.send(Ok(verified_seq));
+                            }
+                            Err(error) => {
+                                eprintln!("agent-bridge: protocol violation: {}", error.message);
+                                exit_error = error.message;
+                                break;
+                            }
+                        }
                     }
 
                     AgentToCore::Pong { nonce: _ } => {
@@ -288,9 +682,11 @@ pub(crate) fn spawn_reader(
                     }
                 }
             }
-            eprintln!("agent-bridge: reader thread exiting (agent stdout closed)");
+            let _ = ready_tx.send(Err(exit_error.clone()));
+            let _ = replay_done_tx.send(Err(exit_error.clone()));
+            bridge.fail_reader_transport(&journal_flow, &exit_error);
+            eprintln!("agent-bridge: reader thread exiting ({exit_error})");
         })
-        .expect("failed to spawn agent-reader thread");
 }
 
 // ---------------------------------------------------------------------------
@@ -355,9 +751,12 @@ mod transport_tests {
         let env_lock = AGENT_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let journal = tempfile::tempdir().expect("create private agent journal");
         let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &bin_path);
+        let journal_env = TestEnvVar::set("T_HUB_AGENT_JOURNAL_DIR", journal.path());
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("connect() must succeed");
+        drop(journal_env);
         drop(agent_bin_env);
         drop(env_lock);
 
@@ -427,11 +826,10 @@ mod transport_tests {
     /// by both the `--hook` ingest processes and the `--stdio` agent the bridge
     /// spawns. Skips when the binary isn't built (so CI never fails spuriously).
     ///
-    /// Exercises BOTH emit paths:
-    ///   - **replay**: hooks fired *before* connect → bridge replays the journal
-    ///     on handshake → each replayed entry emits.
-    ///   - **live tail**: a hook fired *after* connect → agent's tail thread
-    ///     streams it → bridge consumes it → emits.
+    /// Exercises both journal paths:
+    ///   - **replay**: hooks fired before connect are replayed into one bounded
+    ///     supervision snapshot without forwarding historical journal events.
+    ///   - **live tail**: a hook fired after connect is streamed and emitted.
     #[test]
     fn live_emit_demo_hook_sequence_to_supervision_tree() {
         use parking_lot::Mutex as PMutex;
@@ -547,16 +945,17 @@ mod transport_tests {
             *rec.events.lock()
         );
 
-        // Also: agent://journal must have been emitted for the replayed entries.
+        // Historical journal events stay silent during replay. The bounded
+        // supervision snapshot above is the observable replay result.
         let journal_emits = rec
             .events
             .lock()
             .iter()
             .filter(|(ch, _)| ch == super::super::emit::EVT_JOURNAL)
             .count();
-        assert!(
-            journal_emits >= 4,
-            "expected >=4 journal emits, got {journal_emits}"
+        assert_eq!(
+            journal_emits, 0,
+            "replay must suppress historical journal emits"
         );
 
         eprintln!("live_emit_demo: replay path emitted waitingOnSubagents ✓");
@@ -585,6 +984,19 @@ mod transport_tests {
             "live tail path must stream SubagentStop and emit completed; got {:?}",
             *rec.events.lock()
         );
+        let journal_events = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::super::emit::EVT_JOURNAL)
+            .map(|(_, payload)| payload.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journal_events.len(),
+            1,
+            "live tail path must emit exactly one journal event"
+        );
+        assert_eq!(journal_events[0]["replayed"], false);
         eprintln!("live_emit_demo: live tail path emitted completed ✓");
 
         bridge.disconnect();

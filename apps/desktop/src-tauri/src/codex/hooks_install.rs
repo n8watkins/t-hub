@@ -12,20 +12,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const MANAGED_MARKER: &str = "__t_hub_codex_managed__";
-pub const OBSERVED_EVENTS: [&str; 5] = [
+pub const OBSERVED_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
     "PermissionRequest",
+    "PreToolUse",
+    "PostToolUse",
     "Stop",
     "SessionEnd",
 ];
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_CAPABILITY_SCHEMA: u32 = 1;
+const CODEX_HOOK_CAPABILITY: &str = "codex-native-hooks-v1";
+const AGENT_CAPABILITY_OUTPUT_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,7 +64,7 @@ impl Default for CapabilityReport {
             permission: "native_hook",
             completion: "native_hook",
             session_end: "native_hook",
-            question: "structured_app_server_or_degraded",
+            question: "native_hook",
             failure: "structured_app_server_or_degraded",
         }
     }
@@ -76,12 +81,29 @@ pub struct ProducerHealth {
     pub missing_events: Vec<String>,
     pub executable_path: String,
     pub executable_ok: bool,
+    pub agent_capable: bool,
+    pub agent_version: Option<String>,
+    pub hooks_enabled: bool,
     pub inline_user_hooks_present: bool,
     pub project_hooks_present: bool,
     pub plugin_config_present: bool,
     pub managed_hooks_present: bool,
     pub managed_only_policy: bool,
     pub capabilities: CapabilityReport,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentCapabilities {
+    schema_version: u32,
+    agent_version: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct AgentCapabilityProbe {
+    capable: bool,
+    version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -99,28 +121,107 @@ pub struct RuntimePaths {
     pub codex_home: PathBuf,
     pub requirements_path: PathBuf,
     pub agent_bin: PathBuf,
+    pub hooks_state_path: String,
 }
 
-pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
+pub fn runtime_paths(agent_bin: &str, packaged_agent_bin: Option<&str>) -> Result<RuntimePaths> {
     #[cfg(unix)]
     {
+        let _ = packaged_agent_bin;
+        let codex_home = codex_home()?;
+        let hooks_state_path = codex_home.join("hooks.json").display().to_string();
         Ok(RuntimePaths {
-            codex_home: codex_home()?,
+            codex_home,
             requirements_path: requirements_path(),
-            agent_bin: PathBuf::from(agent_bin),
+            agent_bin: resolve_unix_agent_bin(agent_bin),
+            hooks_state_path,
         })
+    }
+    #[cfg(windows)]
+    {
+        let _ = agent_bin;
+        let packaged_agent_bin = packaged_agent_bin
+            .context("verified digest-versioned WSL helper path is unavailable")?;
+        validate_canonical_absolute_posix(packaged_agent_bin)?;
+        let distro = wsl_distro();
+        let home = wsl_home(&distro)?;
+        let runtime_codex_home = format!("{home}/.codex");
+        Ok(RuntimePaths {
+            codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
+            requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
+            agent_bin: PathBuf::from(packaged_agent_bin),
+            hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
+        })
+    }
+}
+
+pub fn runtime_paths_for_uninstall(agent_bin: &str) -> Result<RuntimePaths> {
+    #[cfg(unix)]
+    {
+        runtime_paths(agent_bin, None)
     }
     #[cfg(windows)]
     {
         let _ = agent_bin;
         let distro = wsl_distro();
         let home = wsl_home(&distro)?;
+        let runtime_codex_home = format!("{home}/.codex");
         Ok(RuntimePaths {
-            codex_home: wsl_posix_to_unc(&distro, &format!("{home}/.codex"))?,
+            codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
             requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
-            agent_bin: PathBuf::from(resolve_wsl_agent_bin(&distro)?),
+            agent_bin: PathBuf::from("/.t-hub-uninstall/t-hub-agent"),
+            hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
         })
     }
+}
+
+#[cfg(unix)]
+fn resolve_unix_agent_bin(agent_bin: &str) -> PathBuf {
+    resolve_unix_agent_bin_from(
+        agent_bin,
+        std::env::var_os("PATH").as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+#[cfg(unix)]
+fn resolve_unix_agent_bin_from(
+    agent_bin: &str,
+    search_path: Option<&std::ffi::OsStr>,
+    current_dir: Option<&Path>,
+) -> PathBuf {
+    let supplied = PathBuf::from(agent_bin);
+    if supplied.is_absolute() {
+        return supplied;
+    }
+
+    if supplied.components().count() > 1 {
+        if let Some(current_dir) = current_dir {
+            let candidate = current_dir.join(&supplied);
+            if executable_ok(&candidate) {
+                return candidate;
+            }
+        }
+        return supplied;
+    }
+
+    let Some(search_path) = search_path else {
+        return supplied;
+    };
+    for directory in std::env::split_paths(search_path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else if let Some(current_dir) = current_dir {
+            current_dir.join(directory)
+        } else {
+            continue;
+        };
+        let candidate = directory.join(&supplied);
+        if executable_ok(&candidate) {
+            return candidate;
+        }
+    }
+    supplied
 }
 
 #[cfg(windows)]
@@ -169,15 +270,6 @@ fn normalize_wsl_home(output: &[u8]) -> Result<String> {
         bail!("WSL home is not an absolute POSIX path");
     }
     Ok(home)
-}
-
-#[cfg(any(windows, test))]
-fn normalize_wsl_executable(output: &[u8]) -> Result<String> {
-    let path = normalize_single_wsl_path_output(output)?;
-    if path.len() <= 1 {
-        bail!("WSL t-hub-agent path is not an absolute POSIX path");
-    }
-    Ok(path)
 }
 
 #[cfg(any(windows, test))]
@@ -253,28 +345,21 @@ fn wsl_home(distro: &str) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn resolve_wsl_agent_bin(distro: &str) -> Result<String> {
-    use std::os::windows::process::CommandExt;
-
-    let mut command = std::process::Command::new("wsl.exe");
-    command
-        .arg("-d")
-        .arg(distro)
-        .arg("--")
-        .arg("bash")
-        .arg("-lc")
-        .arg("command -v t-hub-agent")
-        .creation_flags(0x0800_0000);
+fn verify_wsl_agent_bin(distro: &str, agent_bin: &str) -> Result<()> {
+    validate_canonical_absolute_posix(agent_bin)?;
+    let command = crate::wsl::executable_probe_command(distro, agent_bin);
     let output =
         crate::bounded_exec::output_with_timeout(command, crate::bounded_exec::WSL_PROBE_TIMEOUT)
-            .with_context(|| format!("resolving t-hub-agent inside WSL distribution {distro}"))?;
+            .context(format!(
+            "checking deployed t-hub-agent inside WSL distribution {distro}"
+        ))?;
     if !output.status.success() {
         bail!(
-            "could not find t-hub-agent inside WSL distribution {distro}: {}",
+            "deployed t-hub-agent is unavailable at {agent_bin} inside WSL distribution {distro}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    normalize_wsl_executable(&output.stdout)
+    Ok(())
 }
 
 struct ConfigLock {
@@ -323,10 +408,38 @@ impl Drop for ConfigLock {
     }
 }
 
+#[cfg(test)]
 pub fn install(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
+    consent: bool,
+) -> Result<InstallReport> {
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    install_with_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        &hooks_state_path,
+        consent,
+    )
+}
+
+pub fn install_runtime(paths: &RuntimePaths, consent: bool) -> Result<InstallReport> {
+    install_with_state_path(
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        &paths.hooks_state_path,
+        consent,
+    )
+}
+
+fn install_with_state_path(
+    codex_home: &Path,
+    requirements_path: &Path,
+    agent_bin: &Path,
+    hooks_state_path: &str,
     consent: bool,
 ) -> Result<InstallReport> {
     if !consent {
@@ -338,14 +451,26 @@ pub fn install(
     let existing = read_hooks(&hooks_path)?;
     // Parse every config surface before the first mutation.
     // A malformed user or policy file must never be partially "repaired".
-    let _ = health_at(codex_home, requirements_path, agent_bin)?;
+    let _ = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     let merged = merge_managed(&existing, agent_bin)?;
     let changed = merged != existing;
     let backed_up = changed && backup_once(&hooks_path)?;
     if changed {
         write_json_atomic(&hooks_path, &merged)?;
     }
-    let health = health_at(codex_home, requirements_path, agent_bin)?;
+    let health = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     Ok(InstallReport {
         hooks_path: hooks_path.display().to_string(),
         changed,
@@ -355,6 +480,7 @@ pub fn install(
     })
 }
 
+#[cfg(test)]
 pub fn repair(
     codex_home: &Path,
     requirements_path: &Path,
@@ -364,22 +490,58 @@ pub fn repair(
     install(codex_home, requirements_path, agent_bin, consent)
 }
 
+pub fn repair_runtime(paths: &RuntimePaths, consent: bool) -> Result<InstallReport> {
+    install_runtime(paths, consent)
+}
+
+#[cfg(test)]
 pub fn uninstall(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
 ) -> Result<InstallReport> {
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    uninstall_with_state_path(codex_home, requirements_path, agent_bin, &hooks_state_path)
+}
+
+pub fn uninstall_runtime(paths: &RuntimePaths) -> Result<InstallReport> {
+    uninstall_with_state_path(
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        &paths.hooks_state_path,
+    )
+}
+
+fn uninstall_with_state_path(
+    codex_home: &Path,
+    requirements_path: &Path,
+    agent_bin: &Path,
+    hooks_state_path: &str,
+) -> Result<InstallReport> {
     let hooks_path = codex_home.join("hooks.json");
     let _lock = ConfigLock::acquire(&hooks_path)?;
     let existing = read_hooks(&hooks_path)?;
-    let _ = health_at(codex_home, requirements_path, agent_bin)?;
+    let _ = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     let cleaned = remove_managed(&existing)?;
     let changed = cleaned != existing;
     let backed_up = changed && backup_once(&hooks_path)?;
     if changed {
         write_json_atomic(&hooks_path, &cleaned)?;
     }
-    let health = health_at(codex_home, requirements_path, agent_bin)?;
+    let health = health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        hooks_state_path,
+    )?;
     Ok(InstallReport {
         hooks_path: hooks_path.display().to_string(),
         changed,
@@ -389,19 +551,55 @@ pub fn uninstall(
     })
 }
 
+#[cfg(test)]
 pub fn health_at(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
 ) -> Result<ProducerHealth> {
-    health_at_with_project(codex_home, requirements_path, agent_bin, None)
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        None,
+        &hooks_state_path,
+    )
 }
 
+#[cfg(test)]
 pub fn health_at_with_project(
     codex_home: &Path,
     requirements_path: &Path,
     agent_bin: &Path,
     project_root: Option<&Path>,
+) -> Result<ProducerHealth> {
+    let hooks_state_path = codex_home.join("hooks.json").display().to_string();
+    health_at_with_project_and_state_path(
+        codex_home,
+        requirements_path,
+        agent_bin,
+        project_root,
+        &hooks_state_path,
+    )
+}
+
+pub fn health_runtime(paths: &RuntimePaths, project_root: Option<&Path>) -> Result<ProducerHealth> {
+    health_at_with_project_and_state_path(
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        project_root,
+        &paths.hooks_state_path,
+    )
+}
+
+fn health_at_with_project_and_state_path(
+    codex_home: &Path,
+    requirements_path: &Path,
+    agent_bin: &Path,
+    project_root: Option<&Path>,
+    hooks_state_path: &str,
 ) -> Result<ProducerHealth> {
     let hooks_path = codex_home.join("hooks.json");
     let config_path = codex_home.join("config.toml");
@@ -415,6 +613,15 @@ pub fn health_at_with_project(
         .and_then(|value| value.get("allow_managed_hooks_only"))
         .and_then(toml::Value::as_bool)
         .unwrap_or(false);
+    // Requirements are enforced above ordinary configuration. Of the local
+    // requirement sources available here, legacy managed_config.toml has higher
+    // precedence than the system requirements file. User config then overrides
+    // the lower-precedence system default when no requirement pins the feature.
+    let hooks_enabled = hooks_feature_flag(legacy_managed_config.as_ref())
+        .or_else(|| hooks_feature_flag(requirements.as_ref()))
+        .or_else(|| hooks_feature_flag(config.as_ref()))
+        .or_else(|| hooks_feature_flag(system_config.as_ref()))
+        .unwrap_or(true);
     let inline_user_hooks_present = config
         .as_ref()
         .and_then(|value| value.get("hooks"))
@@ -455,11 +662,11 @@ pub fn health_at_with_project(
 
     for event in OBSERVED_EVENTS {
         match find_managed_handler(&hooks, event)? {
-            Some((group_index, handler_index, command)) => {
+            Some((group_index, handler_index, command, matcher)) => {
                 managed_events.push(event.to_string());
                 let key = format!(
                     "{}:{}:{group_index}:{handler_index}",
-                    hooks_path.display(),
+                    hooks_state_path,
                     event_key(event)
                 );
                 let hook_state = state
@@ -473,24 +680,31 @@ pub fn health_at_with_project(
                     .and_then(|state| state.get("trusted_hash"))
                     .and_then(toml::Value::as_str)
                 {
-                    modified |= trusted_hash != expected_trust_hash(event, &command);
+                    modified |=
+                        trusted_hash != expected_trust_hash(event, &command, matcher.as_deref());
                 }
-                drifted |= command != managed_command(agent_bin, event);
+                drifted |= command != managed_command(agent_bin, event)
+                    || matcher.as_deref() != managed_matcher(event);
             }
             None => missing_events.push(event.to_string()),
         }
     }
 
     let executable_ok = executable_ok(agent_bin);
+    let agent_probe = if executable_ok {
+        probe_agent_capabilities(agent_bin)
+    } else {
+        AgentCapabilityProbe::default()
+    };
     let has_trust_for_all = managed_events.iter().all(|event| {
-        let Some((group_index, handler_index, command)) =
+        let Some((group_index, handler_index, command, matcher)) =
             find_managed_handler(&hooks, event).ok().flatten()
         else {
             return false;
         };
         let key = format!(
             "{}:{}:{group_index}:{handler_index}",
-            hooks_path.display(),
+            hooks_state_path,
             event_key(event)
         );
         state
@@ -498,15 +712,15 @@ pub fn health_at_with_project(
             .and_then(toml::Value::as_table)
             .and_then(|state| state.get("trusted_hash"))
             .and_then(toml::Value::as_str)
-            .is_some_and(|hash| hash == expected_trust_hash(event, &command))
+            .is_some_and(|hash| hash == expected_trust_hash(event, &command, matcher.as_deref()))
     });
     let status = if managed_events.is_empty() {
         ProducerStatus::NotInstalled
     } else if managed_only_policy {
         ProducerStatus::BlockedByManagedPolicy
-    } else if drifted || !missing_events.is_empty() || !executable_ok {
+    } else if drifted || !missing_events.is_empty() || !executable_ok || !agent_probe.capable {
         ProducerStatus::Drifted
-    } else if disabled {
+    } else if disabled || !hooks_enabled {
         ProducerStatus::Disabled
     } else if modified {
         ProducerStatus::Modified
@@ -525,6 +739,9 @@ pub fn health_at_with_project(
         missing_events,
         executable_path: agent_bin.display().to_string(),
         executable_ok,
+        agent_capable: agent_probe.capable,
+        agent_version: agent_probe.version,
+        hooks_enabled,
         inline_user_hooks_present,
         project_hooks_present,
         plugin_config_present,
@@ -532,6 +749,14 @@ pub fn health_at_with_project(
         managed_only_policy,
         capabilities: CapabilityReport::default(),
     })
+}
+
+fn hooks_feature_flag(value: Option<&toml::Value>) -> Option<bool> {
+    let features = value?.get("features").and_then(toml::Value::as_table)?;
+    features
+        .get("hooks")
+        .or_else(|| features.get("codex_hooks"))
+        .and_then(toml::Value::as_bool)
 }
 
 fn toml_has_hook_events(value: &toml::Value) -> bool {
@@ -556,14 +781,67 @@ fn validate_agent_bin(path: &Path) -> Result<()> {
     if !executable_ok(path) {
         bail!("Codex hook executable is missing or not executable");
     }
+    if !probe_agent_capabilities(path).capable {
+        bail!("Codex hook executable does not support native Codex hooks; update t-hub-agent");
+    }
     Ok(())
+}
+
+fn probe_agent_capabilities(path: &Path) -> AgentCapabilityProbe {
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = std::process::Command::new("wsl.exe");
+        command
+            .arg("-d")
+            .arg(wsl_distro())
+            .arg("-e")
+            .arg(path)
+            .arg("--capabilities-json")
+            .creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(not(windows))]
+    let command = {
+        let mut command = std::process::Command::new(path);
+        command.arg("--capabilities-json");
+        command
+    };
+
+    let Ok(output) = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        AGENT_CAPABILITY_OUTPUT_LIMIT,
+    ) else {
+        return AgentCapabilityProbe::default();
+    };
+    if !output.status.success() || !output.stderr.is_empty() {
+        return AgentCapabilityProbe::default();
+    }
+    let Ok(report) = serde_json::from_slice::<AgentCapabilities>(&output.stdout) else {
+        return AgentCapabilityProbe::default();
+    };
+    let version_valid = !report.agent_version.is_empty()
+        && report.agent_version.len() <= 64
+        && !report.agent_version.chars().any(char::is_control);
+    if report.schema_version != AGENT_CAPABILITY_SCHEMA || !version_valid {
+        return AgentCapabilityProbe::default();
+    }
+    AgentCapabilityProbe {
+        capable: report
+            .capabilities
+            .iter()
+            .any(|capability| capability == CODEX_HOOK_CAPABILITY),
+        version: Some(report.agent_version),
+    }
 }
 
 fn executable_ok(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let expected = path.to_string_lossy();
-        return resolve_wsl_agent_bin(&wsl_distro()).is_ok_and(|actual| actual == expected);
+        verify_wsl_agent_bin(&wsl_distro(), &expected).is_ok()
     }
     #[cfg(not(windows))]
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -646,13 +924,17 @@ fn merge_managed(existing: &Value, agent_bin: &Path) -> Result<Value> {
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| anyhow!("{event} hooks must be an array"))?;
-        groups.push(json!({
+        let mut group = json!({
             "hooks": [{
                 "type": "command",
                 "command": managed_command(agent_bin, event),
                 "timeout": if event == "SessionEnd" { 3 } else { 10 },
             }]
-        }));
+        });
+        if let Some(matcher) = managed_matcher(event) {
+            group["matcher"] = Value::String(matcher.to_string());
+        }
+        groups.push(group);
     }
     Ok(merged)
 }
@@ -692,7 +974,10 @@ fn remove_managed(existing: &Value) -> Result<Value> {
     Ok(cleaned)
 }
 
-fn find_managed_handler(value: &Value, event: &str) -> Result<Option<(usize, usize, String)>> {
+fn find_managed_handler(
+    value: &Value,
+    event: &str,
+) -> Result<Option<(usize, usize, String, Option<String>)>> {
     let Some(groups_value) = value.get("hooks").and_then(|hooks| hooks.get(event)) else {
         return Ok(None);
     };
@@ -709,7 +994,16 @@ fn find_managed_handler(value: &Value, event: &str) -> Result<Option<(usize, usi
                     .split_whitespace()
                     .any(|word| word == MANAGED_MARKER)
                 {
-                    return Ok(Some((group_index, handler_index, command.to_string())));
+                    let matcher = group
+                        .get("matcher")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    return Ok(Some((
+                        group_index,
+                        handler_index,
+                        command.to_string(),
+                        matcher,
+                    )));
                 }
             }
         }
@@ -735,6 +1029,10 @@ fn managed_command(agent_bin: &Path, event: &str) -> String {
     )
 }
 
+fn managed_matcher(event: &str) -> Option<&'static str> {
+    matches!(event, "PreToolUse" | "PostToolUse").then_some("^request_user_input$")
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -744,23 +1042,34 @@ fn event_key(event: &str) -> &'static str {
         "SessionStart" => "session_start",
         "UserPromptSubmit" => "user_prompt_submit",
         "PermissionRequest" => "permission_request",
+        "PreToolUse" => "pre_tool_use",
+        "PostToolUse" => "post_tool_use",
         "Stop" => "stop",
         "SessionEnd" => "session_end",
         _ => unreachable!("managed event set is closed"),
     }
 }
 
-fn expected_trust_hash(event: &str, command: &str) -> String {
-    let identity = json!({
-        "event_name": event_key(event),
-        "hooks": [{
+fn expected_trust_hash(event: &str, command: &str, matcher: Option<&str>) -> String {
+    let mut identity = Map::from_iter([
+        (
+            "event_name".to_string(),
+            Value::String(event_key(event).to_string()),
+        ),
+        (
+            "hooks".to_string(),
+            json!([{
             "type": "command",
             "command": command,
             "timeout": if event == "SessionEnd" { 3 } else { 10 },
             "async": false,
-        }]
-    });
-    let bytes = serde_json::to_vec(&canonical_json(identity)).unwrap_or_default();
+            }]),
+        ),
+    ]);
+    if let Some(matcher) = matcher {
+        identity.insert("matcher".to_string(), Value::String(matcher.to_string()));
+    }
+    let bytes = serde_json::to_vec(&canonical_json(Value::Object(identity))).unwrap_or_default();
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
@@ -888,13 +1197,126 @@ mod tests {
     fn executable(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("bin").join("t-hub-agent");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"agent").unwrap();
+        let staging = path.with_file_name(".t-hub-agent.fixture");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staging)
+            .unwrap();
+        file.write_all(
+            b"#!/bin/sh\n\
+              if [ \"$1\" = \"--capabilities-json\" ]; then\n\
+                printf '%s\\n' '{\"schemaVersion\":1,\"agentVersion\":\"test\",\"capabilities\":[\"codex-native-hooks-v1\"]}'\n\
+                exit 0\n\
+              fi\n\
+              exit 2\n",
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::rename(staging, &path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut ready = false;
+            for _ in 0..50 {
+                match std::process::Command::new(&path)
+                    .arg("--capabilities-json")
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        ready = true;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(output) => panic!(
+                        "capability fixture exited with {:?}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Err(error) => panic!("capability fixture failed to start: {error}"),
+                }
+            }
+            assert!(ready, "capability fixture remained busy after publication");
         }
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_fixture_is_published_and_runnable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let agent = executable(temp.path());
+        let staging = agent.with_file_name(".t-hub-agent.fixture");
+        let output = std::process::Command::new(&agent)
+            .arg("--capabilities-json")
+            .output()
+            .unwrap();
+        let capabilities: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mode = std::fs::metadata(&agent).unwrap().permissions().mode() & 0o777;
+
+        assert!(output.status.success());
+        assert!(!staging.exists());
+        assert_eq!(mode, 0o700);
+        assert_eq!(
+            capabilities["capabilities"],
+            json!(["codex-native-hooks-v1"])
+        );
+        println!(
+            "published={} staging_exists={} mode={mode:o} capabilities={}",
+            agent.display(),
+            staging.exists(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+
+    #[test]
+    fn health_rejects_an_executable_without_codex_hook_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = temp.path().join("old-t-hub-agent");
+        std::fs::write(&agent, b"#!/bin/sh\nexit 2\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let requirements = temp.path().join("requirements.toml");
+        let hooks = merge_managed(&json!({}), &agent).unwrap();
+        write_json_atomic(&home.join("hooks.json"), &hooks).unwrap();
+
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Drifted);
+        assert!(health.executable_ok);
+        assert!(!health.agent_capable);
+        assert_eq!(health.agent_version, None);
+        assert!(install(&home, &requirements, &agent, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_runtime_agent_path_resolves_from_path_without_blocking_cleanup_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("work");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let agent = executable(temp.path());
+        let search_path = std::env::join_paths([bin_dir]).unwrap();
+
+        assert_eq!(
+            resolve_unix_agent_bin_from("t-hub-agent", Some(&search_path), Some(&working_dir)),
+            agent
+        );
+        assert_eq!(
+            resolve_unix_agent_bin_from("missing-agent", Some(&search_path), Some(&working_dir)),
+            PathBuf::from("missing-agent")
+        );
     }
 
     #[test]
@@ -999,6 +1421,46 @@ mod tests {
     }
 
     #[test]
+    fn health_respects_hook_feature_precedence_and_legacy_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = executable(temp.path());
+        let requirements = temp.path().join("requirements.toml");
+        install(&home, &requirements, &agent, true).unwrap();
+
+        std::fs::write(home.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Disabled);
+        assert!(!health.hooks_enabled);
+
+        std::fs::write(&requirements, "[features]\nhooks = true\n").unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::NeedsReview);
+        assert!(health.hooks_enabled);
+
+        std::fs::write(
+            home.join("config.toml"),
+            "[features]\nhooks = true\ncodex_hooks = false\n",
+        )
+        .unwrap();
+        std::fs::write(&requirements, "[features]\nhooks = false\n").unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Disabled);
+        assert!(!health.hooks_enabled);
+
+        std::fs::remove_file(&requirements).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[features]\ncodex_hooks = false\n",
+        )
+        .unwrap();
+        let health = health_at(&home, &requirements, &agent).unwrap();
+        assert_eq!(health.status, ProducerStatus::Disabled);
+        assert!(!health.hooks_enabled);
+    }
+
+    #[test]
     fn repair_converges_stale_executable_without_duplicate_groups() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
@@ -1023,26 +1485,66 @@ mod tests {
     }
 
     #[test]
-    fn trust_and_enablement_health_follow_codex_state_without_writing_it() {
+    fn health_and_repair_detect_a_broadened_question_matcher() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         std::fs::create_dir_all(&home).unwrap();
         let agent = executable(temp.path());
         let requirements = temp.path().join("requirements.toml");
         install(&home, &requirements, &agent, true).unwrap();
+
+        let mut hooks = read_hooks(&home.join("hooks.json")).unwrap();
+        hooks["hooks"]["PreToolUse"][0]["matcher"] = Value::String("^.*$".to_string());
+        write_json_atomic(&home.join("hooks.json"), &hooks).unwrap();
+        assert_eq!(
+            health_at(&home, &requirements, &agent).unwrap().status,
+            ProducerStatus::Drifted
+        );
+
+        let repaired = repair(&home, &requirements, &agent, true).unwrap();
+        assert!(repaired.changed);
+        let hooks = read_hooks(&home.join("hooks.json")).unwrap();
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["matcher"],
+            "^request_user_input$"
+        );
+        assert_eq!(
+            hooks["hooks"]["PostToolUse"][0]["matcher"],
+            "^request_user_input$"
+        );
+    }
+
+    #[test]
+    fn trust_hash_matches_codex_0_145_normalized_identity() {
+        assert_eq!(
+            expected_trust_hash("PreToolUse", "hook-command", Some("^request_user_input$")),
+            "sha256:cb901ab35ff6ca62ad3d7dd6c32b0de4cc55b9614cd4eee1bb723ec3a4af0d41"
+        );
+        assert_eq!(
+            expected_trust_hash("Stop", "hook-command", None),
+            "sha256:d11af1de50a91de62c838f9019f55b3a9cef5aa3ebb434e944e2407557e10bf4"
+        );
+    }
+
+    #[test]
+    fn trust_health_uses_runtime_hook_path_without_writing_codex_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = executable(temp.path());
+        let requirements = temp.path().join("requirements.toml");
+        let hooks_state_path = "/home/test/.codex/hooks.json";
+        install(&home, &requirements, &agent, true).unwrap();
         let hooks = read_hooks(&home.join("hooks.json")).unwrap();
         let mut state = toml::map::Map::new();
         for event in OBSERVED_EVENTS {
-            let (group, handler, command) = find_managed_handler(&hooks, event).unwrap().unwrap();
-            let key = format!(
-                "{}:{}:{group}:{handler}",
-                home.join("hooks.json").display(),
-                event_key(event)
-            );
+            let (group, handler, command, matcher) =
+                find_managed_handler(&hooks, event).unwrap().unwrap();
+            let key = format!("{hooks_state_path}:{}:{group}:{handler}", event_key(event),);
             let mut hook_state = toml::map::Map::new();
             hook_state.insert(
                 "trusted_hash".to_string(),
-                toml::Value::String(expected_trust_hash(event, &command)),
+                toml::Value::String(expected_trust_hash(event, &command, matcher.as_deref())),
             );
             state.insert(key, toml::Value::Table(hook_state));
         }
@@ -1055,7 +1557,15 @@ mod tests {
         )]));
         std::fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            health_at(&home, &requirements, &agent).unwrap().status,
+            health_at_with_project_and_state_path(
+                &home,
+                &requirements,
+                &agent,
+                None,
+                hooks_state_path,
+            )
+            .unwrap()
+            .status,
             ProducerStatus::Healthy
         );
 
@@ -1078,7 +1588,15 @@ mod tests {
             .insert("enabled".to_string(), toml::Value::Boolean(false));
         std::fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            health_at(&home, &requirements, &agent).unwrap().status,
+            health_at_with_project_and_state_path(
+                &home,
+                &requirements,
+                &agent,
+                None,
+                hooks_state_path,
+            )
+            .unwrap()
+            .status,
             ProducerStatus::Disabled
         );
         let hook_state = config
@@ -1095,7 +1613,15 @@ mod tests {
         );
         std::fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            health_at(&home, &requirements, &agent).unwrap().status,
+            health_at_with_project_and_state_path(
+                &home,
+                &requirements,
+                &agent,
+                None,
+                hooks_state_path,
+            )
+            .unwrap()
+            .status,
             ProducerStatus::Modified
         );
     }
@@ -1147,10 +1673,14 @@ mod tests {
         let home = normalize_wsl_home(b"/home/natkins").unwrap();
         let codex_home = wsl_posix_to_unc(distro, &format!("{home}/.codex")).unwrap();
         let requirements = wsl_posix_to_unc(distro, "/etc/codex/requirements.toml").unwrap();
-        let agent = normalize_wsl_executable(b"/home/natkins/.local/bin/t-hub-agent\r\n").unwrap();
+        let digest = "a".repeat(64);
+        let agent_path = format!("/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent\r\n");
+        let agent = normalize_single_wsl_path_output(agent_path.as_bytes()).unwrap();
         let project = host_project_path_for_distro("/home/natkins/project", distro).unwrap();
+        let hooks_state_path = format!("{home}/.codex/hooks.json");
 
         assert_eq!(home, "/home/natkins");
+        assert_eq!(hooks_state_path, "/home/natkins/.codex/hooks.json");
         assert_eq!(
             codex_home.to_string_lossy(),
             r"\\wsl.localhost\Ubuntu-24.04\home\natkins\.codex"
@@ -1163,11 +1693,24 @@ mod tests {
             project.to_string_lossy(),
             r"\\wsl.localhost\Ubuntu-24.04\home\natkins\project"
         );
-        assert_eq!(agent, "/home/natkins/.local/bin/t-hub-agent");
+        assert_eq!(
+            agent,
+            format!("/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent")
+        );
         let command = managed_command(Path::new(&agent), "Stop");
-        assert!(command.starts_with("'/home/natkins/.local/bin/t-hub-agent' "));
+        assert!(command.starts_with(&format!(
+            "'/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent' "
+        )));
         assert!(!command.contains(r"\\wsl"));
         assert!(!command.contains("C:\\"));
+    }
+
+    #[test]
+    fn windows_runtime_agent_path_accepts_only_canonical_absolute_input() {
+        let digest = "a".repeat(64);
+        let resolved = format!("/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent");
+        assert!(validate_canonical_absolute_posix(&resolved).is_ok());
+        assert!(validate_canonical_absolute_posix("relative/home").is_err());
     }
 
     #[test]
@@ -1177,11 +1720,13 @@ mod tests {
         assert!(normalize_wsl_home(b"/home\\..\\root").is_err());
         assert!(normalize_wsl_home(b"/home/natkins\n/root").is_err());
         assert!(normalize_wsl_home(b"/home/natkins\0").is_err());
-        assert!(normalize_wsl_executable(b"t-hub-agent").is_err());
-        assert!(normalize_wsl_executable(b"/home/natkins/../bin/t-hub-agent").is_err());
-        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\n/root/bin/evil").is_err());
-        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\revil").is_err());
-        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\0").is_err());
+        assert!(normalize_single_wsl_path_output(b"t-hub-agent").is_err());
+        assert!(normalize_single_wsl_path_output(b"/home/natkins/../bin/t-hub-agent").is_err());
+        assert!(
+            normalize_single_wsl_path_output(b"/home/bin/t-hub-agent\n/root/bin/evil").is_err()
+        );
+        assert!(normalize_single_wsl_path_output(b"/home/bin/t-hub-agent\revil").is_err());
+        assert!(normalize_single_wsl_path_output(b"/home/bin/t-hub-agent\0").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", r"C:\Users\natha").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", "/home/../root").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", "/a\\..\\b").is_err());

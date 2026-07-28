@@ -1,13 +1,16 @@
 {
   "name": "t-hub-desktop",
   "private": true,
-  "version": "0.3.135",
+  "version": "0.3.140",
   "type": "module",
-  "description": "T-Hub — terminal-first command center for supervising many persistent Claude Code sessions in WSL2.",
+  "description": "T-Hub - terminal-first command center for supervising many persistent Codex and Claude coding-agent sessions in WSL2.",
   "scripts": {
     "dev": "vite",
     "dev:browser-test": "vite --host 127.0.0.1 --port 4180",
     "build": "tsc --noEmit && vite build",
+    "build:bundle": "vite build",
+    "build:release": "pnpm prepare:agent-resource && pnpm build",
+    "prepare:agent-resource": "node scripts/prepare-agent-resource.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",

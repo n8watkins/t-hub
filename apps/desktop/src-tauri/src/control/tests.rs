@@ -40,6 +40,7 @@ use std::thread;
 
 // Real tmux fixture progress can be delayed substantially by the parallel
 // workspace suite, while thirty seconds remains a bounded failure signal.
+#[cfg(unix)]
 const TEST_ASYNC_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
@@ -463,12 +464,22 @@ int main(int argc, char **argv) {
         if (argc >= 3) write_marker(argv[2]);
         for (;;) sleep(1);
     }
+    if (argc >= 2 && strcmp(argv[1], "same-group") == 0) {
+        if (argc < 4) return 19;
+        execl(argv[3], "codex", "changed", argv[2], (char *)0);
+        return 20;
+    }
     if (argc < 3) return 2;
     signal(SIGTTOU, SIG_IGN);
     if (setpgid(0, 0) != 0 && errno != EACCES && getpgrp() != getpid()) return 8;
     if (tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) return 9;
     const char *mode = argv[1];
     const char *marker = argv[2];
+    if (strcmp(mode, "busy") == 0) {
+        volatile unsigned long counter = 0;
+        write_marker(marker);
+        for (;;) counter++;
+    }
     if (strcmp(mode, "foreign-first") == 0) {
         if (argc < 4) return 15;
         execl(argv[3], "codex", "changed", marker, (char *)0);
@@ -641,16 +652,19 @@ impl ProcessAttestationTmuxGuard {
     }
 }
 
+#[cfg(unix)]
 struct ManagedCortanaTestCleanup {
     ctx: Arc<ControlContext>,
 }
 
+#[cfg(unix)]
 impl ManagedCortanaTestCleanup {
     fn new(ctx: Arc<ControlContext>) -> Self {
         Self { ctx }
     }
 }
 
+#[cfg(unix)]
 impl Drop for ManagedCortanaTestCleanup {
     fn drop(&mut self) {
         let durable = self.ctx.captains.cortana_identity();
@@ -806,6 +820,49 @@ fn good_token_dispatches() {
     let resp = dispatch_authenticated(&ctx, req);
     assert!(resp.ok, "expected ok, got {:?}", resp.error);
     assert!(resp.result.unwrap().get("tabs").is_some());
+}
+
+#[test]
+fn startup_tab_authority_is_retryable_until_reconciled_projection_is_published() {
+    let tabs = Arc::new(TabRegistry::new_pending_startup());
+    let ctx = test_ctx("secret").with_tab_registry(tabs.clone());
+    let request = || ControlRequest {
+        token: "secret".into(),
+        command: "list_tabs".into(),
+        args: Value::Null,
+        session: String::new(),
+        host: "secret".into(),
+        v: None,
+    };
+
+    let pending = dispatch_authenticated(&ctx, request());
+    assert!(!pending.ok);
+    assert!(pending.retryable);
+    assert!(pending
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("startup reconciliation is still pending")));
+
+    tabs.replace(vec![TabRecord {
+        id: "work-intermediate".into(),
+        name: "Intermediate".into(),
+        tile_ids: vec![],
+    }]);
+    let still_pending = dispatch_authenticated(&ctx, request());
+    assert!(!still_pending.ok);
+    assert!(still_pending.retryable);
+
+    tabs.publish_startup(vec![TabRecord {
+        id: "work-ready".into(),
+        name: "Ready".into(),
+        tile_ids: vec!["live-terminal".into()],
+    }]);
+    let ready = dispatch_authenticated(&ctx, request());
+    assert!(
+        ready.ok,
+        "expected reconciled registry, got {:?}",
+        ready.error
+    );
 }
 
 #[test]
@@ -1422,6 +1479,74 @@ fn low1_retryable_errors_carry_a_structured_flag_not_prose() {
     assert!(
         j_gone.get("retryable").is_none(),
         "retryable is omitted when false, so existing consumers see an unchanged wire"
+    );
+}
+
+#[test]
+fn cortana_retryable_managed_evidence_never_enters_quarantine_branch() {
+    let timeout = crate::tmux::TmuxError {
+        op: "trusted-python",
+        code: None,
+        io_kind: Some(std::io::ErrorKind::TimedOut),
+        message: "bounded WSL observation timed out".into(),
+    };
+    let timeout_error =
+        cortana_tmux_observation_error("active Cortana managed owner changed", timeout);
+    assert!(is_retryable_error(&timeout_error));
+    assert_eq!(
+        separate_retryable_cortana_observation::<()>(Err(timeout_error.clone())),
+        Err(timeout_error.clone()),
+        "a WSL/tmux timeout must return before authority revocation"
+    );
+    let timeout_response = ControlResponse::err(timeout_error);
+    assert!(timeout_response.retryable);
+
+    let indeterminate = crate::tmux::TmuxError {
+        op: "retire-managed-runtime",
+        code: None,
+        io_kind: Some(std::io::ErrorKind::WouldBlock),
+        message: "tmux generation liveness is indeterminate before retirement".into(),
+    };
+    let indeterminate_error = cortana_tmux_observation_error(
+        "managed owner for gone terminal remains populated or unverifiable",
+        indeterminate,
+    );
+    assert!(is_retryable_error(&indeterminate_error));
+
+    for code in [41, 43, 77, 80, 82, 83, 84, 90, 92, 94, 100, 101, 118] {
+        let inconclusive_evidence = crate::tmux::TmuxError {
+            op: "observe-managed-runtime-owner",
+            code: Some(code),
+            io_kind: Some(std::io::ErrorKind::WouldBlock),
+            message: "managed runtime evidence was unreadable".into(),
+        };
+        let observation_error = cortana_tmux_observation_error(
+            "prepared launch effect ownership is unverifiable",
+            inconclusive_evidence,
+        );
+        assert!(ControlResponse::err(observation_error).retryable);
+    }
+
+    let unreadable_error = cortana_harness_observation_error(
+        "active Cortana Harness attestation failed",
+        crate::harness::LaunchAttestationError::UnreadableEvidence,
+    );
+    assert!(is_retryable_error(&unreadable_error));
+    assert_eq!(
+        separate_retryable_cortana_observation::<()>(Err(unreadable_error.clone())),
+        Err(unreadable_error),
+        "temporarily unreadable process evidence must return before quarantine"
+    );
+
+    let definitive = cortana_harness_observation_error(
+        "active Cortana Harness attestation failed",
+        crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch,
+    );
+    assert!(!is_retryable_error(&definitive));
+    assert_eq!(
+        separate_retryable_cortana_observation::<()>(Err(definitive.clone())),
+        Ok(Err(definitive)),
+        "positive mismatch evidence must remain available to quarantine"
     );
 }
 
@@ -2897,6 +3022,31 @@ fn report_workspace_tabs_replaces_the_registry() {
     assert_eq!(tabs["tabs"][1]["name"], "Side");
     assert_eq!(tabs["tabs"][2]["kind"], "captain");
     assert_eq!(tabs["tabs"][2]["name"], CAPTAIN_WORKSPACE_NAME);
+}
+
+#[test]
+fn terminal_inventory_prunes_only_the_registry_revision_it_observed() {
+    let tabs = TabRegistry::new();
+    tabs.replace(vec![TabRecord {
+        id: "work".into(),
+        name: "Workspace".into(),
+        tile_ids: vec!["live".into(), "gone".into()],
+    }]);
+    let observed_seq = tabs.snapshot_full().seq;
+    let live = std::collections::HashSet::from(["live".to_string()]);
+
+    let pruned = tabs
+        .prune_gone_tiles_if_seq(observed_seq, &live)
+        .expect("unchanged registry should converge to terminal inventory");
+    assert_eq!(pruned.tabs[0].tile_ids, vec!["live"]);
+
+    tabs.replace(vec![TabRecord {
+        id: "work".into(),
+        name: "Workspace".into(),
+        tile_ids: vec!["live".into(), "new".into()],
+    }]);
+    assert!(tabs.prune_gone_tiles_if_seq(pruned.seq, &live).is_none());
+    assert_eq!(tabs.snapshot()[0].tile_ids, vec!["live", "new"]);
 }
 
 #[test]
@@ -5999,6 +6149,400 @@ fn force_close_with_ambiguous_rehome_persists_needs_assignment_and_rolls_back_on
     let crew = &restarted.snapshot().captains[0].crew[0];
     assert_eq!(crew.workspace_tab_id, None);
     assert!(matches!(crew.state, CrewState::NeedsAssignment { .. }));
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
+    let path = captains_tmp("startup-workspace-tile-prune");
+    let registry = CaptainsRegistry::load(path.clone());
+    registry
+        .claim_test("captain-gone", Some("startup-failure-ship"), vec![])
+        .unwrap();
+    registry
+        .adopt_unowned_workspace_projection(&[
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["live-a".into(), "gone-a".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: vec!["gone-b".into()],
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(
+        registry.snapshot().captains[0].terminal_id.as_deref(),
+        Some("captain-gone")
+    );
+    registry.fail_next_persist("startup workspace prune persistence failure");
+    let error = registry
+        .prune_gone_workspace_tiles(|tile| tile == "live-a")
+        .unwrap_err();
+    assert!(error.contains("startup workspace prune persistence failure"));
+    let filtered_snapshot = registry.snapshot();
+    assert!(filtered_snapshot.captains[0].terminal_id.is_none());
+    assert!(matches!(
+        filtered_snapshot.captains[0].state,
+        ClaimState::Orphaned { .. }
+    ));
+    let rolled_back_projection = registry.workspace_projection();
+    assert_eq!(
+        rolled_back_projection
+            .iter()
+            .find(|workspace| workspace.id == "work-a")
+            .unwrap()
+            .tile_ids,
+        vec!["live-a"]
+    );
+    assert!(rolled_back_projection
+        .iter()
+        .find(|workspace| workspace.id == "work-b")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    registry
+        .rename_workspace("work-a", "Work A renamed")
+        .unwrap();
+    let committed_seq = registry.snapshot().seq;
+    assert!(registry
+        .prune_gone_workspace_tiles(|tile| tile == "live-a")
+        .unwrap()
+        .is_empty());
+    assert_eq!(registry.snapshot().seq, committed_seq);
+
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    let tabs = TabRegistry::new();
+    tabs.replace(restarted.workspace_projection());
+    let projection = tabs.snapshot();
+    assert_eq!(
+        projection
+            .iter()
+            .find(|workspace| workspace.id == "work-a")
+            .unwrap()
+            .tile_ids,
+        vec!["live-a"]
+    );
+    assert!(projection
+        .iter()
+        .find(|workspace| workspace.id == "work-b")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_reconciliation_retries_when_workspaces_change_after_liveness_snapshot() {
+    let registry = CaptainsRegistry::new();
+    registry
+        .claim_test("old-live", Some("old-live-ship"), vec![])
+        .unwrap();
+    let stale_basis = registry.startup_workspace_reconciliation_basis();
+    registry
+        .claim_test("new-live", Some("new-live-ship"), vec![])
+        .unwrap();
+
+    let published = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        registry
+            .reconcile_startup_workspace_tiles(
+                &stale_basis,
+                |tile| tile == "old-live",
+                |_| published.store(true, Ordering::Release),
+            )
+            .unwrap(),
+        None
+    );
+    assert!(!published.load(Ordering::Acquire));
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .flat_map(|workspace| workspace.tile_ids.iter())
+        .any(|tile| tile == "new-live"));
+
+    let current_basis = registry.startup_workspace_reconciliation_basis();
+    assert_eq!(
+        registry
+            .reconcile_startup_workspace_tiles(
+                &current_basis,
+                |tile| matches!(tile, "old-live" | "new-live"),
+                |_| published.store(true, Ordering::Release),
+            )
+            .unwrap(),
+        Some(Vec::new())
+    );
+    assert!(published.load(Ordering::Acquire));
+}
+
+#[test]
+fn startup_reconciliation_ignores_unrelated_registry_changes() {
+    let registry = CaptainsRegistry::new();
+    registry
+        .claim_test("captain-live", Some("live-ship"), vec![])
+        .unwrap();
+    let basis = registry.startup_workspace_reconciliation_basis();
+    registry
+        .checkpoint(
+            Some("captain-live"),
+            None,
+            None,
+            None,
+            Some("active checkpoint"),
+        )
+        .unwrap();
+
+    let published = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        registry
+            .reconcile_startup_workspace_tiles(
+                &basis,
+                |tile| tile == "captain-live",
+                |_| published.store(true, Ordering::Release),
+            )
+            .unwrap(),
+        Some(Vec::new())
+    );
+    assert!(published.load(Ordering::Acquire));
+}
+
+#[test]
+fn startup_prune_reconciles_gone_managed_tiles_and_preserves_live_crew() {
+    let path = captains_tmp("startup-managed-workspace-tile-prune");
+    let registry = CaptainsRegistry::load(path.clone());
+    registry
+        .upsert_project(ProjectRecord {
+            project_id: "project-startup-prune".into(),
+            name: "Startup prune".into(),
+            repo_root: "/tmp/startup-prune".into(),
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
+            remote_url: None,
+            default_branch: None,
+            powder: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+    registry
+        .claim_test("captain-gone", Some("startup-ship"), vec![])
+        .unwrap();
+    registry
+        .bind_ship_context(
+            "startup-ship",
+            "project-startup-prune",
+            "Reconcile startup",
+            "codex",
+        )
+        .unwrap();
+    let captain = registry.snapshot().captains[0].clone();
+    registry
+        .create_workspace(
+            "work-managed",
+            "Managed work",
+            Some(&FleetWorkspaceOwner {
+                project_id: captain.project_id.clone().unwrap(),
+                assignment_id: captain.assignment_id.clone(),
+                ship_slug: captain.ship_slug.clone(),
+            }),
+        )
+        .unwrap();
+    for crew in ["crew-gone", "crew-live"] {
+        registry.record_crew("captain-gone", crew).unwrap();
+        registry.move_workspace_tile(crew, "work-managed").unwrap();
+    }
+
+    assert_eq!(
+        registry
+            .prune_gone_workspace_tiles(|tile| tile == "crew-live")
+            .unwrap(),
+        vec!["captain-gone".to_string(), "crew-gone".to_string()]
+    );
+    let snapshot = registry.snapshot();
+    let captain = &snapshot.captains[0];
+    assert!(captain.terminal_id.is_none());
+    assert!(matches!(captain.state, ClaimState::Orphaned { .. }));
+    let gone = captain
+        .crew
+        .iter()
+        .find(|crew| crew.terminal_id == "crew-gone")
+        .unwrap();
+    assert!(matches!(gone.state, CrewState::Removed { .. }));
+    assert!(gone.workspace_tab_id.is_none());
+    let live = captain
+        .crew
+        .iter()
+        .find(|crew| crew.terminal_id == "crew-live")
+        .unwrap();
+    assert!(matches!(live.state, CrewState::Orphaned { .. }));
+    assert_eq!(live.workspace_tab_id.as_deref(), Some("work-managed"));
+    let projection = registry.workspace_projection();
+    assert!(projection
+        .iter()
+        .find(|workspace| workspace.id == CAPTAIN_WORKSPACE_ID)
+        .unwrap()
+        .tile_ids
+        .is_empty());
+    assert_eq!(
+        projection
+            .iter()
+            .find(|workspace| workspace.id == "work-managed")
+            .unwrap()
+            .tile_ids,
+        vec!["crew-live"]
+    );
+
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    assert_eq!(
+        restarted
+            .workspace_projection()
+            .iter()
+            .find(|workspace| workspace.id == "work-managed")
+            .unwrap()
+            .tile_ids,
+        vec!["crew-live"]
+    );
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_prune_orphans_a_gone_cortana_before_projection() {
+    let path = captains_tmp("startup-gone-cortana-prune");
+    let registry = CaptainsRegistry::load(path.clone());
+    registry
+        .claim(
+            "cortana-gone",
+            None,
+            FleetRole::Cortana,
+            None,
+            vec![],
+            &all_alive,
+            &crew_all_alive,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.prune_gone_workspace_tiles(|_| false).unwrap(),
+        vec!["cortana-gone".to_string()]
+    );
+    let snapshot = registry.snapshot();
+    let cortana = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .unwrap();
+    assert!(matches!(cortana.state, ClaimState::Orphaned { .. }));
+    assert!(cortana.terminal_id.is_none());
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == CAPTAIN_WORKSPACE_ID)
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    let cortana = restarted
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .unwrap();
+    assert!(matches!(cortana.state, ClaimState::Orphaned { .. }));
+    assert!(cortana.terminal_id.is_none());
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_prune_preserves_cleanup_recovery_without_restoring_crew_tile() {
+    let path = captains_tmp("startup-cleanup-pending-tile-prune");
+    let source = powder_lifecycle_registry(None);
+    let mut snapshot = source.snapshot();
+    snapshot.captains[0].workspace_tab_ids = vec!["work-recovery".into()];
+    let crew = &mut snapshot.captains[0].crew[0];
+    crew.workspace_tab_id = Some("work-recovery".into());
+    crew.state = CrewState::CleanupPending { since: 1 };
+    let work = crew.powder_work.as_mut().unwrap();
+    work.dispatch_release_recovery = true;
+    snapshot
+        .pending_dispatch_releases
+        .push(PendingDispatchRelease {
+            crew_session_id: crew.terminal_id.clone(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "profile-that-does-not-exist-for-control-tests".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: work.card_id.clone(),
+            run_id: work.run_id.clone(),
+            agent: work.agent.clone().unwrap(),
+            operation_id: "startup-prune-release".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        });
+    snapshot.workspaces =
+        CaptainsRegistry::reconcile_durable_workspaces(&snapshot.captains, snapshot.workspaces);
+    snapshot.seq = snapshot.seq.saturating_add(1);
+    CaptainsRegistry::validate_snapshot(&snapshot).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+    let registry = CaptainsRegistry::load(path.clone());
+    assert_eq!(
+        registry
+            .prune_gone_workspace_tiles(|tile| tile == "captain-powder")
+            .unwrap(),
+        vec!["crew-powder".to_string()]
+    );
+    let committed = registry.snapshot();
+    let crew = &committed.captains[0].crew[0];
+    assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+    assert!(crew.workspace_tab_id.is_none());
+    assert_eq!(committed.pending_dispatch_releases.len(), 1);
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == "work-recovery")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    registry
+        .rename_workspace("work-recovery", "Recovery renamed")
+        .unwrap();
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == "work-recovery")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    let crew = &restarted.snapshot().captains[0].crew[0];
+    assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+    assert!(crew.workspace_tab_id.is_none());
+    assert!(restarted
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == "work-recovery")
+        .unwrap()
+        .tile_ids
+        .is_empty());
 
     let _ = std::fs::remove_file(path.with_extension("json.bak"));
     let _ = std::fs::remove_file(path);
@@ -16107,7 +16651,13 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
         loop {
             match observe(target, owner) {
                 Ok(observed) if &observed != baseline => break Ok(observed),
-                Err(error) => break Err(error),
+                Err(error @ crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => {
+                    break Err(error);
+                }
+                Err(error) => assert!(
+                    Instant::now() < deadline,
+                    "Harness identity did not settle after a process transition: {error:?}"
+                ),
                 _ => {}
             }
             assert!(Instant::now() < deadline, "Harness identity did not change");
@@ -16130,6 +16680,25 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
             "foreign first provider never reached a stable rejected state"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    tmux::retire_managed_runtime(&target, &owner).unwrap();
+
+    // A live provider changes the CPU accounting fields in /proc/<pid>/stat.
+    // Attestation must pin immutable identity and topology fields rather than
+    // treating those volatile counters as evidence of process substitution.
+    let (target, marker, owner) = start("busy", true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "busy Harness did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let baseline = wait_observed(&target, &owner);
+    for _ in 0..8 {
+        assert_eq!(
+            observe(&target, &owner).unwrap(),
+            baseline,
+            "CPU activity changed the attested Harness identity"
+        );
     }
     tmux::retire_managed_runtime(&target, &owner).unwrap();
 
@@ -16701,7 +17270,7 @@ fn delayed_node_wrapper_attestation_case(trusted_child: bool) {
     let child_marker = script_dir.join("child-start");
     let child_spawn = if trusted_child {
         format!(
-            "spawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});",
+            "spawn({}, ['same-group', {}, {}], {{ stdio: 'inherit' }});",
             serde_json::to_string(&executable).unwrap(),
             serde_json::to_string(&child_marker).unwrap(),
             serde_json::to_string(&trusted_native).unwrap(),
@@ -16882,18 +17451,30 @@ fn delayed_node_wrapper_attestation_case(trusted_child: bool) {
         &fake
     };
     let child_exe = std::fs::metadata(child_executable).unwrap();
-    loop {
+    if trusted_child {
         let effect = tmux::observe_session_effect_identity(&target).unwrap();
         let foreground_exe =
             std::fs::metadata(format!("/proc/{}/exe", effect.foreground_pid)).unwrap();
-        if foreground_exe.dev() == child_exe.dev() && foreground_exe.ino() == child_exe.ino() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "delayed provider child never became the foreground generation"
+        assert_eq!(foreground_exe.dev(), expected.executable.device);
+        assert_eq!(foreground_exe.ino(), expected.executable.inode);
+        assert_ne!(
+            (foreground_exe.dev(), foreground_exe.ino()),
+            (child_exe.dev(), child_exe.ino())
         );
-        std::thread::sleep(Duration::from_millis(20));
+    } else {
+        loop {
+            let effect = tmux::observe_session_effect_identity(&target).unwrap();
+            let foreground_exe =
+                std::fs::metadata(format!("/proc/{}/exe", effect.foreground_pid)).unwrap();
+            if foreground_exe.dev() == child_exe.dev() && foreground_exe.ino() == child_exe.ino() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delayed provider child never became the foreground generation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     let child_observation = crate::harness::observe_scoped_harness_process(
         &target,
@@ -17494,7 +18075,11 @@ fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
         crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
     ));
     let terminal_id = active.terminal_id.clone().unwrap();
+    let identity_id = active.identity_id.clone().unwrap();
+    let generation = active.generation;
+    let quarantine_ledger = active.quarantine_ledger.clone();
     let owner = active.owner.clone().unwrap();
+    let sessions_before = tmux::list_sessions().unwrap();
 
     // Keep this retry observation-only after an uncertain result. That
     // makes the elapsed bound measure the shared observation deadline,
@@ -17530,7 +18115,10 @@ fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
 
     let (result, elapsed) = worker.join().unwrap();
     let error = result.unwrap_err();
-    assert!(!error.trim().is_empty());
+    assert!(
+        is_retryable_error(&error),
+        "an inconclusive ancestry observation must be retryable: {error:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(3),
         "one-second aggregate observation deadline took {elapsed:?}"
@@ -17538,6 +18126,30 @@ fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
     assert!(
         ctx.dispatch_admission.try_lock().is_ok(),
         "dispatch admission remained unavailable after observation timeout"
+    );
+    let retained = ctx.captains.cortana_identity();
+    assert_eq!(retained.identity_id.as_deref(), Some(identity_id.as_str()));
+    assert_eq!(retained.terminal_id.as_deref(), Some(terminal_id.as_str()));
+    assert_eq!(retained.generation, generation);
+    assert_eq!(retained.quarantine_ledger, quarantine_ledger);
+    assert!(ctx.captains.snapshot().captains.iter().any(|captain| {
+        captain.role == FleetRole::Cortana
+            && captain.state == ClaimState::Active
+            && captain.terminal_id.as_deref() == Some(terminal_id.as_str())
+    }));
+    let retained_identity = ctx.identity.get(&identity_id).unwrap();
+    assert_eq!(
+        retained_identity.session_tile.as_deref(),
+        Some(terminal_id.as_str())
+    );
+    assert_eq!(
+        tmux::session_liveness(&tmux_target(&terminal_id)),
+        tmux::SessionLiveness::Alive
+    );
+    assert_eq!(
+        tmux::list_sessions().unwrap(),
+        sessions_before,
+        "a transient observation must not spawn a replacement Cortana"
     );
 
     tmux::retire_managed_runtime(&tmux_target(&terminal_id), &tmux_cortana_owner(&owner)).unwrap();
@@ -21866,8 +22478,13 @@ fn audit_refusal_releases_idempotency_reservation_for_retry() {
     let _ = std::fs::remove_dir_all(&sink_parent);
     let _ = std::fs::remove_file(&sink_parent);
     std::fs::write(&sink_parent, b"not a directory").unwrap();
-    let ctx =
-        test_ctx("audit-retry").with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
+    // Stub the live-session evidence. The spawn path gathers it by shelling out
+    // to tmux BEFORE the audit gate, so a tmux server that is unreachable (a
+    // loaded CI runner, a hostile socket name) refuses the request as
+    // `refused-evidence` and this test never reaches the gate it covers.
+    let ctx = test_ctx("audit-retry")
+        .with_live_sessions(|| Ok(Vec::new()))
+        .with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
     let request = || {
         req(
             "audit-retry",
@@ -21905,7 +22522,12 @@ fn audit_refusal_refunds_governor_admission() {
     };
 
     let spawn_sink = broken_sink();
+    // Stub the live-session evidence: both the dispatch below and the
+    // `admit_spawn` refund check gather it from tmux before the audit gate, so
+    // an unreachable tmux server refuses as `refused-evidence` and hides the
+    // gate behaviour this test covers.
     let spawn_ctx = test_ctx("audit-spawn-refund")
+        .with_live_sessions(|| Ok(Vec::new()))
         .with_governor(Arc::new(SpawnGovernor::new(128, 0.0, 1.0)))
         .with_audit(Arc::new(AuditLog::new(spawn_sink.join("audit"))));
     let response = dispatch_authenticated(
