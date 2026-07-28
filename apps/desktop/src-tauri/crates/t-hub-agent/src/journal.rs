@@ -398,10 +398,12 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                head_seq = entry.seq.max(head_seq.saturating_add(1));
-                if let Some(event_id) = entry.event_id.as_deref() {
-                    Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+            if let Ok(entries) = Self::parse_complete_record(&line.bytes) {
+                for entry in entries {
+                    head_seq = entry.seq.max(head_seq.saturating_add(1));
+                    if let Some(event_id) = entry.event_id.as_deref() {
+                        Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                    }
                 }
             }
         }
@@ -526,6 +528,21 @@ impl Journal {
             bytes.pop();
         }
         Ok(Some(BoundedLine { bytes, complete }))
+    }
+
+    /// Parse every complete JSON value in one physical journal record.
+    ///
+    /// Current writers append one serialized entry and its newline in a single
+    /// locked write.
+    /// Older writers could interleave those two writes across hook processes,
+    /// leaving multiple otherwise complete entries concatenated before one
+    /// newline.
+    /// Treat those values as consecutive durable entries while still rejecting
+    /// malformed bytes.
+    fn parse_complete_record(bytes: &[u8]) -> serde_json::Result<Vec<EventJournalEntry>> {
+        serde_json::Deserializer::from_slice(bytes)
+            .into_iter::<EventJournalEntry>()
+            .collect()
     }
 
     fn read_head_state(&self) -> Option<HeadState> {
@@ -736,13 +753,15 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                Ok(mut entry) => {
-                    seq = entry.seq.max(seq.saturating_add(1));
-                    last_seq = last_seq.max(seq);
-                    if seq > after_seq && !Self::is_compaction_watermark(&entry) {
-                        entry.seq = seq;
-                        out.push(entry);
+            match Self::parse_complete_record(&line.bytes) {
+                Ok(entries) => {
+                    for mut entry in entries {
+                        seq = entry.seq.max(seq.saturating_add(1));
+                        last_seq = last_seq.max(seq);
+                        if seq > after_seq && !Self::is_compaction_watermark(&entry) {
+                            entry.seq = seq;
+                            out.push(entry);
+                        }
                     }
                 }
                 Err(error) => {
@@ -842,13 +861,15 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            // Skip torn/garbage lines but still advance past them (same tolerance
-            // as recovery/replay); only count parseable entries toward `seq`.
-            if let Ok(mut e) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                seq = e.seq.max(seq.saturating_add(1));
-                if !Self::is_compaction_watermark(&e) {
-                    e.seq = seq;
-                    out.push(e);
+            // Skip torn/garbage lines but still advance past them.
+            // Only count parseable entries toward `seq`.
+            if let Ok(entries) = Self::parse_complete_record(&line.bytes) {
+                for mut entry in entries {
+                    seq = entry.seq.max(seq.saturating_add(1));
+                    if !Self::is_compaction_watermark(&entry) {
+                        entry.seq = seq;
+                        out.push(entry);
+                    }
                 }
             }
         }
@@ -916,26 +937,38 @@ impl Journal {
                 if line.bytes.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let parsed = serde_json::from_slice::<EventJournalEntry>(&line.bytes).ok();
-                if let Some(entry) = parsed.as_ref() {
-                    head_seq = entry.seq.max(head_seq.saturating_add(1));
-                }
-                let is_discarded = parsed.as_ref().is_some_and(|entry| {
-                    entry.source == JournalSource::Status || Self::is_compaction_watermark(entry)
-                });
-                if !is_discarded {
-                    out.write_all(&line.bytes)
-                        .context("writing compaction entry")?;
-                    out.write_all(b"\n")?;
-                    compacted_len = compacted_len
-                        .checked_add(line.bytes.len() as u64 + 1)
-                        .context("compacted journal length overflow")?;
-                    if let Some(entry) = parsed {
-                        kept += 1;
-                        retained_head_seq = head_seq;
-                        if let Some(event_id) = entry.event_id.as_deref() {
-                            Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                match Self::parse_complete_record(&line.bytes) {
+                    Ok(entries) => {
+                        for mut entry in entries {
+                            head_seq = entry.seq.max(head_seq.saturating_add(1));
+                            if entry.source == JournalSource::Status
+                                || Self::is_compaction_watermark(&entry)
+                            {
+                                continue;
+                            }
+                            entry.seq = head_seq;
+                            let serialized = serde_json::to_vec(&entry)
+                                .context("serializing normalized compaction entry")?;
+                            out.write_all(&serialized)
+                                .context("writing compaction entry")?;
+                            out.write_all(b"\n")?;
+                            compacted_len = compacted_len
+                                .checked_add(serialized.len() as u64 + 1)
+                                .context("compacted journal length overflow")?;
+                            kept += 1;
+                            retained_head_seq = head_seq;
+                            if let Some(event_id) = entry.event_id.as_deref() {
+                                Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                            }
                         }
+                    }
+                    Err(_) => {
+                        out.write_all(&line.bytes)
+                            .context("preserving unknown compaction record")?;
+                        out.write_all(b"\n")?;
+                        compacted_len = compacted_len
+                            .checked_add(line.bytes.len() as u64 + 1)
+                            .context("compacted journal length overflow")?;
                     }
                 }
             }
@@ -1866,6 +1899,94 @@ mod tests {
             replay.is_err(),
             "replay must not attest a boundary after silently dropping a malformed record"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_recovers_concatenated_legacy_records() {
+        let dir = temp_dir("concatenated-replay-records");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = entry(JournalEventType::SessionStart, "first");
+        first.seq = 1;
+        let mut second = entry(JournalEventType::SessionEnd, "second");
+        second.seq = 1;
+        let journal_bytes = format!(
+            "{}{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
+
+        let journal = Journal::open(&dir).unwrap();
+        let replay = journal.replay_with_boundary(0).unwrap();
+        assert_eq!(
+            replay
+                .entries
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(replay.last_seq, 2);
+
+        let appended = journal
+            .append(entry(JournalEventType::TaskCreated, "third"))
+            .unwrap();
+        assert_eq!(appended.seq, 3);
+
+        let (tailed, offset, tail_head) = journal.tail_from(0, 0).unwrap();
+        assert_eq!(
+            tailed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(offset, journal.byte_len());
+        assert_eq!(tail_head, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_normalizes_concatenated_legacy_records() {
+        let dir = temp_dir("compact-concatenated-records");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = entry(JournalEventType::SessionStart, "first");
+        first.seq = 1;
+        let mut status = entry(JournalEventType::StatusSnapshot, "status");
+        status.seq = 1;
+        status.source = JournalSource::Status;
+        let mut third = entry(JournalEventType::TaskCreated, "third");
+        third.seq = 1;
+        let journal_bytes = format!(
+            "{}{}{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&status).unwrap(),
+            serde_json::to_string(&third).unwrap()
+        );
+        std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
+
+        let journal = Journal::open(&dir).unwrap();
+        let (_, _, kept) = journal.compact_dropping_status().unwrap();
+        assert_eq!(kept, 2);
+
+        let replay = journal.replay_with_boundary(0).unwrap();
+        assert_eq!(
+            replay
+                .entries
+                .iter()
+                .map(|event| (&event.event_type, event.seq))
+                .collect::<Vec<_>>(),
+            vec![
+                (&JournalEventType::SessionStart, 1),
+                (&JournalEventType::TaskCreated, 3),
+            ]
+        );
+        assert_eq!(replay.last_seq, 3);
+
+        let compacted = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+        assert!(compacted
+            .lines()
+            .all(|line| { serde_json::from_str::<EventJournalEntry>(line).is_ok() }));
 
         std::fs::remove_dir_all(&dir).ok();
     }
