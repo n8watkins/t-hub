@@ -398,13 +398,17 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if let Ok(entries) = Self::parse_complete_record(&line.bytes) {
-                for entry in entries {
-                    head_seq = entry.seq.max(head_seq.saturating_add(1));
-                    if let Some(event_id) = entry.event_id.as_deref() {
-                        Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+            match Self::parse_complete_record(&line.bytes) {
+                Ok(entries) => {
+                    for entry in entries {
+                        head_seq = entry.seq.max(head_seq.saturating_add(1));
+                        if let Some(event_id) = entry.event_id.as_deref() {
+                            Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
+                        }
                     }
                 }
+                Err(error) if error.is_io() => return Err(error.into()),
+                Err(_) => {}
             }
         }
         Ok(HeadState {
@@ -501,11 +505,12 @@ impl Journal {
         scanned: &mut u64,
     ) -> Result<Option<BoundedLine>> {
         let mut bytes = Vec::new();
-        let limit = MAX_ENTRY_BYTES
-            .checked_add(2)
-            .context("journal entry read limit overflow")?;
+        let limit = MAX_SCAN_BYTES
+            .checked_sub(*scanned)
+            .and_then(|remaining| remaining.checked_add(1))
+            .context("journal scan byte limit overflow")?;
         let read = reader
-            .take(limit as u64)
+            .take(limit)
             .read_until(b'\n', &mut bytes)
             .context("reading journal line")?;
         if read == 0 {
@@ -519,11 +524,6 @@ impl Journal {
             "journal scan exceeded the {MAX_SCAN_BYTES}-byte limit"
         );
         let complete = bytes.last() == Some(&b'\n');
-        let content_len = bytes.len().saturating_sub(usize::from(complete));
-        anyhow::ensure!(
-            content_len <= MAX_ENTRY_BYTES,
-            "journal entry exceeds the {MAX_ENTRY_BYTES}-byte limit"
-        );
         if complete {
             bytes.pop();
         }
@@ -540,9 +540,36 @@ impl Journal {
     /// Treat those values as consecutive durable entries while still rejecting
     /// malformed bytes.
     fn parse_complete_record(bytes: &[u8]) -> serde_json::Result<Vec<EventJournalEntry>> {
-        serde_json::Deserializer::from_slice(bytes)
-            .into_iter::<EventJournalEntry>()
-            .collect()
+        let mut stream =
+            serde_json::Deserializer::from_slice(bytes).into_iter::<EventJournalEntry>();
+        let mut entries = Vec::new();
+        let mut previous_end = 0;
+        while let Some(result) = stream.next() {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(error) if bytes.len() <= MAX_ENTRY_BYTES => return Err(error),
+                Err(_) => return Err(Self::oversized_record_error()),
+            };
+            let end = stream.byte_offset();
+            let start = previous_end
+                + bytes[previous_end..end]
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .unwrap_or(end - previous_end);
+            if end - start > MAX_ENTRY_BYTES {
+                return Err(Self::oversized_record_error());
+            }
+            previous_end = end;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn oversized_record_error() -> serde_json::Error {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal entry exceeds the {MAX_ENTRY_BYTES}-byte limit"),
+        ))
     }
 
     fn read_head_state(&self) -> Option<HeadState> {
@@ -1911,11 +1938,16 @@ mod tests {
         first.seq = 1;
         let mut second = entry(JournalEventType::SessionEnd, "second");
         second.seq = 1;
+        first.payload = serde_json::json!({"data": "x".repeat(MAX_ENTRY_BYTES / 2 + 1)});
+        second.payload = serde_json::json!({"data": "y".repeat(MAX_ENTRY_BYTES / 2 + 1)});
         let journal_bytes = format!(
             "{}{}\n",
             serde_json::to_string(&first).unwrap(),
             serde_json::to_string(&second).unwrap()
         );
+        assert!(journal_bytes.len() > MAX_ENTRY_BYTES);
+        assert!(serde_json::to_vec(&first).unwrap().len() <= MAX_ENTRY_BYTES);
+        assert!(serde_json::to_vec(&second).unwrap().len() <= MAX_ENTRY_BYTES);
         std::fs::write(dir.join(JOURNAL_FILE), journal_bytes).unwrap();
 
         let journal = Journal::open(&dir).unwrap();

@@ -796,7 +796,7 @@ fn probe_agent_capabilities(path: &Path) -> AgentCapabilityProbe {
         command
             .arg("-d")
             .arg(wsl_distro())
-            .arg("--")
+            .arg("-e")
             .arg(path)
             .arg("--capabilities-json")
             .creation_flags(0x0800_0000);

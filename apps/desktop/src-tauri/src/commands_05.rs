@@ -254,10 +254,13 @@ pub async fn codex_hooks_health(
 /// DISTINCT UI opt-in that names the blocking behavior) or this refuses.
 #[tauri::command]
 pub async fn install_claude_gate(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::claude::InstallReport, String> {
-    crate::claude::install::install_gate(&agent_bin, consent).map_err(|e| e.to_string())
+    let packaged_agent = ensure_packaged_hook_helper(&state)?;
+    let agent_bin = packaged_agent.as_deref().unwrap_or(&agent_bin);
+    crate::claude::install::install_gate(agent_bin, consent).map_err(|e| e.to_string())
 }
 
 /// Remove ONLY the blocking gate (its distinct opt-out), leaving observe hooks intact.
