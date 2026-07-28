@@ -378,7 +378,7 @@ pub struct WorktreeCoordinator {
     inner: Mutex<WorktreeRetirementSnapshot>,
     admissions: Mutex<BTreeMap<String, usize>>,
     workers: Mutex<BTreeSet<String>>,
-    coordination: Mutex<()>,
+    boundaries: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 pub struct WorktreeAdmissionGuard {
@@ -474,7 +474,7 @@ impl WorktreeCoordinator {
             inner: Mutex::new(snapshot),
             admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
-            coordination: Mutex::new(()),
+            boundaries: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -488,7 +488,7 @@ impl WorktreeCoordinator {
             inner: Mutex::new(WorktreeRetirementSnapshot::default()),
             admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
-            coordination: Mutex::new(()),
+            boundaries: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -539,8 +539,16 @@ impl WorktreeCoordinator {
             ));
         }
 
-        let _coordination = self
-            .coordination
+        let mut boundaries = self
+            .boundaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let boundary = Arc::clone(
+            boundaries
+                .entry(worktree_path.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        );
+        let _boundary = boundary
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let admissions = self
@@ -610,6 +618,20 @@ impl WorktreeCoordinator {
         if let Err(error) = self.persist(&snapshot) {
             *snapshot = previous;
             return Err(error);
+        }
+        if !state.is_active() {
+            let worktree_path = updated.worktree_path.clone();
+            drop(snapshot);
+            let mut boundaries = self
+                .boundaries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if boundaries
+                .get(&worktree_path)
+                .is_some_and(|boundary| Arc::strong_count(boundary) == 1)
+            {
+                boundaries.remove(&worktree_path);
+            }
         }
         Ok(updated)
     }
@@ -861,10 +883,25 @@ impl WorktreeCoordinator {
             .map_err(|error| {
                 format!("{operation}: could not resolve worktree activity: {error}")
             })?;
-        let _coordination = self
-            .coordination
+        let mut boundaries = self
+            .boundaries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let boundary = {
+            let snapshot = self.lock();
+            matching_active_retirement(&snapshot, &candidate_path).map(|record| {
+                Arc::clone(
+                    boundaries
+                        .entry(record.worktree_path.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            })
+        };
+        let _boundary = boundary.as_ref().map(|boundary| {
+            boundary
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let mut admissions = self
             .admissions
             .lock()
@@ -898,8 +935,18 @@ impl WorktreeCoordinator {
         record: &WorktreeRetirement,
         request: &RetirementCleanupRequest,
     ) -> Result<std::process::Output, String> {
-        let _coordination = self
-            .coordination
+        let boundary = {
+            let mut boundaries = self
+                .boundaries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                boundaries
+                    .entry(record.worktree_path.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _boundary = boundary
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
@@ -916,7 +963,7 @@ impl WorktreeCoordinator {
                 "Cargo cleanup commit refused because worktree activity is admitted".into(),
             );
         }
-        drop(_coordination);
+        drop(_boundary);
         run_provider(&record.request_path)
     }
 }
@@ -1970,7 +2017,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(admission.blockers.len(), 2);
-        assert!(coordinator.coordination.try_lock().is_ok());
+        let boundaries = coordinator
+            .boundaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = Arc::clone(
+            boundaries
+                .get(directory.path().join("first").to_str().unwrap())
+                .unwrap(),
+        );
+        let second = Arc::clone(
+            boundaries
+                .get(directory.path().join("second").to_str().unwrap())
+                .unwrap(),
+        );
+        drop(boundaries);
+        let _first_guard = first
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(second.try_lock().is_ok());
+        drop(_first_guard);
         assert!(coordinator
             .admit_activity(
                 directory.path().join("first").to_str().unwrap(),
