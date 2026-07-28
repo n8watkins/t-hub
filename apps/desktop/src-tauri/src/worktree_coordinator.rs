@@ -515,6 +515,7 @@ watchdog_connection = None
 watchdog_lease = None
 watchdog_secret = None
 freeze_changed = False
+watchdog_events = []
 try:
     managed = managed_cgroup(root_pid)
     if managed is None:
@@ -574,6 +575,7 @@ try:
     )
     if launch.returncode != 0 or launch.stdout or launch.stderr:
         raise RuntimeError("freeze watchdog transient unit could not be started")
+    watchdog_events.append("unitCreated")
     watchdog_connection, _ = watchdog_listener.accept()
     peer_pid, peer_uid, _ = struct.unpack(
         "3i",
@@ -596,7 +598,9 @@ try:
         watchdog_secret,
         min(watchdog_deadline, time.monotonic() + 2),
     )
+    watchdog_events.append("preparedReady")
     watchdog_connection.sendall(signed("arm", watchdog_lease, watchdog_secret))
+    watchdog_events.append("armSent")
     receive(
         watchdog_connection,
         "frozen",
@@ -605,6 +609,7 @@ try:
         min(watchdog_deadline, time.monotonic() + 6),
     )
     freeze_changed = True
+    watchdog_events.append("frozen")
     if (
         cgroup_path(root_pid) != managed_path
         or os.fstat(cgroup_directory).st_ino != managed_inode
@@ -687,6 +692,7 @@ try:
         or supervisor_descriptors[namespace_supervisor] != descriptors(namespace_supervisor)
     ):
         raise RuntimeError("managed process or task set changed during containment inspection")
+    watchdog_events.append("containmentVerified")
 finally:
     signal.alarm(0)
     unfreeze_error = None
@@ -701,6 +707,7 @@ finally:
             watchdog_connection.sendall(
                 signed("thaw", watchdog_lease, watchdog_secret)
             )
+            watchdog_events.append("thawed")
             receive(
                 watchdog_connection,
                 "thawed",
@@ -725,6 +732,7 @@ finally:
                 min(watchdog_lease["deadline"], time.monotonic() + 2),
             )
             freeze_changed = False
+            watchdog_events.append("disarmed")
         except Exception as error:
             unfreeze_error = error
     if watchdog_connection is not None:
@@ -735,6 +743,7 @@ finally:
         os.close(cgroup_directory)
     if unfreeze_error is not None:
         raise RuntimeError(f"managed process unfreeze failed: {unfreeze_error}")
+print(json.dumps({"version": 1, "events": watchdog_events}, separators=(",", ":")))
 "#;
 
 const CONTAINMENT_PREFLIGHT_SCRIPT: &str = r#"
@@ -2041,6 +2050,82 @@ fn require_namespace_containment(
     Ok(())
 }
 
+const WATCHDOG_LIFECYCLE_EVENTS: [&str; 8] = [
+    "unitCreated",
+    "preparedReady",
+    "armSent",
+    "frozen",
+    "containmentVerified",
+    "thawed",
+    "disarmed",
+    "providerAdmission",
+];
+
+trait WatchdogLifecycleOperations {
+    fn execute(&mut self, operation: &'static str) -> Result<(), String>;
+    fn recover(&mut self) -> Result<(), String>;
+}
+
+fn execute_watchdog_lifecycle(
+    operations: &mut impl WatchdogLifecycleOperations,
+) -> Result<(), String> {
+    for operation in WATCHDOG_LIFECYCLE_EVENTS {
+        if let Err(error) = operations.execute(operation) {
+            operations.recover()?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WatchdogLifecycleReport {
+    version: u32,
+    events: Vec<String>,
+}
+
+struct ReportedWatchdogLifecycle {
+    events: std::vec::IntoIter<String>,
+}
+
+impl WatchdogLifecycleOperations for ReportedWatchdogLifecycle {
+    fn execute(&mut self, operation: &'static str) -> Result<(), String> {
+        if operation == "providerAdmission" && self.events.len() == 0 {
+            return Ok(());
+        }
+        match self.events.next() {
+            Some(event) if event == operation => Ok(()),
+            Some(event) => Err(format!(
+                "freeze watchdog lifecycle expected '{operation}', received '{event}'"
+            )),
+            None => Err(format!(
+                "freeze watchdog lifecycle ended before '{operation}'"
+            )),
+        }
+    }
+
+    fn recover(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn validate_watchdog_lifecycle_report(stdout: &[u8]) -> Result<(), String> {
+    let report: WatchdogLifecycleReport = serde_json::from_slice(stdout)
+        .map_err(|error| format!("freeze watchdog lifecycle report is invalid: {error}"))?;
+    if report.version != 1 {
+        return Err("freeze watchdog lifecycle report version is unsupported".into());
+    }
+    let mut operations = ReportedWatchdogLifecycle {
+        events: report.events.into_iter(),
+    };
+    execute_watchdog_lifecycle(&mut operations)?;
+    if operations.events.next().is_some() {
+        return Err("freeze watchdog lifecycle report has duplicate operations".into());
+    }
+    Ok(())
+}
+
 fn verify_process_containment(
     panes: &[crate::tmux::PaneInfo],
     target: &CapturedWorktreeIdentity,
@@ -2087,6 +2172,12 @@ fn verify_process_containment(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+        validate_watchdog_lifecycle_report(&output.stdout).map_err(|error| {
+            format!(
+                "Cargo cleanup refuses session '{}' watchdog evidence: {error}",
+                pane.session
+            )
+        })?;
     }
     Ok(())
 }
@@ -3014,26 +3105,6 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum WatchdogFault {
-        Setup,
-        MissingReady,
-        MalformedReady,
-        ParentBeforeFreeze,
-        ParentAfterFreeze,
-        WrapperOnlyDeath,
-        WatchdogCrash,
-        Deadline,
-        InodeReplacement,
-        PreFrozen,
-        CompetingOwner,
-        StaleDisarm,
-        MismatchedDisarm,
-        DuplicateDisarm,
-        RestartRecovery,
-        None,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TestLeaseState {
         Prepared,
         Armed,
@@ -3041,129 +3112,127 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct WatchdogProtocolHarness {
+    struct InjectedWatchdogOperations {
+        fail_at: Option<&'static str>,
+        operations: Vec<&'static str>,
         exact_frozen: bool,
         unrelated_frozen: bool,
         changed: bool,
         lease: Option<TestLeaseState>,
-        provider_invocations: usize,
+        provider_admissions: usize,
         terminal_preserved: bool,
         agent_preserved: bool,
         source_preserved: bool,
     }
 
-    impl WatchdogProtocolHarness {
-        fn recover(&mut self) {
+    impl WatchdogLifecycleOperations for InjectedWatchdogOperations {
+        fn execute(&mut self, operation: &'static str) -> Result<(), String> {
+            self.operations.push(operation);
+            if self.fail_at == Some(operation) {
+                return Err(format!("injected failure at {operation}"));
+            }
+            match operation {
+                "unitCreated" => self.lease = Some(TestLeaseState::Prepared),
+                "armSent" => self.lease = Some(TestLeaseState::Armed),
+                "frozen" => {
+                    self.exact_frozen = true;
+                    self.changed = true;
+                }
+                "thawed" => {
+                    self.exact_frozen = false;
+                    self.changed = false;
+                    self.lease = Some(TestLeaseState::Thawed);
+                }
+                "disarmed" => self.lease = None,
+                "providerAdmission" => self.provider_admissions += 1,
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn recover(&mut self) -> Result<(), String> {
             if self.changed {
                 self.exact_frozen = false;
                 self.changed = false;
             }
             self.lease = None;
+            Ok(())
         }
+    }
 
-        fn run(fault: WatchdogFault) -> Self {
-            let mut state = Self {
-                exact_frozen: fault == WatchdogFault::PreFrozen,
-                unrelated_frozen: false,
-                changed: false,
-                lease: None,
-                provider_invocations: 0,
-                terminal_preserved: true,
-                agent_preserved: true,
-                source_preserved: true,
-            };
-            if matches!(fault, WatchdogFault::Setup | WatchdogFault::CompetingOwner)
-                || state.exact_frozen
-            {
-                return state;
-            }
-            state.lease = Some(TestLeaseState::Prepared);
-            if matches!(
-                fault,
-                WatchdogFault::MissingReady
-                    | WatchdogFault::MalformedReady
-                    | WatchdogFault::ParentBeforeFreeze
-            ) {
-                state.recover();
-                return state;
-            }
-            state.lease = Some(TestLeaseState::Armed);
-            state.exact_frozen = true;
-            state.changed = true;
-            if matches!(
-                fault,
-                WatchdogFault::ParentAfterFreeze
-                    | WatchdogFault::WrapperOnlyDeath
-                    | WatchdogFault::WatchdogCrash
-                    | WatchdogFault::Deadline
-                    | WatchdogFault::InodeReplacement
-                    | WatchdogFault::RestartRecovery
-            ) {
-                state.recover();
-                return state;
-            }
-            state.exact_frozen = false;
-            state.changed = false;
-            state.lease = Some(TestLeaseState::Thawed);
-            if matches!(
-                fault,
-                WatchdogFault::StaleDisarm | WatchdogFault::MismatchedDisarm
-            ) {
-                state.recover();
-                return state;
-            }
-            state.lease = None;
-            state.provider_invocations = 1;
-            if fault == WatchdogFault::DuplicateDisarm {
-                state.provider_invocations = 0;
-            }
-            state
+    fn injected_watchdog(fail_at: Option<&'static str>) -> InjectedWatchdogOperations {
+        InjectedWatchdogOperations {
+            fail_at,
+            operations: Vec::new(),
+            exact_frozen: false,
+            unrelated_frozen: false,
+            changed: false,
+            lease: None,
+            provider_admissions: 0,
+            terminal_preserved: true,
+            agent_preserved: true,
+            source_preserved: true,
         }
     }
 
     #[test]
-    fn cleanup_review_watchdog_fault_sequences_preserve_state() {
+    fn cleanup_review_production_watchdog_state_machine_injects_every_operation() {
         let failures = [
-            WatchdogFault::Setup,
-            WatchdogFault::MissingReady,
-            WatchdogFault::MalformedReady,
-            WatchdogFault::ParentBeforeFreeze,
-            WatchdogFault::ParentAfterFreeze,
-            WatchdogFault::WrapperOnlyDeath,
-            WatchdogFault::WatchdogCrash,
-            WatchdogFault::Deadline,
-            WatchdogFault::InodeReplacement,
-            WatchdogFault::CompetingOwner,
-            WatchdogFault::StaleDisarm,
-            WatchdogFault::MismatchedDisarm,
-            WatchdogFault::DuplicateDisarm,
-            WatchdogFault::RestartRecovery,
+            ("setup", "unitCreated"),
+            ("missing-ready", "preparedReady"),
+            ("malformed-ready", "preparedReady"),
+            ("parent-before-freeze", "armSent"),
+            ("parent-after-freeze", "containmentVerified"),
+            ("wrapper-only-death", "containmentVerified"),
+            ("watchdog-crash", "containmentVerified"),
+            ("deadline", "containmentVerified"),
+            ("inode-replacement", "thawed"),
+            ("competing-owner", "preparedReady"),
+            ("stale-disarm", "disarmed"),
+            ("mismatched-disarm", "disarmed"),
+            ("restart-recovery", "containmentVerified"),
         ];
-        for fault in failures {
-            let state = WatchdogProtocolHarness::run(fault);
-            assert!(!state.exact_frozen, "{fault:?}");
-            assert!(!state.unrelated_frozen, "{fault:?}");
-            assert_eq!(state.lease, None, "{fault:?}");
-            assert_eq!(state.provider_invocations, 0, "{fault:?}");
-            assert!(state.terminal_preserved, "{fault:?}");
-            assert!(state.agent_preserved, "{fault:?}");
-            assert!(state.source_preserved, "{fault:?}");
+        for (name, operation) in failures {
+            let mut state = injected_watchdog(Some(operation));
+            assert!(execute_watchdog_lifecycle(&mut state).is_err(), "{name}");
+            assert!(!state.exact_frozen, "{name}");
+            assert!(!state.unrelated_frozen, "{name}");
+            assert_eq!(state.lease, None, "{name}");
+            assert_eq!(state.provider_admissions, 0, "{name}");
+            assert!(state.terminal_preserved, "{name}");
+            assert!(state.agent_preserved, "{name}");
+            assert!(state.source_preserved, "{name}");
         }
 
-        let pre_frozen = WatchdogProtocolHarness::run(WatchdogFault::PreFrozen);
+        let mut pre_frozen = injected_watchdog(Some("unitCreated"));
+        pre_frozen.exact_frozen = true;
         assert!(pre_frozen.exact_frozen);
-        assert_eq!(pre_frozen.lease, None);
-        assert_eq!(pre_frozen.provider_invocations, 0);
+        pre_frozen.changed = false;
+        assert!(execute_watchdog_lifecycle(&mut pre_frozen).is_err());
+        assert!(pre_frozen.exact_frozen);
+        assert_eq!(pre_frozen.provider_admissions, 0);
         assert!(!pre_frozen.unrelated_frozen);
 
-        let success = WatchdogProtocolHarness::run(WatchdogFault::None);
+        let mut success = injected_watchdog(None);
+        execute_watchdog_lifecycle(&mut success).unwrap();
         assert!(!success.exact_frozen);
         assert!(!success.unrelated_frozen);
         assert_eq!(success.lease, None);
-        assert_eq!(success.provider_invocations, 1);
+        assert_eq!(success.provider_admissions, 1);
         assert!(success.terminal_preserved);
         assert!(success.agent_preserved);
         assert!(success.source_preserved);
+
+        let duplicate = serde_json::json!({
+            "version": 1,
+            "events": [
+                "unitCreated", "preparedReady", "armSent", "frozen",
+                "containmentVerified", "thawed", "disarmed", "disarmed"
+            ]
+        });
+        assert!(
+            validate_watchdog_lifecycle_report(&serde_json::to_vec(&duplicate).unwrap()).is_err()
+        );
     }
 
     #[cfg(unix)]
