@@ -11015,6 +11015,43 @@ fn exact_unresolved_managed_cortana_candidate(
         && !candidate.trusted_cortana_identity
 }
 
+fn retire_new_unreserved_cortana_identity(
+    ctx: &ControlContext,
+    identity_id: &str,
+    newly_minted: bool,
+) -> Result<(), String> {
+    if !newly_minted {
+        return Ok(());
+    }
+    let durable = ctx.captains.cortana_identity();
+    let replacement_identity_id = match &durable.recovery {
+        crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+            replacement_identity_id,
+            ..
+        }
+        | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+            replacement_identity_id,
+            ..
+        } => replacement_identity_id.as_deref(),
+        _ => None,
+    };
+    if durable.identity_id.as_deref() == Some(identity_id)
+        || durable
+            .managed_launch
+            .as_ref()
+            .is_some_and(|launch| launch.identity_id == identity_id)
+        || replacement_identity_id == Some(identity_id)
+    {
+        return Ok(());
+    }
+    if !ctx.identity.retire(identity_id)? {
+        return Err(format!(
+            "reconcile_cortana: newly minted identity '{identity_id}' disappeared before cleanup"
+        ));
+    }
+    Ok(())
+}
+
 fn reconcile_cortana_inner(
     ctx: &ControlContext,
     args: &Value,
@@ -11835,8 +11872,51 @@ fn reconcile_cortana_inner(
         arg_str(args, "testEffectStartupCommand").unwrap_or_else(|| startup_command.clone());
     #[cfg(not(test))]
     let effect_startup_command = startup_command.clone();
+    let tmux_cwd = files::posix_form(&home);
+    let worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "reconcile_cortana")?;
 
-    let (identity, _newly_minted) = if let Some((_, _, _, _, _, replacement_identity_id)) =
+    let expected_identity_id = replacement
+        .as_ref()
+        .and_then(|(_, _, _, _, _, identity_id)| identity_id.as_deref())
+        .or(durable.identity_id.as_deref());
+    if let Some(previous_terminal_id) = durable.terminal_id.as_deref() {
+        if tmux::session_liveness(&tmux_target(previous_terminal_id)) == tmux::SessionLiveness::Gone
+        {
+            ctx.tabs.retire_tile_locked(previous_terminal_id);
+            let _ = ctx.captains.remove_session(previous_terminal_id)?;
+        }
+    }
+    for candidate in &candidates {
+        if candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
+            && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Gone
+            && candidate.current_control_capability
+            && expected_identity_id.is_some()
+            && candidate.identity_id.as_deref() == expected_identity_id
+        {
+            let owner = durable.owner.as_ref().ok_or_else(|| {
+                format!(
+                    "reconcile_cortana: failed runtime '{}' has no durable managed owner and was preserved",
+                    candidate.terminal_id
+                )
+            })?;
+            tmux::retire_managed_runtime(
+                &tmux_target(&candidate.terminal_id),
+                &tmux_cortana_owner(owner),
+            )
+            .map_err(|error| {
+                cortana_tmux_observation_error(
+                    &format!(
+                        "reconcile_cortana: failed managed runtime '{}' could not be retired",
+                        candidate.terminal_id
+                    ),
+                    error,
+                )
+            })?;
+            ctx.tabs.retire_tile_locked(&candidate.terminal_id);
+            let _ = ctx.captains.remove_session(&candidate.terminal_id)?;
+        }
+    }
+    let (identity, newly_minted) = if let Some((_, _, _, _, _, replacement_identity_id)) =
         &replacement
     {
         match replacement_identity_id.as_deref() {
@@ -11884,42 +11964,6 @@ fn reconcile_cortana_inner(
             None => (ctx.identity.mint(crate::identity::Role::Cortana)?, true),
         }
     };
-    if let Some(previous_terminal_id) = durable.terminal_id.as_deref() {
-        if tmux::session_liveness(&tmux_target(previous_terminal_id)) == tmux::SessionLiveness::Gone
-        {
-            ctx.tabs.retire_tile_locked(previous_terminal_id);
-            let _ = ctx.captains.remove_session(previous_terminal_id)?;
-        }
-    }
-    for candidate in &candidates {
-        if candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
-            && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Gone
-            && candidate.current_control_capability
-            && candidate.identity_id.as_deref() == Some(identity.id.as_str())
-        {
-            let owner = durable.owner.as_ref().ok_or_else(|| {
-                format!(
-                    "reconcile_cortana: failed runtime '{}' has no durable managed owner and was preserved",
-                    candidate.terminal_id
-                )
-            })?;
-            tmux::retire_managed_runtime(
-                &tmux_target(&candidate.terminal_id),
-                &tmux_cortana_owner(owner),
-            )
-            .map_err(|error| {
-                cortana_tmux_observation_error(
-                    &format!(
-                        "reconcile_cortana: failed managed runtime '{}' could not be retired",
-                        candidate.terminal_id
-                    ),
-                    error,
-                )
-            })?;
-            ctx.tabs.retire_tile_locked(&candidate.terminal_id);
-            let _ = ctx.captains.remove_session(&candidate.terminal_id)?;
-        }
-    }
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let terminal_id = suffix[..8].to_string();
     let spawn_args = json!({
@@ -11943,13 +11987,23 @@ fn reconcile_cortana_inner(
         pending_provider_marker(&harness_name),
     ));
     let pane = crate::commands::pane_command(None, Some(&effect_startup_command));
-    let tmux_cwd = files::posix_form(&home);
-    let worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "reconcile_cortana")?;
-    let (pane, elevation) = worktree_admission.contain_process(pane.as_deref(), elevation)?;
-    let launch = tmux::prepare_managed_runtime_launch().map_err(|error| {
-        format!("reconcile_cortana: managed launch preparation failed: {error}")
-    })?;
-    ctx.captains.prepare_cortana_managed_launch(
+    let (pane, elevation) = match worktree_admission.contain_process(pane.as_deref(), elevation) {
+        Ok(contained) => contained,
+        Err(error) => {
+            retire_new_unreserved_cortana_identity(ctx, &identity.id, newly_minted)?;
+            return Err(error);
+        }
+    };
+    let launch = match tmux::prepare_managed_runtime_launch() {
+        Ok(launch) => launch,
+        Err(error) => {
+            retire_new_unreserved_cortana_identity(ctx, &identity.id, newly_minted)?;
+            return Err(format!(
+                "reconcile_cortana: managed launch preparation failed: {error}"
+            ));
+        }
+    };
+    if let Err(error) = ctx.captains.prepare_cortana_managed_launch(
         operation_id,
         &terminal_id,
         &identity.id,
@@ -11957,7 +12011,10 @@ fn reconcile_cortana_inner(
         harness.as_provider(),
         &launch,
         expected_harness_launch_provenance,
-    )?;
+    ) {
+        retire_new_unreserved_cortana_identity(ctx, &identity.id, newly_minted)?;
+        return Err(error);
+    }
     ctx.identity.bind_tile(&identity.id, &terminal_id)?;
     let prepared_launch = ctx
         .captains

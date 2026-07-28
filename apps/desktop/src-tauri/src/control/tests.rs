@@ -126,6 +126,18 @@ fn test_ctx(token: &str) -> ControlContext {
     ctx
 }
 
+#[test]
+fn cleanup_review_cortana_prepublication_retires_only_new_identity() {
+    let ctx = test_ctx("cortana-prepublication-identity");
+    let newly_minted = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+    retire_new_unreserved_cortana_identity(&ctx, &newly_minted.id, true).unwrap();
+    assert!(ctx.identity.get(&newly_minted.id).is_none());
+
+    let reused = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+    retire_new_unreserved_cortana_identity(&ctx, &reused.id, false).unwrap();
+    assert!(ctx.identity.get(&reused.id).is_some());
+}
+
 fn dispatch_test_repo_root() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
