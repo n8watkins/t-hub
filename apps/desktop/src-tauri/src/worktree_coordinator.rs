@@ -22,20 +22,252 @@ const INSPECTION_OUTPUT_LIMIT: usize = 1024 * 1024;
 const LAST_ERROR_LIMIT: usize = 8192;
 const CONTAINMENT_EVIDENCE_LIMIT: usize = 64 * 1024;
 
+const CONTAINMENT_FREEZE_WATCHDOG_SCRIPT: &str = r#"
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import select
+import socket
+import stat
+import sys
+import time
+
+lease = json.loads(sys.argv[1])
+secret = bytes.fromhex(sys.argv[2])
+socket_name = sys.argv[3]
+lease_path = lease["leasePath"]
+directory = None
+freeze_descriptor = None
+connection = None
+changed = False
+lease_owned = False
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+def signed(kind):
+    body = {"kind": kind, "lease": lease}
+    body["mac"] = hmac.new(secret, canonical(body), hashlib.sha256).hexdigest()
+    return canonical(body)
+
+def verify(raw, kind):
+    value = json.loads(raw)
+    mac = value.pop("mac", "")
+    if (
+        value != {"kind": kind, "lease": lease}
+        or not hmac.compare_digest(mac, hmac.new(secret, canonical(value), hashlib.sha256).hexdigest())
+    ):
+        raise RuntimeError("freeze watchdog message authentication failed")
+
+def event_value(key):
+    descriptor = os.open("cgroup.events", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        raw = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    values = {}
+    for row in raw.decode("ascii").splitlines():
+        name, value = row.split()
+        if name in values:
+            raise RuntimeError("freeze watchdog cgroup events are ambiguous")
+        values[name] = int(value)
+    if len(raw) > 4096 or key not in values:
+        raise RuntimeError("freeze watchdog cgroup events are incomplete")
+    return values[key]
+
+def write_freeze(value):
+    if os.write(freeze_descriptor, value) != len(value):
+        raise RuntimeError("freeze watchdog write was partial")
+
+def wait_frozen(expected):
+    deadline = time.monotonic() + 5
+    while event_value("frozen") != expected:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("freeze watchdog state did not converge")
+        time.sleep(0.005)
+
+def exact_identity():
+    return (
+        os.fstat(directory).st_dev == lease["cgroupDevice"]
+        and os.fstat(directory).st_ino == lease["cgroupInode"]
+        and pathlib.Path(lease["cgroupPath"]).name == lease["managedUnit"]
+    )
+
+def persist(state):
+    value = dict(lease)
+    value["state"] = state
+    temporary = f"{lease_path}.{lease['watchdogNonce']}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        raw = canonical(value)
+        if os.write(descriptor, raw) != len(raw):
+            raise RuntimeError("freeze watchdog lease write was partial")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, lease_path)
+    parent = os.open(
+        str(pathlib.Path(lease_path).parent),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+def read_existing():
+    try:
+        value = json.loads(pathlib.Path(lease_path).read_text())
+    except FileNotFoundError:
+        return None
+    state = value.pop("state", None)
+    if value != lease or state not in ("prepared", "armed", "thawed"):
+        raise RuntimeError("freeze watchdog durable lease is mismatched")
+    return state
+
+def remove_lease():
+    os.unlink(lease_path)
+    parent = os.open(
+        str(pathlib.Path(lease_path).parent),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+def recv_until(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not select.select([connection], [], [], remaining)[0]:
+        raise RuntimeError("freeze watchdog command deadline expired")
+    raw = connection.recv(65537)
+    if not raw or len(raw) > 65536:
+        raise RuntimeError("freeze watchdog parent connection was lost")
+    return raw
+
+try:
+    directory = os.open(
+        "/sys/fs/cgroup" + lease["cgroupPath"],
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    if not exact_identity():
+        raise RuntimeError("freeze watchdog cgroup identity is mismatched")
+    for control in ("cgroup.freeze", "cgroup.events", "cgroup.procs"):
+        if not stat.S_ISREG(os.stat(control, dir_fd=directory, follow_symlinks=False).st_mode):
+            raise RuntimeError("freeze watchdog cgroup controls are incomplete")
+    freeze_descriptor = os.open(
+        "cgroup.freeze",
+        os.O_WRONLY | os.O_CLOEXEC,
+        dir_fd=directory,
+    )
+    fcntl.flock(freeze_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    existing = read_existing()
+    if existing is not None:
+        lease_owned = True
+        if existing == "armed" and exact_identity() and event_value("frozen") == 1:
+            write_freeze(b"0")
+            wait_frozen(0)
+        if exact_identity() and event_value("frozen") == 0:
+            remove_lease()
+            raise SystemExit(0)
+        raise RuntimeError("freeze watchdog restart recovery is ambiguous")
+    if event_value("frozen") != 0:
+        raise RuntimeError("managed cgroup is already frozen by another owner")
+    persist("prepared")
+    lease_owned = True
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    connection.settimeout(2)
+    connection.connect("\0" + socket_name)
+    connection.sendall(signed("ready"))
+    verify(recv_until(min(lease["deadline"], time.monotonic() + 2)), "arm")
+    persist("armed")
+    write_freeze(b"1")
+    changed = True
+    wait_frozen(1)
+    if not exact_identity():
+        raise RuntimeError("freeze watchdog cgroup identity changed after freeze")
+    connection.sendall(signed("frozen"))
+    verify(recv_until(lease["deadline"]), "thaw")
+    if not exact_identity() or event_value("frozen") != 1:
+        raise RuntimeError("freeze watchdog thaw identity is mismatched")
+    write_freeze(b"0")
+    wait_frozen(0)
+    changed = False
+    persist("thawed")
+    connection.sendall(signed("thawed"))
+    verify(recv_until(min(lease["deadline"], time.monotonic() + 2)), "disarm")
+    if not exact_identity() or event_value("frozen") != 0:
+        raise RuntimeError("freeze watchdog disarm identity is mismatched")
+    remove_lease()
+    connection.sendall(signed("disarmed"))
+except SystemExit:
+    raise
+except Exception:
+    recovered = False
+    try:
+        if (
+            directory is not None
+            and freeze_descriptor is not None
+            and lease_owned
+            and exact_identity()
+            and changed
+            and event_value("frozen") == 1
+        ):
+            write_freeze(b"0")
+            wait_frozen(0)
+            changed = False
+        if (
+            directory is not None
+            and lease_owned
+            and exact_identity()
+            and event_value("frozen") == 0
+        ):
+            try:
+                remove_lease()
+            except FileNotFoundError:
+                pass
+            recovered = True
+    finally:
+        if not recovered:
+            raise
+finally:
+    if connection is not None:
+        connection.close()
+    if freeze_descriptor is not None:
+        os.close(freeze_descriptor)
+    if directory is not None:
+        os.close(directory)
+"#;
+
 const ATOMIC_CONTAINMENT_INSPECTION_SCRIPT: &str = r#"
 import base64
-import fcntl
+import hashlib
+import hmac
 import json
 import os
 import pathlib
 import re
+import secrets
+import socket
 import signal
 import stat
+import struct
+import subprocess
 import sys
 import time
 
 root_pid = int(sys.argv[1])
 target = json.loads(sys.argv[2])
+operation_id = sys.argv[3]
+request_path = sys.argv[4]
+watchdog_script = sys.argv[5]
 MAX_PROCESSES = 256
 MAX_TASKS = 1024
 
@@ -43,7 +275,7 @@ def inspection_timeout(signum, frame):
     raise RuntimeError("managed containment inspection timed out")
 
 signal.signal(signal.SIGALRM, inspection_timeout)
-signal.alarm(4)
+signal.alarm(12)
 
 def proc_start(pid):
     value = pathlib.Path(f"/proc/{pid}/stat").read_text()
@@ -203,17 +435,6 @@ def event_value(directory, key):
         raise RuntimeError("managed cgroup freeze evidence is incomplete")
     return values[key]
 
-def write_freeze(descriptor, value):
-    if os.write(descriptor, value) != len(value):
-        raise RuntimeError("managed cgroup freeze write was partial")
-
-def wait_frozen(directory, expected):
-    deadline = time.monotonic() + 5
-    while event_value(directory, "frozen") != expected:
-        if time.monotonic() >= deadline:
-            raise RuntimeError("managed cgroup freeze state did not converge")
-        time.sleep(0.005)
-
 def managed_cgroup(pid):
     path = cgroup_path(pid)
     nonce = next(
@@ -263,53 +484,131 @@ def cgroup_processes(directory):
         raise RuntimeError("managed cgroup process set is empty or exceeds the safe bound")
     return values
 
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+def signed(kind, lease, secret):
+    body = {"kind": kind, "lease": lease}
+    body["mac"] = hmac.new(secret, canonical(body), hashlib.sha256).hexdigest()
+    return canonical(body)
+
+def verify_message(raw, kind, lease, secret):
+    value = json.loads(raw)
+    mac = value.pop("mac", "")
+    if (
+        value != {"kind": kind, "lease": lease}
+        or not hmac.compare_digest(mac, hmac.new(secret, canonical(value), hashlib.sha256).hexdigest())
+    ):
+        raise RuntimeError("freeze watchdog message authentication failed")
+
+def receive(connection, kind, lease, secret, deadline):
+    connection.settimeout(max(0.001, deadline - time.monotonic()))
+    raw = connection.recv(65537)
+    if not raw or len(raw) > 65536:
+        raise RuntimeError("freeze watchdog response is missing or oversized")
+    verify_message(raw, kind, lease, secret)
+
 cgroup_directory = None
 cgroup_identity = None
-freeze_descriptor = None
+watchdog_listener = None
+watchdog_connection = None
+watchdog_lease = None
+watchdog_secret = None
 freeze_changed = False
-recovery_write = None
-recovery_pid = None
 try:
     managed = managed_cgroup(root_pid)
     if managed is None:
         raise RuntimeError("exact managed cgroup-v2 freezer ownership is unavailable")
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+        or not os.path.isabs(request_path)
+        or "\0" in request_path
+    ):
+        raise RuntimeError("freeze watchdog operation identity is invalid")
     managed_path, managed_inode, cgroup_directory = managed
-    freeze_descriptor = os.open(
-        "cgroup.freeze",
-        os.O_WRONLY | os.O_CLOEXEC,
-        dir_fd=cgroup_directory,
-    )
-    fcntl.flock(freeze_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     if event_value(cgroup_directory, "frozen") != 0:
         raise RuntimeError("managed cgroup is already frozen by another owner")
-    recovery_read, recovery_write = os.pipe()
-    recovery_pid = os.fork()
-    if recovery_pid == 0:
-        try:
-            os.close(recovery_write)
-            os.setsid()
-            null = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
-            for descriptor in (0, 1, 2):
-                os.dup2(null, descriptor)
-            os.close(null)
-            while os.read(recovery_read, 1):
-                pass
-            if (
-                os.fstat(cgroup_directory).st_ino == managed_inode
-                and event_value(cgroup_directory, "frozen") == 1
-            ):
-                write_freeze(freeze_descriptor, b"0")
-                wait_frozen(cgroup_directory, 0)
-            os._exit(0)
-        except Exception:
-            os._exit(1)
-    os.close(recovery_read)
-    write_freeze(freeze_descriptor, b"1")
+    watchdog_nonce = secrets.token_hex(16)
+    watchdog_secret = secrets.token_bytes(32)
+    watchdog_unit = f"t-hub-freeze-watchdog-{watchdog_nonce}.service"
+    watchdog_socket = f"t-hub-freeze-watchdog-{watchdog_nonce}"
+    watchdog_deadline = time.monotonic() + 10
+    watchdog_lease = {
+        "version": 1,
+        "operationId": operation_id,
+        "watchdogNonce": watchdog_nonce,
+        "managedUnit": pathlib.PurePosixPath(managed_path).name,
+        "cgroupPath": managed_path,
+        "cgroupDevice": os.fstat(cgroup_directory).st_dev,
+        "cgroupInode": managed_inode,
+        "deadline": watchdog_deadline,
+        "leasePath": f"{request_path}.freeze-{root_pid}-{watchdog_nonce}.json",
+    }
+    watchdog_listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    watchdog_listener.bind("\0" + watchdog_socket)
+    watchdog_listener.listen(1)
+    watchdog_listener.settimeout(3)
+    launch = subprocess.run(
+        [
+            "/usr/bin/systemd-run",
+            "--user",
+            f"--unit={watchdog_unit}",
+            "--property=Type=exec",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=100ms",
+            "--property=RuntimeMaxSec=12s",
+            "--collect",
+            "--quiet",
+            "/usr/bin/python3",
+            "-c",
+            watchdog_script,
+            json.dumps(watchdog_lease, separators=(",", ":")),
+            watchdog_secret.hex(),
+            watchdog_socket,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3,
+        check=False,
+    )
+    if launch.returncode != 0 or launch.stdout or launch.stderr:
+        raise RuntimeError("freeze watchdog transient unit could not be started")
+    watchdog_connection, _ = watchdog_listener.accept()
+    peer_pid, peer_uid, _ = struct.unpack(
+        "3i",
+        watchdog_connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+    )
+    expected_watchdog_cgroup = (
+        f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/"
+        f"app.slice/{watchdog_unit}"
+    )
+    if (
+        peer_uid != os.getuid()
+        or cgroup_path(peer_pid) != expected_watchdog_cgroup
+        or not executable_matches(peer_pid, "/usr/bin/python3")
+    ):
+        raise RuntimeError("freeze watchdog transient unit identity is mismatched")
+    receive(
+        watchdog_connection,
+        "ready",
+        watchdog_lease,
+        watchdog_secret,
+        min(watchdog_deadline, time.monotonic() + 2),
+    )
+    watchdog_connection.sendall(signed("arm", watchdog_lease, watchdog_secret))
+    receive(
+        watchdog_connection,
+        "frozen",
+        watchdog_lease,
+        watchdog_secret,
+        min(watchdog_deadline, time.monotonic() + 6),
+    )
     freeze_changed = True
-    wait_frozen(cgroup_directory, 1)
     if (
         cgroup_path(root_pid) != managed_path
         or os.fstat(cgroup_directory).st_ino != managed_inode
+        or event_value(cgroup_directory, "frozen") != 1
     ):
         raise RuntimeError("managed cgroup identity changed during freeze")
     roots = cgroup_processes(cgroup_directory)
@@ -391,25 +690,47 @@ try:
 finally:
     signal.alarm(0)
     unfreeze_error = None
-    if cgroup_directory is not None and freeze_changed:
+    if watchdog_connection is not None and freeze_changed:
         try:
             if (
                 cgroup_path(root_pid) != managed_path
                 or os.fstat(cgroup_directory).st_ino != managed_inode
+                or event_value(cgroup_directory, "frozen") != 1
             ):
                 raise RuntimeError("managed cgroup identity changed before unfreeze")
-            write_freeze(freeze_descriptor, b"0")
-            wait_frozen(cgroup_directory, 0)
+            watchdog_connection.sendall(
+                signed("thaw", watchdog_lease, watchdog_secret)
+            )
+            receive(
+                watchdog_connection,
+                "thawed",
+                watchdog_lease,
+                watchdog_secret,
+                min(watchdog_lease["deadline"], time.monotonic() + 6),
+            )
+            if (
+                cgroup_path(root_pid) != managed_path
+                or os.fstat(cgroup_directory).st_ino != managed_inode
+                or event_value(cgroup_directory, "frozen") != 0
+            ):
+                raise RuntimeError("managed cgroup identity changed after unfreeze")
+            watchdog_connection.sendall(
+                signed("disarm", watchdog_lease, watchdog_secret)
+            )
+            receive(
+                watchdog_connection,
+                "disarmed",
+                watchdog_lease,
+                watchdog_secret,
+                min(watchdog_lease["deadline"], time.monotonic() + 2),
+            )
+            freeze_changed = False
         except Exception as error:
             unfreeze_error = error
-    if recovery_write is not None:
-        os.close(recovery_write)
-    if recovery_pid is not None:
-        _, recovery_status = os.waitpid(recovery_pid, 0)
-        if recovery_status != 0 and unfreeze_error is None:
-            unfreeze_error = RuntimeError("managed cgroup recovery watchdog failed")
-    if freeze_descriptor is not None:
-        os.close(freeze_descriptor)
+    if watchdog_connection is not None:
+        watchdog_connection.close()
+    if watchdog_listener is not None:
+        watchdog_listener.close()
     if cgroup_directory is not None:
         os.close(cgroup_directory)
     if unfreeze_error is not None:
@@ -1415,7 +1736,12 @@ impl WorktreeCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
             .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
-        verify_process_containment(&panes, &request.worktree)?;
+        verify_process_containment(
+            &panes,
+            &request.worktree,
+            &record.operation_id,
+            &record.request_path,
+        )?;
         if self
             .boundary_snapshot()
             .iter()
@@ -1717,6 +2043,8 @@ fn require_namespace_containment(
 fn verify_process_containment(
     panes: &[crate::tmux::PaneInfo],
     target: &CapturedWorktreeIdentity,
+    operation_id: &str,
+    request_path: &str,
 ) -> Result<(), String> {
     let target_json = serde_json::to_string(target)
         .map_err(|error| format!("worktree containment identity failed: {error}"))?;
@@ -1734,10 +2062,13 @@ fn verify_process_containment(
             ATOMIC_CONTAINMENT_INSPECTION_SCRIPT,
             &pane.pid.to_string(),
             &target_json,
+            operation_id,
+            request_path,
+            CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
         ]);
         let output = match crate::bounded_exec::output_with_timeout_and_limit(
             command,
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             CONTAINMENT_EVIDENCE_LIMIT,
         ) {
             Ok(output) => output,
@@ -2450,6 +2781,8 @@ mod tests {
         let error = verify_process_containment(
             &[pane],
             admission.blockers.first().expect("one exact blocker"),
+            "0123456789abcdef0123456789abcdef",
+            "/tmp/test-request.json",
         )
         .unwrap_err();
         assert!(error.contains("exact managed cgroup-v2 freezer ownership is unavailable"));
@@ -2458,7 +2791,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_runtime_containment_resolves_inside_exact_cgroup() {
+    fn cleanup_review_managed_runtime_uses_supervised_freeze_watchdog() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
         let worktree = directory.path().join("worktree");
@@ -2534,9 +2867,16 @@ mod tests {
         let verification = verify_process_containment(
             &[pane],
             admission.blockers.first().expect("one exact blocker"),
+            &record.operation_id,
+            request_path.to_str().unwrap(),
         );
+        let leaked_lease = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".freeze-"));
         crate::tmux::retire_managed_runtime(&session, &owner).unwrap();
         verification.unwrap();
+        assert!(!leaked_lease);
     }
 
     #[test]
@@ -2554,19 +2894,46 @@ mod tests {
             cwd: "/tmp".into(),
             pid: std::process::id(),
         };
-        assert!(verify_process_containment(&[pane], &target)
-            .unwrap_err()
-            .contains("uncontained"));
+        assert!(verify_process_containment(
+            &[pane],
+            &target,
+            "0123456789abcdef0123456789abcdef",
+            "/tmp/test-request.json"
+        )
+        .unwrap_err()
+        .contains("uncontained"));
     }
 
     #[test]
     fn cleanup_review_freeze_requires_exact_recoverable_cgroup_ownership() {
+        for script in [
+            ATOMIC_CONTAINMENT_INSPECTION_SCRIPT,
+            CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
+        ] {
+            let status = Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import sys; compile(sys.argv[1], '<containment>', 'exec')",
+                    script,
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
         assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT
             .contains("exact managed cgroup-v2 freezer ownership is unavailable"));
         assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT
             .contains("managed cgroup is already frozen by another owner"));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"));
-        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("recovery_pid = os.fork()"));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("--property=Restart=on-failure"));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("receive("));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("\"ready\""));
+        assert!(ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("\"disarmed\""));
+        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("lease[\"deadline\"]"));
+        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"));
+        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("existing == \"armed\""));
+        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("persist(\"prepared\")"));
+        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("persist(\"armed\")"));
+        assert!(CONTAINMENT_FREEZE_WATCHDOG_SCRIPT.contains("persist(\"thawed\")"));
         assert!(!ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("SIGSTOP"));
         assert!(!ATOMIC_CONTAINMENT_INSPECTION_SCRIPT.contains("SIGCONT"));
     }
