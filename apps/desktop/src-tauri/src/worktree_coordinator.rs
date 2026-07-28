@@ -2247,45 +2247,66 @@ fn provider_request_path(request_path: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn provider_request_path(request_path: &str) -> Result<String, String> {
-    use std::os::windows::fs::MetadataExt;
+    translate_windows_provider_request_path(request_path, &WindowsProviderPathTransport)
+}
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderPathIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(any(windows, test))]
+trait ProviderPathTransport {
+    fn canonical_native(&self, path: &str) -> Result<(String, ProviderPathIdentity), String>;
+    fn wslpath(&self, arguments: &[&str]) -> Result<String, String>;
+    fn readlink(&self, path: &str) -> Result<String, String>;
+    fn native_identity(&self, path: &str) -> Result<ProviderPathIdentity, String>;
+}
+
+#[cfg(any(windows, test))]
+fn translate_windows_provider_request_path(
+    request_path: &str,
+    transport: &impl ProviderPathTransport,
+) -> Result<String, String> {
+    validate_windows_provider_request_spelling(request_path)?;
+    let (canonical_native, original_identity) = transport.canonical_native(request_path)?;
+    let path = transport.wslpath(&["-a", "-u", request_path])?;
+    validate_posix_provider_request_path(&path)?;
+    if transport.readlink(&path)? != path {
+        return Err("provider request path changes identity inside WSL".into());
+    }
+    let round_trip = transport.wslpath(&["-a", "-w", &path])?;
+    if transport.native_identity(&round_trip)? != original_identity {
+        return Err("provider request path round trip changed file identity".into());
+    }
+    if transport.native_identity(request_path)? != original_identity {
+        return Err("provider request path identity changed during translation".into());
+    }
+    if canonical_native.is_empty() {
+        return Err("provider request canonical identity is empty".into());
+    }
+    Ok(path)
+}
+
+#[cfg(any(windows, test))]
+fn validate_windows_provider_request_spelling(request_path: &str) -> Result<(), String> {
     if request_path.trim() != request_path
         || request_path.contains('\0')
         || (request_path.contains('/') && request_path.contains('\\'))
-        || !Path::new(request_path).is_absolute()
-        || Path::new(request_path).components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
+        || request_path.starts_with("\\\\")
+        || request_path.len() < 4
+        || request_path.as_bytes()[1] != b':'
+        || !request_path.as_bytes()[0].is_ascii_alphabetic()
+        || request_path.as_bytes()[2] != b'\\'
+        || request_path
+            .split('\\')
+            .any(|part| matches!(part, "." | ".."))
     {
         return Err("provider request path has ambiguous native spelling".into());
     }
-    let canonical_native = std::fs::canonicalize(request_path)
-        .map_err(|error| format!("could not canonicalize provider request path: {error}"))?;
-    let canonical_native = canonical_native
-        .to_str()
-        .ok_or_else(|| "provider request path is not valid UTF-8".to_string())?;
-    let path = run_wslpath(&["-a", "-u", request_path])?;
-    validate_posix_provider_request_path(&path)?;
-    let canonical_wsl = run_wsl_readlink(&path)?;
-    if canonical_wsl != path {
-        return Err("provider request path changes identity inside WSL".into());
-    }
-    let round_trip = run_wslpath(&["-a", "-w", &path])?;
-    let round_trip = std::fs::canonicalize(&round_trip)
-        .map_err(|error| format!("could not validate provider request round trip: {error}"))?;
-    let original = std::fs::metadata(canonical_native)
-        .map_err(|error| format!("could not inspect provider request identity: {error}"))?;
-    let translated = std::fs::metadata(&round_trip)
-        .map_err(|error| format!("could not inspect translated request identity: {error}"))?;
-    if original.volume_serial_number() != translated.volume_serial_number()
-        || original.file_index() != translated.file_index()
-    {
-        return Err("provider request path round trip changed file identity".into());
-    }
-    Ok(path)
+    Ok(())
 }
 
 fn validate_posix_provider_request_path(path: &str) -> Result<(), String> {
@@ -2301,64 +2322,93 @@ fn validate_posix_provider_request_path(path: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn run_wslpath(arguments: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("wsl.exe");
-    command.args([
-        "-d",
-        &crate::files::host_distro(),
-        "--cd",
-        "~",
-        "-e",
-        "wslpath",
-    ]);
-    command.args(arguments);
+struct WindowsProviderPathTransport;
+
+#[cfg(windows)]
+impl ProviderPathTransport for WindowsProviderPathTransport {
+    fn canonical_native(&self, path: &str) -> Result<(String, ProviderPathIdentity), String> {
+        use std::os::windows::fs::MetadataExt;
+
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|error| format!("could not canonicalize provider request path: {error}"))?;
+        let canonical = canonical
+            .to_str()
+            .ok_or_else(|| "provider request path is not valid UTF-8".to_string())?
+            .to_string();
+        Ok((canonical, self.native_identity(path)?))
+    }
+
+    fn wslpath(&self, arguments: &[&str]) -> Result<String, String> {
+        let mut command = Command::new("wsl.exe");
+        command.args([
+            "-d",
+            &crate::files::host_distro(),
+            "--cd",
+            "~",
+            "-e",
+            "wslpath",
+        ]);
+        command.args(arguments);
+        bounded_path_output(
+            command,
+            "could not translate provider request path into WSL",
+        )
+    }
+
+    fn readlink(&self, path: &str) -> Result<String, String> {
+        let mut command = Command::new("wsl.exe");
+        command.args([
+            "-d",
+            &crate::files::host_distro(),
+            "--cd",
+            "~",
+            "-e",
+            "readlink",
+            "-f",
+            "--",
+            path,
+        ]);
+        bounded_path_output(
+            command,
+            "could not canonicalize provider request path in WSL",
+        )
+    }
+
+    fn native_identity(&self, path: &str) -> Result<ProviderPathIdentity, String> {
+        use std::os::windows::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("could not inspect provider request identity: {error}"))?;
+        Ok(ProviderPathIdentity {
+            volume: metadata
+                .volume_serial_number()
+                .ok_or_else(|| "provider request volume identity is unavailable".to_string())?
+                as u64,
+            file: metadata
+                .file_index()
+                .ok_or_else(|| "provider request file identity is unavailable".to_string())?,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn bounded_path_output(mut command: Command, context: &str) -> Result<String, String> {
     let output = crate::bounded_exec::output_with_timeout_and_limit(
         command,
         crate::bounded_exec::WSL_PROBE_TIMEOUT,
         4096,
     )
-    .map_err(|error| format!("could not translate provider request path into WSL: {error}"))?;
-    if !output.status.success() {
+    .map_err(|error| format!("{context}: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
         return Err(format!(
-            "could not translate provider request path into WSL: {}",
+            "{context}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() || path.contains('\0') || path.contains('\n') {
-        return Err("wslpath returned an invalid provider request path".into());
+        return Err(format!("{context}: command returned malformed output"));
     }
-    Ok(path)
-}
-
-#[cfg(windows)]
-fn run_wsl_readlink(path: &str) -> Result<String, String> {
-    let mut command = Command::new("wsl.exe");
-    command.args([
-        "-d",
-        &crate::files::host_distro(),
-        "--cd",
-        "~",
-        "-e",
-        "readlink",
-        "-f",
-        "--",
-        path,
-    ]);
-    let output = crate::bounded_exec::output_with_timeout_and_limit(
-        command,
-        crate::bounded_exec::WSL_PROBE_TIMEOUT,
-        4096,
-    )
-    .map_err(|error| format!("could not canonicalize provider request path in WSL: {error}"))?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        return Err(format!(
-            "could not canonicalize provider request path in WSL: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    validate_posix_provider_request_path(&path)?;
     Ok(path)
 }
 
@@ -3257,6 +3307,165 @@ mod tests {
         ] {
             assert!(validate_posix_provider_request_path(invalid).is_err());
         }
+    }
+
+    struct InjectedProviderPathTransport {
+        canonical: Result<(String, ProviderPathIdentity), String>,
+        translations: std::cell::RefCell<std::collections::VecDeque<Result<String, String>>>,
+        canonical_wsl: Result<String, String>,
+        identities:
+            std::cell::RefCell<std::collections::VecDeque<Result<ProviderPathIdentity, String>>>,
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+    }
+
+    impl InjectedProviderPathTransport {
+        fn exact(native: &str, wsl: &str) -> Self {
+            let identity = ProviderPathIdentity {
+                volume: 7,
+                file: 11,
+            };
+            Self {
+                canonical: Ok((native.to_string(), identity)),
+                translations: std::cell::RefCell::new(
+                    [Ok(wsl.to_string()), Ok(native.to_string())].into(),
+                ),
+                canonical_wsl: Ok(wsl.to_string()),
+                identities: std::cell::RefCell::new([Ok(identity), Ok(identity)].into()),
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProviderPathTransport for InjectedProviderPathTransport {
+        fn canonical_native(&self, _path: &str) -> Result<(String, ProviderPathIdentity), String> {
+            self.canonical.clone()
+        }
+
+        fn wslpath(&self, arguments: &[&str]) -> Result<String, String> {
+            self.calls.borrow_mut().push(
+                arguments
+                    .iter()
+                    .map(|argument| argument.to_string())
+                    .collect(),
+            );
+            self.translations
+                .borrow_mut()
+                .pop_front()
+                .expect("expected translation")
+        }
+
+        fn readlink(&self, _path: &str) -> Result<String, String> {
+            self.canonical_wsl.clone()
+        }
+
+        fn native_identity(&self, _path: &str) -> Result<ProviderPathIdentity, String> {
+            self.identities
+                .borrow_mut()
+                .pop_front()
+                .expect("expected identity check")
+        }
+    }
+
+    #[test]
+    fn cleanup_review_windows_path_transport_enforces_exact_contract() {
+        let native = r"C:\Users\natha\request with 'quotes' & $(literal).json";
+        let wsl = "/mnt/c/Users/natha/request with 'quotes' & $(literal).json";
+        let transport = InjectedProviderPathTransport::exact(native, wsl);
+        assert_eq!(
+            translate_windows_provider_request_path(native, &transport).unwrap(),
+            wsl
+        );
+        assert_eq!(
+            transport.calls.into_inner(),
+            vec![vec!["-a", "-u", native], vec!["-a", "-w", wsl],]
+        );
+
+        let lower_drive = r"c:\Users\natha\request.json";
+        assert!(translate_windows_provider_request_path(
+            lower_drive,
+            &InjectedProviderPathTransport::exact(lower_drive, "/mnt/c/Users/natha/request.json")
+        )
+        .is_ok());
+
+        for invalid in [
+            r"request.json",
+            r"\\server\share\request.json",
+            r"C:\Users/natha\request.json",
+            r"C:\Users\natha\..\request.json",
+            r"C:\Users\natha\.\request.json",
+            "C:\\Users\\natha\\request.json\n",
+        ] {
+            assert!(
+                translate_windows_provider_request_path(
+                    invalid,
+                    &InjectedProviderPathTransport::exact(
+                        r"C:\Users\natha\request.json",
+                        "/mnt/c/Users/natha/request.json"
+                    )
+                )
+                .is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_review_windows_path_transport_fails_closed_on_transport_faults() {
+        let native = r"C:\Users\natha\request.json";
+        let wsl = "/mnt/c/Users/natha/request.json";
+
+        for translated in [
+            "mnt/c/Users/natha/request.json",
+            "/mnt/c/Users/natha/request.json\n/mnt/c/Users/natha/request.json",
+            "/mnt/c/Users/natha/../request.json",
+        ] {
+            let mut transport = InjectedProviderPathTransport::exact(native, wsl);
+            transport.translations = std::cell::RefCell::new(
+                [Ok(translated.to_string()), Ok(native.to_string())].into(),
+            );
+            assert!(translate_windows_provider_request_path(native, &transport).is_err());
+        }
+
+        let mut alias = InjectedProviderPathTransport::exact(native, wsl);
+        alias.canonical_wsl = Ok("/mnt/c/Users/natha/other.json".into());
+        assert!(translate_windows_provider_request_path(native, &alias).is_err());
+
+        let mut timeout = InjectedProviderPathTransport::exact(native, wsl);
+        timeout.translations =
+            std::cell::RefCell::new([Err("translation timed out".into())].into());
+        assert!(translate_windows_provider_request_path(native, &timeout).is_err());
+
+        let mut round_trip_mismatch = InjectedProviderPathTransport::exact(native, wsl);
+        round_trip_mismatch.identities = std::cell::RefCell::new(
+            [
+                Ok(ProviderPathIdentity {
+                    volume: 8,
+                    file: 11,
+                }),
+                Ok(ProviderPathIdentity {
+                    volume: 7,
+                    file: 11,
+                }),
+            ]
+            .into(),
+        );
+        assert!(translate_windows_provider_request_path(native, &round_trip_mismatch).is_err());
+
+        let mut changed_during_use = InjectedProviderPathTransport::exact(native, wsl);
+        changed_during_use.identities = std::cell::RefCell::new(
+            [
+                Ok(ProviderPathIdentity {
+                    volume: 7,
+                    file: 11,
+                }),
+                Ok(ProviderPathIdentity {
+                    volume: 7,
+                    file: 12,
+                }),
+            ]
+            .into(),
+        );
+        assert!(translate_windows_provider_request_path(native, &changed_during_use).is_err());
     }
 
     #[cfg(windows)]
