@@ -822,9 +822,9 @@ mod transport_tests {
     /// agent→core→emit spine end-to-end and prove a live `supervision://tree`
     /// emit emerges from a `SessionStart → … → Stop` hook sequence.
     ///
-    /// Hermetic: a private `$HOME` so the journal lives under a temp dir, shared
-    /// by both the `--hook` ingest processes and the `--stdio` agent the bridge
-    /// spawns. Skips when the binary isn't built (so CI never fails spuriously).
+    /// Hermetic: a private journal under a temp dir, shared by both the `--hook`
+    /// ingest processes and the `--stdio` agent the bridge spawns. Skips when
+    /// the binary isn't built (so CI never fails spuriously).
     ///
     /// Exercises both journal paths:
     ///   - **replay**: hooks fired before connect are replayed into one bounded
@@ -848,14 +848,16 @@ mod transport_tests {
             return;
         }
 
-        // Hermetic private HOME → journal at $HOME/.t-hub/journal, shared by the
-        // hook processes and the stdio agent (both honor $HOME).
+        // Use one explicit journal path for the hook processes and stdio agent.
+        // An explicit child argument cannot inherit a parallel test's temporary
+        // process-wide journal override.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let home = std::env::temp_dir().join(format!("t-hub-live-emit-demo-{ts}"));
         std::fs::create_dir_all(&home).unwrap();
+        let journal_dir = home.join("journal");
 
         // The exact production hook entrypoint: `t-hub-agent --hook <EVENT>`,
         // feeding the hook's JSON stdin (session_id + subagent base fields).
@@ -864,7 +866,8 @@ mod transport_tests {
             let mut child = Command::new(&bin_path)
                 .arg("--hook")
                 .arg(event)
-                .env("HOME", &home)
+                .arg("--journal-dir")
+                .arg(&journal_dir)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -904,7 +907,7 @@ mod transport_tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &bin_path);
-        let home_env = TestEnvVar::set("HOME", &home);
+        let journal_env = TestEnvVar::set("T_HUB_AGENT_JOURNAL_DIR", &journal_dir);
 
         // Recording emitter to capture the live UI events.
         #[derive(Default, Clone)]
@@ -923,7 +926,7 @@ mod transport_tests {
         let bridge = AgentBridge::new();
         bridge.set_emitter(Arc::new(rec.clone()));
         bridge.connect("ignored").expect("connect must succeed");
-        drop(home_env);
+        drop(journal_env);
         drop(agent_bin_env);
         drop(env_lock);
 
