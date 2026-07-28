@@ -6,7 +6,10 @@
 //! Completed records remain durable for recovery and audit, but only active
 //! records participate in admission decisions.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +26,233 @@ const PROVIDER_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const INSPECTION_OUTPUT_LIMIT: usize = 1024 * 1024;
 const LAST_ERROR_LIMIT: usize = 8192;
 const CONTAINMENT_EVIDENCE_LIMIT: usize = 64 * 1024;
+
+const PROVIDER_SUPERVISOR_SCRIPT: &str = r#"
+import base64
+import ctypes
+import json
+import os
+import pathlib
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+command = json.loads(sys.argv[1])
+generation = sys.argv[2]
+timeout = int(sys.argv[3])
+unit = sys.argv[4]
+output_limit = int(sys.argv[5])
+if (
+    not command
+    or len(generation) != 32
+    or any(value not in "0123456789abcdef" for value in generation)
+    or timeout < 1
+    or timeout > 21600
+    or unit != f"t-hub-provider-{generation}.scope"
+    or output_limit != 16777216
+):
+    raise RuntimeError("provider supervisor arguments are invalid")
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise RuntimeError("provider supervisor could not become a child subreaper")
+
+def cgroup_path(pid):
+    rows = pathlib.Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    if len(rows) != 1 or not rows[0].startswith("0::/"):
+        raise RuntimeError("provider cgroup identity is malformed")
+    return rows[0][3:]
+
+path = cgroup_path(os.getpid())
+if pathlib.PurePosixPath(path).name != unit:
+    raise RuntimeError("provider supervisor is outside its exact managed scope")
+directory = os.open(
+    "/sys/fs/cgroup" + path,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+)
+try:
+    for control in ("cgroup.events", "cgroup.procs", "cgroup.kill"):
+        if not stat.S_ISREG(os.stat(control, dir_fd=directory, follow_symlinks=False).st_mode):
+            raise RuntimeError("provider managed cgroup controls are incomplete")
+    identity = {
+        "generation": generation,
+        "unit": unit,
+        "cgroupPath": path,
+        "cgroupDevice": os.fstat(directory).st_dev,
+        "cgroupInode": os.fstat(directory).st_ino,
+    }
+    print(json.dumps({"kind": "ready", "identity": identity}, separators=(",", ":")), flush=True)
+    authorization = sys.stdin.buffer.readline(64)
+    if authorization != b"start\n":
+        raise RuntimeError("provider authorization was not received")
+
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(sys.stdin.buffer, selectors.EVENT_READ, "parent")
+    selector.register(child.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(child.stderr, selectors.EVENT_READ, "stderr")
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    failure = None
+    while child.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            failure = "provider generation exceeded its timeout"
+            break
+        for key, _ in selector.select(min(remaining, 0.1)):
+            if key.data == "parent":
+                if os.read(sys.stdin.fileno(), 1) == b"":
+                    failure = "provider supervisor lost its parent"
+                    break
+                failure = "provider supervisor received unexpected parent input"
+                break
+            chunk = os.read(key.fileobj.fileno(), 8192)
+            if chunk:
+                output[key.data].extend(chunk)
+                if len(output[key.data]) > output_limit:
+                    failure = "provider output exceeded its safe bound"
+                    break
+        if failure is not None:
+            break
+
+    if failure is not None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        stop_deadline = time.monotonic() + 2
+        while child.poll() is None and time.monotonic() < stop_deadline:
+            time.sleep(0.01)
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        child.wait()
+    else:
+        child.wait()
+
+    group_deadline = time.monotonic() + 2
+    group_killed = False
+    while True:
+        while True:
+            try:
+                waited, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if waited == 0:
+                break
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            break
+        if time.monotonic() >= group_deadline:
+            if group_killed:
+                raise RuntimeError("provider descendant generation could not be terminated")
+            if failure is None:
+                failure = "provider descendant generation outlived its leader"
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                break
+            group_killed = True
+            group_deadline = time.monotonic() + 2
+        time.sleep(0.01)
+
+    for stream in ("stdout", "stderr"):
+        file = getattr(child, stream)
+        while True:
+            chunk = os.read(file.fileno(), 8192)
+            if not chunk:
+                break
+            output[stream].extend(chunk)
+            if len(output[stream]) > output_limit:
+                failure = "provider output exceeded its safe bound"
+                break
+
+    while True:
+        try:
+            waited, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if waited == 0:
+            break
+
+    result = {
+        "kind": "completed" if failure is None else "terminated",
+        "identity": identity,
+        "exitCode": child.returncode,
+        "stdout": base64.b64encode(output["stdout"]).decode("ascii"),
+        "stderr": base64.b64encode(output["stderr"]).decode("ascii"),
+        "error": failure,
+    }
+    print(json.dumps(result, separators=(",", ":")), flush=True)
+finally:
+    os.close(directory)
+"#;
+
+const TERMINATE_PROVIDER_SCRIPT: &str = r#"
+import json
+import os
+import pathlib
+import stat
+import sys
+import time
+
+identity = json.loads(sys.argv[1])
+try:
+    directory = os.open(
+        "/sys/fs/cgroup" + identity["cgroupPath"],
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+except FileNotFoundError:
+    raise SystemExit(0)
+try:
+    if (
+        os.fstat(directory).st_dev != identity["cgroupDevice"]
+        or os.fstat(directory).st_ino != identity["cgroupInode"]
+        or pathlib.Path(identity["cgroupPath"]).name != identity["unit"]
+        or not stat.S_ISREG(
+            os.stat("cgroup.kill", dir_fd=directory, follow_symlinks=False).st_mode
+        )
+    ):
+        raise RuntimeError("provider managed cgroup identity is mismatched")
+    kill_descriptor = os.open(
+        "cgroup.kill",
+        os.O_WRONLY | os.O_CLOEXEC,
+        dir_fd=directory,
+    )
+    try:
+        if os.write(kill_descriptor, b"1") != 1:
+            raise RuntimeError("provider managed cgroup kill was partial")
+    finally:
+        os.close(kill_descriptor)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            events = pathlib.Path(
+                f"/sys/fs/cgroup{identity['cgroupPath']}/cgroup.events"
+            ).read_text()
+        except FileNotFoundError:
+            break
+        populated = dict(row.split() for row in events.splitlines()).get("populated")
+        if populated == "0":
+            break
+        if populated != "1" or time.monotonic() >= deadline:
+            raise RuntimeError("provider managed cgroup did not terminate")
+        time.sleep(0.005)
+finally:
+    os.close(directory)
+"#;
 
 const CONTAINMENT_FREEZE_WATCHDOG_SCRIPT: &str = r#"
 import fcntl
@@ -41,6 +271,7 @@ lease = json.loads(sys.argv[1])
 secret = bytes.fromhex(sys.argv[2])
 socket_name = sys.argv[3]
 lease_path = lease["leasePath"]
+provider = lease["provider"]
 directory = None
 freeze_descriptor = None
 connection = None
@@ -97,6 +328,62 @@ def exact_identity():
         and os.fstat(directory).st_ino == lease["cgroupInode"]
         and pathlib.Path(lease["cgroupPath"]).name == lease["managedUnit"]
     )
+
+def provider_directory():
+    try:
+        descriptor = os.open(
+            "/sys/fs/cgroup" + provider["cgroupPath"],
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        return None
+    if (
+        os.fstat(descriptor).st_dev != provider["cgroupDevice"]
+        or os.fstat(descriptor).st_ino != provider["cgroupInode"]
+        or pathlib.Path(provider["cgroupPath"]).name != provider["unit"]
+    ):
+        os.close(descriptor)
+        raise RuntimeError("provider managed cgroup identity is mismatched")
+    return descriptor
+
+def provider_populated(descriptor):
+    provider_events = os.open(
+        "cgroup.events",
+        os.O_RDONLY | os.O_CLOEXEC,
+        dir_fd=descriptor,
+    )
+    try:
+        raw = os.read(provider_events, 4097)
+    finally:
+        os.close(provider_events)
+    values = dict(row.split() for row in raw.decode("ascii").splitlines())
+    if len(raw) > 4096 or values.get("populated") not in ("0", "1"):
+        raise RuntimeError("provider managed cgroup events are incomplete")
+    return values["populated"] == "1"
+
+def terminate_provider():
+    provider_cgroup = provider_directory()
+    if provider_cgroup is None:
+        return
+    try:
+        if provider_populated(provider_cgroup):
+            kill_descriptor = os.open(
+                "cgroup.kill",
+                os.O_WRONLY | os.O_CLOEXEC,
+                dir_fd=provider_cgroup,
+            )
+            try:
+                if os.write(kill_descriptor, b"1") != 1:
+                    raise RuntimeError("provider managed cgroup kill was partial")
+            finally:
+                os.close(kill_descriptor)
+        deadline = time.monotonic() + 5
+        while provider_populated(provider_cgroup):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("provider managed cgroup did not terminate")
+            time.sleep(0.005)
+    finally:
+        os.close(provider_cgroup)
 
 def persist(state):
     value = dict(lease)
@@ -174,6 +461,7 @@ try:
     if existing is not None:
         lease_owned = True
         if existing == "armed" and exact_identity() and event_value("frozen") == 1:
+            terminate_provider()
             write_freeze(b"0")
             wait_frozen(0)
         if exact_identity() and event_value("frozen") == 0:
@@ -199,6 +487,7 @@ try:
     verify(recv_until(lease["deadline"]), "thaw")
     if not exact_identity() or event_value("frozen") != 1:
         raise RuntimeError("freeze watchdog thaw identity is mismatched")
+    terminate_provider()
     write_freeze(b"0")
     wait_frozen(0)
     changed = False
@@ -222,6 +511,7 @@ except Exception:
             and changed
             and event_value("frozen") == 1
         ):
+            terminate_provider()
             write_freeze(b"0")
             wait_frozen(0)
             changed = False
@@ -269,7 +559,8 @@ root_pid = int(sys.argv[1])
 target = json.loads(sys.argv[2])
 operation_id = sys.argv[3]
 request_path = sys.argv[4]
-watchdog_script = sys.argv[5]
+provider = json.loads(sys.argv[5])
+watchdog_script = sys.argv[6]
 MAX_PROCESSES = 256
 MAX_TASKS = 1024
 
@@ -277,10 +568,37 @@ def inspection_timeout(signum, frame):
     raise RuntimeError("managed containment inspection timed out")
 
 signal.signal(signal.SIGALRM, inspection_timeout)
-containment_timeout = int(sys.argv[6])
+containment_timeout = int(sys.argv[7])
 if containment_timeout < 60 or containment_timeout > 21630:
     raise RuntimeError("managed containment timeout is invalid")
 signal.alarm(containment_timeout)
+
+def validate_provider():
+    if (
+        not re.fullmatch(r"[0-9a-f]{32}", provider.get("generation", ""))
+        or provider.get("unit") != f"t-hub-provider-{provider.get('generation')}.scope"
+        or pathlib.PurePosixPath(provider.get("cgroupPath", "")).name != provider.get("unit")
+    ):
+        raise RuntimeError("provider managed cgroup identity is invalid")
+    descriptor = os.open(
+        "/sys/fs/cgroup" + provider["cgroupPath"],
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        if (
+            os.fstat(descriptor).st_dev != provider["cgroupDevice"]
+            or os.fstat(descriptor).st_ino != provider["cgroupInode"]
+        ):
+            raise RuntimeError("provider managed cgroup identity is mismatched")
+        for control in ("cgroup.events", "cgroup.procs", "cgroup.kill"):
+            if not stat.S_ISREG(
+                os.stat(control, dir_fd=descriptor, follow_symlinks=False).st_mode
+            ):
+                raise RuntimeError("provider managed cgroup controls are incomplete")
+    finally:
+        os.close(descriptor)
+
+validate_provider()
 
 def proc_start(pid):
     value = pathlib.Path(f"/proc/{pid}/stat").read_text()
@@ -570,6 +888,7 @@ try:
         "cgroupInode": managed_inode,
         "deadline": watchdog_deadline,
         "leasePath": f"{request_path}.freeze-{root_pid}-{watchdog_nonce}.json",
+        "provider": provider,
     }
     completed("createLease")
     command("launchWatchdog")
@@ -1910,6 +2229,7 @@ impl WorktreeCoordinator {
         record: &WorktreeRetirement,
         request: &CapturedProviderRequest,
     ) -> Result<std::process::Output, String> {
+        let mut provider = PreparedProviderProcess::spawn(&request.provider_path)?;
         let boundary = self.boundary_for(&record.worktree_path);
         let _boundary = boundary
             .coordination
@@ -1922,6 +2242,7 @@ impl WorktreeCoordinator {
             &request.request.worktree,
             &record.operation_id,
             &request.provider_path,
+            &provider.identity,
         )?;
         if self
             .boundary_snapshot()
@@ -1951,14 +2272,20 @@ impl WorktreeCoordinator {
             containment.evidence.clone(),
         )?;
         drop(_boundary);
-        let output = authorization.launch(&running, &request.request.worktree, request);
-        let release = containment.release();
-        match (output, release) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(provider_error), Err(release_error)) => Err(format!(
-                "{provider_error}; managed runtime containment release failed: {release_error}"
-            )),
+        let completion =
+            authorization.launch(&running, &request.request.worktree, request, &mut provider);
+        match completion {
+            ManagedProviderCompletion::Completed(output) => {
+                containment.release()?;
+                Ok(output)
+            }
+            ManagedProviderCompletion::Terminated(error) => {
+                containment.release().map_err(|release_error| {
+                    format!("{error}; managed runtime containment release failed: {release_error}")
+                })?;
+                Err(error)
+            }
+            ManagedProviderCompletion::Indeterminate(error) => Err(error),
         }
     }
 }
@@ -2424,9 +2751,12 @@ impl ProcessWatchdogBackend {
         target: &CapturedWorktreeIdentity,
         operation_id: &str,
         request_path: &str,
+        provider: &ManagedProviderIdentity,
     ) -> Result<Self, String> {
         let target_json = serde_json::to_string(target)
             .map_err(|error| format!("worktree containment identity failed: {error}"))?;
+        let provider_json = serde_json::to_string(provider)
+            .map_err(|error| format!("provider containment identity failed: {error}"))?;
         let mut command = containment_command();
         command.args([
             "/usr/bin/python3",
@@ -2436,6 +2766,7 @@ impl ProcessWatchdogBackend {
             &target_json,
             operation_id,
             request_path,
+            &provider_json,
             CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
             &(provider_timeout().as_secs() + 30).to_string(),
         ]);
@@ -2641,6 +2972,7 @@ fn verify_process_containment(
     target: &CapturedWorktreeIdentity,
     operation_id: &str,
     request_path: &str,
+    provider: &ManagedProviderIdentity,
 ) -> Result<ProcessContainmentGuard, String> {
     let generation = uuid::Uuid::new_v4().simple().to_string();
     let mut guard = ProcessContainmentGuard {
@@ -2658,13 +2990,14 @@ fn verify_process_containment(
                 pane.session
             ));
         }
-        let mut backend = ProcessWatchdogBackend::spawn(pane, target, operation_id, request_path)
-            .map_err(|error| {
-            format!(
-                "Cargo cleanup could not start session '{}' containment: {error}",
-                pane.session
-            )
-        })?;
+        let mut backend =
+            ProcessWatchdogBackend::spawn(pane, target, operation_id, request_path, provider)
+                .map_err(|error| {
+                    format!(
+                        "Cargo cleanup could not start session '{}' containment: {error}",
+                        pane.session
+                    )
+                })?;
         let authorization = prepare_watchdog_lifecycle(&mut backend).map_err(|error| {
             format!(
                 "Cargo cleanup refuses session '{}' containment: {error}",
@@ -2747,6 +3080,300 @@ fn provider_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
+impl PreparedProviderProcess {
+    fn spawn(request_path: &str) -> Result<Self, String> {
+        let mut configured = configured_provider_command()?;
+        configured.extend(
+            [
+                "retirement-clean",
+                "--request",
+                request_path,
+                "--apply",
+                "--confirm",
+                "--json",
+            ]
+            .map(str::to_string),
+        );
+        Self::spawn_command(configured)
+    }
+
+    fn spawn_command(configured: Vec<String>) -> Result<Self, String> {
+        Self::spawn_command_with_timeout(configured, provider_timeout())
+    }
+
+    fn spawn_command_with_timeout(
+        configured: Vec<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let generation = uuid::Uuid::new_v4().simple().to_string();
+        let unit = format!("t-hub-provider-{generation}.scope");
+        let configured = serde_json::to_string(&configured)
+            .map_err(|error| format!("provider command identity failed: {error}"))?;
+        let mut command = containment_command();
+        command.args([
+            "/usr/bin/systemd-run",
+            "--user",
+            "--scope",
+            &format!("--unit={unit}"),
+            "--collect",
+            "--quiet",
+            "/usr/bin/python3",
+            "-c",
+            PROVIDER_SUPERVISOR_SCRIPT,
+            &configured,
+            &generation,
+            &timeout.as_secs().to_string(),
+            &unit,
+            &PROVIDER_OUTPUT_LIMIT.to_string(),
+        ]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not start provider supervisor: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "provider supervisor input is unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "provider supervisor output is unavailable".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "provider supervisor errors are unavailable".to_string())?;
+        let (sender, messages) = mpsc::channel();
+        let stdout_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut message = Vec::new();
+                match reader.read_until(b'\n', &mut message) {
+                    Ok(0) => break,
+                    Ok(_) if message.len() <= PROVIDER_OUTPUT_LIMIT * 3 => {
+                        if sender.send(Ok(message)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        let _ = sender.send(Err(
+                            "provider supervisor message exceeded its safe bound".into(),
+                        ));
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+        let captured_stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_output = Arc::clone(&captured_stderr);
+        let stderr_thread = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = stderr
+                .take((CONTAINMENT_EVIDENCE_LIMIT + 1) as u64)
+                .read_to_end(&mut output);
+            *stderr_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = output;
+        });
+        let ready = messages
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|error| format!("provider supervisor did not become ready: {error}"))?
+            .map_err(|error| format!("provider supervisor readiness failed: {error}"))?;
+        let ProviderSupervisorMessage::Ready { identity } =
+            serde_json::from_slice::<ProviderSupervisorMessage>(&ready)
+                .map_err(|error| format!("provider supervisor readiness is invalid: {error}"))?
+        else {
+            return Err("provider supervisor completed before authorization".into());
+        };
+        if identity.generation != generation
+            || identity.unit != unit
+            || !identity.cgroup_path.ends_with(&format!("/{unit}"))
+        {
+            return Err("provider supervisor readiness identity is mismatched".into());
+        }
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            messages,
+            identity,
+            stderr: captured_stderr,
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+            timeout,
+            finished: false,
+        })
+    }
+
+    fn run(&mut self) -> ManagedProviderCompletion {
+        let result = self.run_inner();
+        let termination = terminate_managed_provider(&self.identity);
+        self.finish_transport();
+        self.finished = termination.is_ok();
+        match (result, termination) {
+            (Ok(output), Ok(())) => ManagedProviderCompletion::Completed(output),
+            (Err(error), Ok(())) => ManagedProviderCompletion::Terminated(error),
+            (Ok(_), Err(error)) => ManagedProviderCompletion::Indeterminate(format!(
+                "provider completed but exact generation termination is unproven: {error}"
+            )),
+            (Err(provider_error), Err(termination_error)) => {
+                ManagedProviderCompletion::Indeterminate(format!(
+                    "{provider_error}; exact provider generation termination is unproven: {termination_error}"
+                ))
+            }
+        }
+    }
+
+    fn stop(&mut self, reason: String) -> ManagedProviderCompletion {
+        let termination = terminate_managed_provider(&self.identity);
+        self.finish_transport();
+        self.finished = termination.is_ok();
+        match termination {
+            Ok(()) => ManagedProviderCompletion::Terminated(reason),
+            Err(error) => ManagedProviderCompletion::Indeterminate(format!(
+                "{reason}; exact provider generation termination is unproven: {error}"
+            )),
+        }
+    }
+
+    fn run_inner(&mut self) -> Result<std::process::Output, String> {
+        self.stdin
+            .as_mut()
+            .ok_or_else(|| "provider supervisor authorization was already consumed".to_string())?
+            .write_all(b"start\n")
+            .and_then(|_| self.stdin.as_mut().unwrap().flush())
+            .map_err(|error| format!("could not authorize provider supervisor: {error}"))?;
+        let message = self
+            .messages
+            .recv_timeout(self.timeout + Duration::from_secs(10))
+            .map_err(|error| {
+                format!(
+                    "provider supervisor completion was not received: {error}: {}",
+                    String::from_utf8_lossy(
+                        &self
+                            .stderr
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    )
+                    .trim()
+                )
+            })?
+            .map_err(|error| format!("provider supervisor completion failed: {error}"))?;
+        let message = serde_json::from_slice::<ProviderSupervisorMessage>(&message)
+            .map_err(|error| format!("provider supervisor completion is invalid: {error}"))?;
+        let (identity, exit_code, stdout, stderr, error) = match message {
+            ProviderSupervisorMessage::Completed {
+                identity,
+                exit_code,
+                stdout,
+                stderr,
+                error,
+            } => (identity, exit_code, stdout, stderr, error),
+            ProviderSupervisorMessage::Terminated {
+                identity,
+                exit_code,
+                stdout,
+                stderr,
+                error,
+            } => (identity, exit_code, stdout, stderr, error),
+            ProviderSupervisorMessage::Ready { .. } => {
+                return Err("provider supervisor repeated its readiness message".into())
+            }
+        };
+        if identity != self.identity {
+            return Err("provider supervisor completion identity is mismatched".into());
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        let stdout = STANDARD
+            .decode(stdout)
+            .map_err(|error| format!("provider supervisor stdout is invalid: {error}"))?;
+        let stderr = STANDARD
+            .decode(stderr)
+            .map_err(|error| format!("provider supervisor stderr is invalid: {error}"))?;
+        if stdout.len() > PROVIDER_OUTPUT_LIMIT || stderr.len() > PROVIDER_OUTPUT_LIMIT {
+            return Err("provider supervisor output exceeded its safe bound".into());
+        }
+        Ok(std::process::Output {
+            status: exit_status(exit_code),
+            stdout,
+            stderr,
+        })
+    }
+
+    fn finish_transport(&mut self) {
+        self.stdin.take();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(thread) = self.stdout_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PreparedProviderProcess {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stdin.take();
+            let _ = terminate_managed_provider(&self.identity);
+            self.finish_transport();
+        }
+    }
+}
+
+fn terminate_managed_provider(identity: &ManagedProviderIdentity) -> Result<(), String> {
+    let identity = serde_json::to_string(identity)
+        .map_err(|error| format!("provider termination identity failed: {error}"))?;
+    let mut command = containment_command();
+    command.args([
+        "/usr/bin/python3",
+        "-c",
+        TERMINATE_PROVIDER_SCRIPT,
+        &identity,
+    ]);
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        Duration::from_secs(10),
+        CONTAINMENT_EVIDENCE_LIMIT,
+    )
+    .map_err(|error| format!("provider generation termination failed: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "provider generation termination failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
+#[cfg(windows)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code as u32)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderRequestIdentity {
@@ -2786,6 +3413,60 @@ struct CapturedProviderRequest {
     bytes: Vec<u8>,
     request: RetirementCleanupRequest,
     identity: ProviderRequestIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedProviderIdentity {
+    generation: String,
+    unit: String,
+    cgroup_path: String,
+    cgroup_device: u64,
+    cgroup_inode: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum ProviderSupervisorMessage {
+    Ready {
+        identity: ManagedProviderIdentity,
+    },
+    Completed {
+        identity: ManagedProviderIdentity,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+    },
+    Terminated {
+        identity: ManagedProviderIdentity,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+    },
+}
+
+enum ManagedProviderCompletion {
+    Completed(std::process::Output),
+    Terminated(String),
+    Indeterminate(String),
+}
+
+struct PreparedProviderProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    messages: Receiver<Result<Vec<u8>, String>>,
+    identity: ManagedProviderIdentity,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_thread: Option<std::thread::JoinHandle<()>>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+    timeout: Duration,
+    finished: bool,
 }
 
 struct ProviderAuthorizationGuard {
@@ -2861,26 +3542,12 @@ impl ProviderAuthorizationGuard {
         record: &WorktreeRetirement,
         target: &CapturedWorktreeIdentity,
         request: &CapturedProviderRequest,
-    ) -> Result<std::process::Output, String> {
-        self.launch_with(record, target, request, |request_path| {
-            let configured = configured_provider_command()?;
-            let mut command = Command::new(&configured[0]);
-            command.args(&configured[1..]);
-            command.args([
-                "retirement-clean",
-                "--request",
-                request_path,
-                "--apply",
-                "--confirm",
-                "--json",
-            ]);
-            crate::bounded_exec::output_with_timeout_and_limit(
-                command,
-                provider_timeout(),
-                PROVIDER_OUTPUT_LIMIT,
-            )
-            .map_err(|error| format!("rust-storage retirement-clean could not complete: {error}"))
-        })
+        provider: &mut PreparedProviderProcess,
+    ) -> ManagedProviderCompletion {
+        match self.launch_with(record, target, request, |_| Ok(provider.run())) {
+            Ok(completion) => completion,
+            Err(error) => provider.stop(error),
+        }
     }
 
     fn launch_with<T>(
@@ -3466,6 +4133,10 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_test_provider() -> PreparedProviderProcess {
+        PreparedProviderProcess::spawn_command(vec!["/bin/true".into()]).unwrap()
+    }
 
     fn git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -4094,14 +4765,20 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(20));
         };
+        let mut provider = prepared_test_provider();
         let error = verify_process_containment(
             &[pane],
             admission.blockers.first().expect("one exact blocker"),
             "0123456789abcdef0123456789abcdef",
             "/tmp/test-request.json",
+            &provider.identity,
         )
         .err()
         .unwrap();
+        assert!(matches!(
+            provider.stop("test complete".into()),
+            ManagedProviderCompletion::Terminated(_)
+        ));
         assert!(error.contains("exact managed cgroup-v2 freezer ownership is unavailable"));
         crate::tmux::kill_session_tree(&session).unwrap();
     }
@@ -4190,12 +4867,18 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(20));
         };
+        let mut provider = prepared_test_provider();
         let mut verification = verify_process_containment(
             &[pane],
             &target,
             &record.operation_id,
             request_path.to_str().unwrap(),
+            &provider.identity,
         );
+        assert!(matches!(
+            provider.stop("test complete".into()),
+            ManagedProviderCompletion::Terminated(_)
+        ));
         if let Ok(guard) = &mut verification {
             guard.release().unwrap();
         }
@@ -4223,20 +4906,28 @@ mod tests {
             cwd: "/tmp".into(),
             pid: std::process::id(),
         };
+        let mut provider = prepared_test_provider();
         assert!(verify_process_containment(
             &[pane],
             &target,
             "0123456789abcdef0123456789abcdef",
-            "/tmp/test-request.json"
+            "/tmp/test-request.json",
+            &provider.identity,
         )
         .err()
         .unwrap()
         .contains("exact managed cgroup-v2 freezer ownership is unavailable"));
+        assert!(matches!(
+            provider.stop("test complete".into()),
+            ManagedProviderCompletion::Terminated(_)
+        ));
     }
 
     #[test]
     fn cleanup_review_watchdog_scripts_are_executable() {
         for script in [
+            PROVIDER_SUPERVISOR_SCRIPT,
+            TERMINATE_PROVIDER_SCRIPT,
             ATOMIC_CONTAINMENT_INSPECTION_SCRIPT,
             CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
         ] {
@@ -4250,6 +4941,75 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[test]
+    fn cleanup_review_provider_supervisor_proves_completion() {
+        let mut provider = PreparedProviderProcess::spawn_command_with_timeout(
+            vec!["/bin/sh".into(), "-c".into(), "printf completed".into()],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let ManagedProviderCompletion::Completed(output) = provider.run() else {
+            panic!("provider completion was not proven");
+        };
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"completed");
+    }
+
+    #[test]
+    fn cleanup_review_provider_supervisor_terminates_timeout_and_descendants() {
+        let mut timeout = PreparedProviderProcess::spawn_command_with_timeout(
+            vec!["/bin/sleep".into(), "30".into()],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            timeout.run(),
+            ManagedProviderCompletion::Terminated(error) if error.contains("timeout")
+        ));
+
+        let mut descendant = PreparedProviderProcess::spawn_command_with_timeout(
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30 & exit 0".into()],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(matches!(
+            descendant.run(),
+            ManagedProviderCompletion::Terminated(error) if error.contains("descendant")
+        ));
+    }
+
+    #[test]
+    fn cleanup_review_provider_supervisor_terminates_on_parent_loss() {
+        let mut provider = PreparedProviderProcess::spawn_command_with_timeout(
+            vec!["/bin/sleep".into(), "30".into()],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        provider
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"start\n")
+            .unwrap();
+        provider.stdin.as_mut().unwrap().flush().unwrap();
+        provider.stdin.take();
+        let message = provider
+            .messages
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ProviderSupervisorMessage>(&message).unwrap(),
+            ProviderSupervisorMessage::Terminated {
+                error: Some(error),
+                ..
+            } if error.contains("lost its parent")
+        ));
+        terminate_managed_provider(&provider.identity).unwrap();
+        provider.finish_transport();
+        provider.finished = true;
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
