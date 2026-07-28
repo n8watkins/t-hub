@@ -9,10 +9,11 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -508,6 +509,18 @@ def receive(connection, kind, lease, secret, deadline):
         raise RuntimeError("freeze watchdog response is missing or oversized")
     verify_message(raw, kind, lease, secret)
 
+def command(operation):
+    raw = sys.stdin.buffer.readline(65537)
+    if not raw or len(raw) > 65536:
+        raise RuntimeError("watchdog backend command is missing or oversized")
+    value = json.loads(raw)
+    if value != {"operation": operation}:
+        raise RuntimeError("watchdog backend command is out of state")
+
+def completed(operation):
+    sys.stdout.write(json.dumps({"operation": operation}, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
 cgroup_directory = None
 cgroup_identity = None
 watchdog_listener = None
@@ -515,8 +528,10 @@ watchdog_connection = None
 watchdog_lease = None
 watchdog_secret = None
 freeze_changed = False
-watchdog_events = []
+watchdog_thawed = False
+watchdog_disarmed = False
 try:
+    command("captureCgroup")
     managed = managed_cgroup(root_pid)
     if managed is None:
         raise RuntimeError("exact managed cgroup-v2 freezer ownership is unavailable")
@@ -529,6 +544,8 @@ try:
     managed_path, managed_inode, cgroup_directory = managed
     if event_value(cgroup_directory, "frozen") != 0:
         raise RuntimeError("managed cgroup is already frozen by another owner")
+    completed("captureCgroup")
+    command("createLease")
     watchdog_nonce = secrets.token_hex(16)
     watchdog_secret = secrets.token_bytes(32)
     watchdog_unit = f"t-hub-freeze-watchdog-{watchdog_nonce}.service"
@@ -545,6 +562,8 @@ try:
         "deadline": watchdog_deadline,
         "leasePath": f"{request_path}.freeze-{root_pid}-{watchdog_nonce}.json",
     }
+    completed("createLease")
+    command("launchWatchdog")
     watchdog_listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     watchdog_listener.bind("\0" + watchdog_socket)
     watchdog_listener.listen(1)
@@ -575,7 +594,8 @@ try:
     )
     if launch.returncode != 0 or launch.stdout or launch.stderr:
         raise RuntimeError("freeze watchdog transient unit could not be started")
-    watchdog_events.append("unitCreated")
+    completed("launchWatchdog")
+    command("verifyReady")
     watchdog_connection, _ = watchdog_listener.accept()
     peer_pid, peer_uid, _ = struct.unpack(
         "3i",
@@ -598,9 +618,11 @@ try:
         watchdog_secret,
         min(watchdog_deadline, time.monotonic() + 2),
     )
-    watchdog_events.append("preparedReady")
+    completed("verifyReady")
+    command("arm")
     watchdog_connection.sendall(signed("arm", watchdog_lease, watchdog_secret))
-    watchdog_events.append("armSent")
+    completed("arm")
+    command("freeze")
     receive(
         watchdog_connection,
         "frozen",
@@ -609,7 +631,8 @@ try:
         min(watchdog_deadline, time.monotonic() + 6),
     )
     freeze_changed = True
-    watchdog_events.append("frozen")
+    completed("freeze")
+    command("inspectEvidence")
     if (
         cgroup_path(root_pid) != managed_path
         or os.fstat(cgroup_directory).st_ino != managed_inode
@@ -692,7 +715,48 @@ try:
         or supervisor_descriptors[namespace_supervisor] != descriptors(namespace_supervisor)
     ):
         raise RuntimeError("managed process or task set changed during containment inspection")
-    watchdog_events.append("containmentVerified")
+    completed("inspectEvidence")
+    command("thaw")
+    if (
+        cgroup_path(root_pid) != managed_path
+        or os.fstat(cgroup_directory).st_ino != managed_inode
+        or event_value(cgroup_directory, "frozen") != 1
+    ):
+        raise RuntimeError("managed cgroup identity changed before unfreeze")
+    watchdog_connection.sendall(
+        signed("thaw", watchdog_lease, watchdog_secret)
+    )
+    receive(
+        watchdog_connection,
+        "thawed",
+        watchdog_lease,
+        watchdog_secret,
+        min(watchdog_lease["deadline"], time.monotonic() + 6),
+    )
+    freeze_changed = False
+    watchdog_thawed = True
+    completed("thaw")
+    command("verifyThaw")
+    if (
+        cgroup_path(root_pid) != managed_path
+        or os.fstat(cgroup_directory).st_ino != managed_inode
+        or event_value(cgroup_directory, "frozen") != 0
+    ):
+        raise RuntimeError("managed cgroup identity changed after unfreeze")
+    completed("verifyThaw")
+    command("disarm")
+    watchdog_connection.sendall(
+        signed("disarm", watchdog_lease, watchdog_secret)
+    )
+    receive(
+        watchdog_connection,
+        "disarmed",
+        watchdog_lease,
+        watchdog_secret,
+        min(watchdog_lease["deadline"], time.monotonic() + 2),
+    )
+    watchdog_disarmed = True
+    completed("disarm")
 finally:
     signal.alarm(0)
     unfreeze_error = None
@@ -707,7 +771,6 @@ finally:
             watchdog_connection.sendall(
                 signed("thaw", watchdog_lease, watchdog_secret)
             )
-            watchdog_events.append("thawed")
             receive(
                 watchdog_connection,
                 "thawed",
@@ -715,12 +778,23 @@ finally:
                 watchdog_secret,
                 min(watchdog_lease["deadline"], time.monotonic() + 6),
             )
+            watchdog_thawed = True
             if (
                 cgroup_path(root_pid) != managed_path
                 or os.fstat(cgroup_directory).st_ino != managed_inode
                 or event_value(cgroup_directory, "frozen") != 0
             ):
                 raise RuntimeError("managed cgroup identity changed after unfreeze")
+            freeze_changed = False
+        except Exception as error:
+            unfreeze_error = error
+    if (
+        watchdog_connection is not None
+        and watchdog_thawed
+        and not watchdog_disarmed
+        and unfreeze_error is None
+    ):
+        try:
             watchdog_connection.sendall(
                 signed("disarm", watchdog_lease, watchdog_secret)
             )
@@ -731,8 +805,7 @@ finally:
                 watchdog_secret,
                 min(watchdog_lease["deadline"], time.monotonic() + 2),
             )
-            freeze_changed = False
-            watchdog_events.append("disarmed")
+            watchdog_disarmed = True
         except Exception as error:
             unfreeze_error = error
     if watchdog_connection is not None:
@@ -743,7 +816,6 @@ finally:
         os.close(cgroup_directory)
     if unfreeze_error is not None:
         raise RuntimeError(f"managed process unfreeze failed: {unfreeze_error}")
-print(json.dumps({"version": 1, "events": watchdog_events}, separators=(",", ":")))
 "#;
 
 const CONTAINMENT_PREFLIGHT_SCRIPT: &str = r#"
@@ -2050,97 +2122,99 @@ fn require_namespace_containment(
     Ok(())
 }
 
-const WATCHDOG_LIFECYCLE_EVENTS: [&str; 8] = [
-    "unitCreated",
-    "preparedReady",
-    "armSent",
-    "frozen",
-    "containmentVerified",
-    "thawed",
-    "disarmed",
-    "providerAdmission",
-];
-
-trait WatchdogLifecycleOperations {
-    fn execute(&mut self, operation: &'static str) -> Result<(), String>;
-    fn recover(&mut self) -> Result<(), String>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchdogOperation {
+    CaptureCgroup,
+    CreateLease,
+    LaunchWatchdog,
+    VerifyReady,
+    Arm,
+    Freeze,
+    InspectEvidence,
+    Thaw,
+    VerifyThaw,
+    Disarm,
+    AuthorizeProvider,
 }
 
-fn execute_watchdog_lifecycle(
-    operations: &mut impl WatchdogLifecycleOperations,
-) -> Result<(), String> {
-    for operation in WATCHDOG_LIFECYCLE_EVENTS {
-        if let Err(error) = operations.execute(operation) {
-            operations.recover()?;
+const WATCHDOG_LIFECYCLE: [WatchdogOperation; 11] = [
+    WatchdogOperation::CaptureCgroup,
+    WatchdogOperation::CreateLease,
+    WatchdogOperation::LaunchWatchdog,
+    WatchdogOperation::VerifyReady,
+    WatchdogOperation::Arm,
+    WatchdogOperation::Freeze,
+    WatchdogOperation::InspectEvidence,
+    WatchdogOperation::Thaw,
+    WatchdogOperation::VerifyThaw,
+    WatchdogOperation::Disarm,
+    WatchdogOperation::AuthorizeProvider,
+];
+
+impl WatchdogOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CaptureCgroup => "captureCgroup",
+            Self::CreateLease => "createLease",
+            Self::LaunchWatchdog => "launchWatchdog",
+            Self::VerifyReady => "verifyReady",
+            Self::Arm => "arm",
+            Self::Freeze => "freeze",
+            Self::InspectEvidence => "inspectEvidence",
+            Self::Thaw => "thaw",
+            Self::VerifyThaw => "verifyThaw",
+            Self::Disarm => "disarm",
+            Self::AuthorizeProvider => "authorizeProvider",
+        }
+    }
+}
+
+trait WatchdogBackend {
+    fn perform(&mut self, operation: WatchdogOperation) -> Result<(), String>;
+    fn recover(&mut self) -> Result<(), String>;
+    fn finish(&mut self) -> Result<(), String>;
+}
+
+fn execute_watchdog_lifecycle(backend: &mut impl WatchdogBackend) -> Result<(), String> {
+    for operation in WATCHDOG_LIFECYCLE {
+        if let Err(error) = backend.perform(operation) {
+            backend.recover()?;
             return Err(error);
         }
     }
-    Ok(())
+    backend.finish()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchdogBackendCommand {
+    operation: &'static str,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WatchdogLifecycleReport {
-    version: u32,
-    events: Vec<String>,
+struct WatchdogBackendCompletion {
+    operation: String,
 }
 
-struct ReportedWatchdogLifecycle {
-    events: std::vec::IntoIter<String>,
+struct ProcessWatchdogBackend {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    responses: Receiver<Result<String, String>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_thread: Option<std::thread::JoinHandle<()>>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl WatchdogLifecycleOperations for ReportedWatchdogLifecycle {
-    fn execute(&mut self, operation: &'static str) -> Result<(), String> {
-        if operation == "providerAdmission" && self.events.len() == 0 {
-            return Ok(());
-        }
-        match self.events.next() {
-            Some(event) if event == operation => Ok(()),
-            Some(event) => Err(format!(
-                "freeze watchdog lifecycle expected '{operation}', received '{event}'"
-            )),
-            None => Err(format!(
-                "freeze watchdog lifecycle ended before '{operation}'"
-            )),
-        }
-    }
-
-    fn recover(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-fn validate_watchdog_lifecycle_report(stdout: &[u8]) -> Result<(), String> {
-    let report: WatchdogLifecycleReport = serde_json::from_slice(stdout)
-        .map_err(|error| format!("freeze watchdog lifecycle report is invalid: {error}"))?;
-    if report.version != 1 {
-        return Err("freeze watchdog lifecycle report version is unsupported".into());
-    }
-    let mut operations = ReportedWatchdogLifecycle {
-        events: report.events.into_iter(),
-    };
-    execute_watchdog_lifecycle(&mut operations)?;
-    if operations.events.next().is_some() {
-        return Err("freeze watchdog lifecycle report has duplicate operations".into());
-    }
-    Ok(())
-}
-
-fn verify_process_containment(
-    panes: &[crate::tmux::PaneInfo],
-    target: &CapturedWorktreeIdentity,
-    operation_id: &str,
-    request_path: &str,
-) -> Result<(), String> {
-    let target_json = serde_json::to_string(target)
-        .map_err(|error| format!("worktree containment identity failed: {error}"))?;
-    for pane in panes {
-        if path_within(&pane.cwd, &target.path) {
-            return Err(format!(
-                "Cargo cleanup refuses live session '{}' in the target worktree",
-                pane.session
-            ));
-        }
+impl ProcessWatchdogBackend {
+    fn spawn(
+        pane: &crate::tmux::PaneInfo,
+        target: &CapturedWorktreeIdentity,
+        operation_id: &str,
+        request_path: &str,
+    ) -> Result<Self, String> {
+        let target_json = serde_json::to_string(target)
+            .map_err(|error| format!("worktree containment identity failed: {error}"))?;
         let mut command = containment_command();
         command.args([
             "/usr/bin/python3",
@@ -2152,29 +2226,188 @@ fn verify_process_containment(
             request_path,
             CONTAINMENT_FREEZE_WATCHDOG_SCRIPT,
         ]);
-        let output = match crate::bounded_exec::output_with_timeout_and_limit(
-            command,
-            Duration::from_secs(15),
-            CONTAINMENT_EVIDENCE_LIMIT,
-        ) {
-            Ok(output) => output,
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not start containment backend: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "containment backend input is unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "containment backend output is unavailable".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "containment backend errors are unavailable".to_string())?;
+        let (sender, responses) = mpsc::channel();
+        let stdout_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if sender
+                    .send(line.map_err(|error| error.to_string()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let captured_stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_output = Arc::clone(&captured_stderr);
+        let stderr_thread = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = stderr
+                .take((CONTAINMENT_EVIDENCE_LIMIT + 1) as u64)
+                .read_to_end(&mut output);
+            *stderr_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = output;
+        });
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            responses,
+            stderr: captured_stderr,
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) -> Result<std::process::ExitStatus, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("could not inspect containment backend: {error}"))?
+            {
+                if let Some(thread) = self.stdout_thread.take() {
+                    let _ = thread.join();
+                }
+                if let Some(thread) = self.stderr_thread.take() {
+                    let _ = thread.join();
+                }
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                return Err("containment backend did not stop within its deadline".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .stderr
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+        .trim()
+        .to_string()
+    }
+}
+
+impl WatchdogBackend for ProcessWatchdogBackend {
+    fn perform(&mut self, operation: WatchdogOperation) -> Result<(), String> {
+        if operation == WatchdogOperation::AuthorizeProvider {
+            return Ok(());
+        }
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "containment backend is no longer writable".to_string())?;
+        serde_json::to_writer(
+            &mut *stdin,
+            &WatchdogBackendCommand {
+                operation: operation.name(),
+            },
+        )
+        .map_err(|error| format!("could not encode containment command: {error}"))?;
+        stdin
+            .write_all(b"\n")
+            .and_then(|_| stdin.flush())
+            .map_err(|error| format!("could not send containment command: {error}"))?;
+        let response = match self.responses.recv_timeout(Duration::from_secs(15)) {
+            Ok(response) => {
+                response.map_err(|error| format!("could not read containment response: {error}"))?
+            }
             Err(error) => {
-                return Err(format!(
-                    "Cargo cleanup could not verify session '{}' containment: {error}",
-                    pane.session
-                ));
+                let _ = self.wait(Duration::from_secs(15));
+                let stderr = self.stderr();
+                return Err(if stderr.is_empty() {
+                    format!(
+                        "containment backend did not complete '{}': {error}",
+                        operation.name()
+                    )
+                } else {
+                    format!(
+                        "containment backend did not complete '{}': {stderr}",
+                        operation.name()
+                    )
+                });
             }
         };
-        if !output.status.success() || !output.stderr.is_empty() {
+        let completion: WatchdogBackendCompletion = serde_json::from_str(&response)
+            .map_err(|error| format!("containment response is invalid: {error}"))?;
+        if completion.operation != operation.name() {
             return Err(format!(
-                "Cargo cleanup refuses uncontained session '{}': {}",
-                pane.session,
-                String::from_utf8_lossy(&output.stderr).trim()
+                "containment backend completed '{}' while '{}' was required",
+                completion.operation,
+                operation.name()
             ));
         }
-        validate_watchdog_lifecycle_report(&output.stdout).map_err(|error| {
+        Ok(())
+    }
+
+    fn recover(&mut self) -> Result<(), String> {
+        self.stdin.take();
+        self.wait(Duration::from_secs(15)).map(|_| ())
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.stdin.take();
+        let status = self.wait(Duration::from_secs(3))?;
+        let stderr = self.stderr();
+        if !status.success() || !stderr.is_empty() {
+            return Err(if stderr.is_empty() {
+                format!("containment backend exited with {status}")
+            } else {
+                format!("containment backend failed: {stderr}")
+            });
+        }
+        Ok(())
+    }
+}
+
+fn verify_process_containment(
+    panes: &[crate::tmux::PaneInfo],
+    target: &CapturedWorktreeIdentity,
+    operation_id: &str,
+    request_path: &str,
+) -> Result<(), String> {
+    for pane in panes {
+        if path_within(&pane.cwd, &target.path) {
+            return Err(format!(
+                "Cargo cleanup refuses live session '{}' in the target worktree",
+                pane.session
+            ));
+        }
+        let mut backend = ProcessWatchdogBackend::spawn(pane, target, operation_id, request_path)
+            .map_err(|error| {
             format!(
-                "Cargo cleanup refuses session '{}' watchdog evidence: {error}",
+                "Cargo cleanup could not start session '{}' containment: {error}",
+                pane.session
+            )
+        })?;
+        execute_watchdog_lifecycle(&mut backend).map_err(|error| {
+            format!(
+                "Cargo cleanup refuses session '{}' containment: {error}",
                 pane.session
             )
         })?;
@@ -3133,7 +3366,7 @@ mod tests {
             "/tmp/test-request.json"
         )
         .unwrap_err()
-        .contains("uncontained"));
+        .contains("exact managed cgroup-v2 freezer ownership is unavailable"));
     }
 
     #[test]
@@ -3163,8 +3396,8 @@ mod tests {
 
     #[derive(Debug)]
     struct InjectedWatchdogOperations {
-        fail_at: Option<&'static str>,
-        operations: Vec<&'static str>,
+        fail_at: Option<WatchdogOperation>,
+        operations: Vec<WatchdogOperation>,
         exact_frozen: bool,
         unrelated_frozen: bool,
         changed: bool,
@@ -3175,26 +3408,26 @@ mod tests {
         source_preserved: bool,
     }
 
-    impl WatchdogLifecycleOperations for InjectedWatchdogOperations {
-        fn execute(&mut self, operation: &'static str) -> Result<(), String> {
+    impl WatchdogBackend for InjectedWatchdogOperations {
+        fn perform(&mut self, operation: WatchdogOperation) -> Result<(), String> {
             self.operations.push(operation);
             if self.fail_at == Some(operation) {
-                return Err(format!("injected failure at {operation}"));
+                return Err(format!("injected failure at {}", operation.name()));
             }
             match operation {
-                "unitCreated" => self.lease = Some(TestLeaseState::Prepared),
-                "armSent" => self.lease = Some(TestLeaseState::Armed),
-                "frozen" => {
+                WatchdogOperation::LaunchWatchdog => self.lease = Some(TestLeaseState::Prepared),
+                WatchdogOperation::Arm => self.lease = Some(TestLeaseState::Armed),
+                WatchdogOperation::Freeze => {
                     self.exact_frozen = true;
                     self.changed = true;
                 }
-                "thawed" => {
+                WatchdogOperation::Thaw => {
                     self.exact_frozen = false;
                     self.changed = false;
                     self.lease = Some(TestLeaseState::Thawed);
                 }
-                "disarmed" => self.lease = None,
-                "providerAdmission" => self.provider_admissions += 1,
+                WatchdogOperation::Disarm => self.lease = None,
+                WatchdogOperation::AuthorizeProvider => self.provider_admissions += 1,
                 _ => {}
             }
             Ok(())
@@ -3208,9 +3441,13 @@ mod tests {
             self.lease = None;
             Ok(())
         }
+
+        fn finish(&mut self) -> Result<(), String> {
+            Ok(())
+        }
     }
 
-    fn injected_watchdog(fail_at: Option<&'static str>) -> InjectedWatchdogOperations {
+    fn injected_watchdog(fail_at: Option<WatchdogOperation>) -> InjectedWatchdogOperations {
         InjectedWatchdogOperations {
             fail_at,
             operations: Vec::new(),
@@ -3228,19 +3465,19 @@ mod tests {
     #[test]
     fn cleanup_review_production_watchdog_state_machine_injects_every_operation() {
         let failures = [
-            ("setup", "unitCreated"),
-            ("missing-ready", "preparedReady"),
-            ("malformed-ready", "preparedReady"),
-            ("parent-before-freeze", "armSent"),
-            ("parent-after-freeze", "containmentVerified"),
-            ("wrapper-only-death", "containmentVerified"),
-            ("watchdog-crash", "containmentVerified"),
-            ("deadline", "containmentVerified"),
-            ("inode-replacement", "thawed"),
-            ("competing-owner", "preparedReady"),
-            ("stale-disarm", "disarmed"),
-            ("mismatched-disarm", "disarmed"),
-            ("restart-recovery", "containmentVerified"),
+            ("setup", WatchdogOperation::CaptureCgroup),
+            ("missing-ready", WatchdogOperation::VerifyReady),
+            ("malformed-ready", WatchdogOperation::VerifyReady),
+            ("parent-before-freeze", WatchdogOperation::Arm),
+            ("parent-after-freeze", WatchdogOperation::InspectEvidence),
+            ("wrapper-only-death", WatchdogOperation::InspectEvidence),
+            ("watchdog-crash", WatchdogOperation::InspectEvidence),
+            ("deadline", WatchdogOperation::InspectEvidence),
+            ("inode-replacement", WatchdogOperation::Thaw),
+            ("competing-owner", WatchdogOperation::CaptureCgroup),
+            ("stale-disarm", WatchdogOperation::Disarm),
+            ("mismatched-disarm", WatchdogOperation::Disarm),
+            ("restart-recovery", WatchdogOperation::InspectEvidence),
         ];
         for (name, operation) in failures {
             let mut state = injected_watchdog(Some(operation));
@@ -3254,7 +3491,7 @@ mod tests {
             assert!(state.source_preserved, "{name}");
         }
 
-        let mut pre_frozen = injected_watchdog(Some("unitCreated"));
+        let mut pre_frozen = injected_watchdog(Some(WatchdogOperation::CaptureCgroup));
         pre_frozen.exact_frozen = true;
         assert!(pre_frozen.exact_frozen);
         pre_frozen.changed = false;
@@ -3272,17 +3509,7 @@ mod tests {
         assert!(success.terminal_preserved);
         assert!(success.agent_preserved);
         assert!(success.source_preserved);
-
-        let duplicate = serde_json::json!({
-            "version": 1,
-            "events": [
-                "unitCreated", "preparedReady", "armSent", "frozen",
-                "containmentVerified", "thawed", "disarmed", "disarmed"
-            ]
-        });
-        assert!(
-            validate_watchdog_lifecycle_report(&serde_json::to_vec(&duplicate).unwrap()).is_err()
-        );
+        assert_eq!(success.operations, WATCHDOG_LIFECYCLE);
     }
 
     #[cfg(unix)]
