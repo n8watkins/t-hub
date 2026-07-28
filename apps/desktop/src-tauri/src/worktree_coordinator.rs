@@ -6,9 +6,10 @@
 //! Completed records remain durable for recovery and audit, but only active
 //! records participate in admission decisions.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,72 @@ const SCHEMA_VERSION: u32 = 1;
 const PROVIDER_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const INSPECTION_OUTPUT_LIMIT: usize = 1024 * 1024;
 const LAST_ERROR_LIMIT: usize = 8192;
+const CONTAINMENT_EVIDENCE_LIMIT: usize = 64 * 1024;
+
+const CONTAINMENT_INSPECTION_SCRIPT: &str = r#"
+import base64
+import json
+import os
+import pathlib
+import sys
+
+root_pid = int(sys.argv[1])
+target = json.loads(sys.argv[2])
+
+def unescape_mount(value):
+    for encoded, decoded in (
+        ("\\040", " "),
+        ("\\011", "\t"),
+        ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        value = value.replace(encoded, decoded)
+    return value
+
+pending = [root_pid]
+seen = set()
+while pending and len(seen) < 256:
+    pid = pending.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    try:
+        children = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        pending.extend(int(child) for child in children)
+        environ = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        encoded = next(
+            (
+                item.split(b"=", 1)[1]
+                for item in environ
+                if item.startswith(b"T_HUB_WORKTREE_CONTAINMENT=")
+            ),
+            None,
+        )
+        if encoded is None or len(encoded) > 65536:
+            continue
+        padding = b"=" * (-len(encoded) % 4)
+        evidence = json.loads(base64.urlsafe_b64decode(encoded + padding))
+        if target not in evidence:
+            continue
+        contained = False
+        for line in pathlib.Path(f"/proc/{pid}/mountinfo").read_text().splitlines():
+            fields = line.split()
+            separator = fields.index("-")
+            if (
+                unescape_mount(fields[4]) == target["path"]
+                and fields[separator + 1] == "tmpfs"
+            ):
+                contained = True
+                break
+        if not contained:
+            continue
+        visible = os.stat(f"/proc/{pid}/root{target['path']}")
+        if visible.st_dev != target["device"] or visible.st_ino != target["inode"]:
+            sys.exit(0)
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+raise RuntimeError("managed process tree lacks exact target containment")
+"#;
 
 const INSPECTION_SCRIPT: &str = r#"
 import json
@@ -311,16 +378,56 @@ pub struct WorktreeCoordinator {
     inner: Mutex<WorktreeRetirementSnapshot>,
     admissions: Mutex<BTreeMap<String, usize>>,
     workers: Mutex<BTreeSet<String>>,
+    coordination: Mutex<()>,
 }
 
 pub struct WorktreeAdmissionGuard {
     coordinator: Arc<WorktreeCoordinator>,
     path: String,
+    blockers: Vec<CapturedWorktreeIdentity>,
 }
 
 impl WorktreeAdmissionGuard {
     pub fn canonical_path(&self) -> &str {
         &self.path
+    }
+
+    pub fn contain_process(
+        &self,
+        command: Option<&str>,
+        mut env: Vec<(String, String)>,
+    ) -> Result<(Option<String>, Vec<(String, String)>), String> {
+        if self.blockers.is_empty() {
+            return Ok((command.map(str::to_string), env));
+        }
+        require_namespace_containment()?;
+        let evidence = serde_json::to_vec(&self.blockers)
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|error| format!("worktree containment evidence failed: {error}"))?;
+        if evidence.len() > CONTAINMENT_EVIDENCE_LIMIT {
+            return Err("worktree containment evidence exceeds the safe bound".into());
+        }
+        env.push(("T_HUB_WORKTREE_CONTAINMENT".into(), evidence.clone()));
+        let mut wrapper = vec![
+            "exec /usr/bin/bwrap".to_string(),
+            "--die-with-parent".into(),
+            "--bind / /".into(),
+        ];
+        for blocker in &self.blockers {
+            wrapper.push(format!("--tmpfs {}", shell_quote(&blocker.path)));
+        }
+        wrapper.push(format!(
+            "--setenv T_HUB_WORKTREE_CONTAINMENT {}",
+            shell_quote(&evidence)
+        ));
+        wrapper.push("--".into());
+        match command {
+            Some(command) => {
+                wrapper.push(format!("${{SHELL:-/bin/sh}} -lc {}", shell_quote(command)))
+            }
+            None => wrapper.push("${SHELL:-/bin/sh} -l".into()),
+        }
+        Ok((Some(wrapper.join(" ")), env))
     }
 }
 
@@ -367,6 +474,7 @@ impl WorktreeCoordinator {
             inner: Mutex::new(snapshot),
             admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
+            coordination: Mutex::new(()),
         })
     }
 
@@ -380,6 +488,7 @@ impl WorktreeCoordinator {
             inner: Mutex::new(WorktreeRetirementSnapshot::default()),
             admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
+            coordination: Mutex::new(()),
         }
     }
 
@@ -430,6 +539,10 @@ impl WorktreeCoordinator {
             ));
         }
 
+        let _coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let admissions = self
             .admissions
             .lock()
@@ -648,14 +761,29 @@ impl WorktreeCoordinator {
 
     pub fn recover_pending(self: &Arc<Self>) {
         for record in self.pending_retirements() {
-            if record.state == RetirementState::RecoveryRequired {
-                continue;
-            }
-            if let Err(error) = self.start_provider_worker(record.clone()) {
-                eprintln!(
-                    "t-hub-cargo-cleanup: could not recover operation '{}': {error}",
-                    record.operation_id
-                );
+            match record.state {
+                RetirementState::Reserved => {
+                    if let Err(error) = self.start_provider_worker(record.clone()) {
+                        eprintln!(
+                            "t-hub-cargo-cleanup: could not recover operation '{}': {error}",
+                            record.operation_id
+                        );
+                    }
+                }
+                RetirementState::Running => {
+                    if let Err(error) = self.transition(
+                        &record.operation_id,
+                        RetirementState::RecoveryRequired,
+                        Some("Cargo cleanup was interrupted during its provider commit".into()),
+                    ) {
+                        eprintln!(
+                            "t-hub-cargo-cleanup: could not preserve interrupted operation '{}': {error}",
+                            record.operation_id
+                        );
+                    }
+                }
+                RetirementState::RecoveryRequired => {}
+                RetirementState::Succeeded | RetirementState::Failed => unreachable!(),
             }
         }
     }
@@ -675,7 +803,7 @@ impl WorktreeCoordinator {
                     "could not persist the running provider state: {error}"
                 ));
             }
-            match run_provider(&record.request_path, &record.worktree_path) {
+            match self.run_provider(&record, &request) {
                 Ok(output) => classify_provider_output(&output, &request.targets),
                 Err(error) => ProviderCompletion::RecoveryRequired(error),
             }
@@ -733,6 +861,10 @@ impl WorktreeCoordinator {
             .map_err(|error| {
                 format!("{operation}: could not resolve worktree activity: {error}")
             })?;
+        let _coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut admissions = self
             .admissions
             .lock()
@@ -744,11 +876,48 @@ impl WorktreeCoordinator {
                 record.worktree_path, record.operation_id
             ));
         }
+        let blockers = snapshot
+            .retirements
+            .values()
+            .filter(|record| record.state.is_active())
+            .map(read_provider_request)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|request| request.worktree)
+            .collect();
         *admissions.entry(candidate_path.clone()).or_default() += 1;
         Ok(WorktreeAdmissionGuard {
             coordinator: Arc::clone(self),
             path: candidate_path,
+            blockers,
         })
+    }
+
+    fn run_provider(
+        &self,
+        record: &WorktreeRetirement,
+        request: &RetirementCleanupRequest,
+    ) -> Result<std::process::Output, String> {
+        let _coordination = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let panes = crate::tmux::pane_info()
+            .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
+        verify_process_containment(&panes, &request.worktree)?;
+        if self
+            .admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .any(|candidate| path_within(candidate, &record.worktree_path))
+        {
+            return Err(
+                "Cargo cleanup commit refused because worktree activity is admitted".into(),
+            );
+        }
+        drop(_coordination);
+        run_provider(&record.request_path)
     }
 }
 
@@ -987,6 +1156,88 @@ fn inspection_command(worktree_path: &str) -> Command {
     command
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn require_namespace_containment() -> Result<(), String> {
+    let mut command = containment_command();
+    command.args([
+        "/usr/bin/bwrap",
+        "--die-with-parent",
+        "--bind",
+        "/",
+        "/",
+        "--",
+        "/bin/true",
+    ]);
+    let output =
+        crate::bounded_exec::output_with_timeout_and_limit(command, Duration::from_secs(5), 4096)
+            .map_err(|error| format!("worktree namespace containment is unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "worktree namespace containment is unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_process_containment(
+    panes: &[crate::tmux::PaneInfo],
+    target: &CapturedWorktreeIdentity,
+) -> Result<(), String> {
+    let target_json = serde_json::to_string(target)
+        .map_err(|error| format!("worktree containment identity failed: {error}"))?;
+    for pane in panes {
+        if path_within(&pane.cwd, &target.path) {
+            return Err(format!(
+                "Cargo cleanup refuses live session '{}' in the target worktree",
+                pane.session
+            ));
+        }
+        let mut command = containment_command();
+        command.args([
+            "/usr/bin/python3",
+            "-c",
+            CONTAINMENT_INSPECTION_SCRIPT,
+            &pane.pid.to_string(),
+            &target_json,
+        ]);
+        let output = crate::bounded_exec::output_with_timeout_and_limit(
+            command,
+            Duration::from_secs(5),
+            CONTAINMENT_EVIDENCE_LIMIT,
+        )
+        .map_err(|error| {
+            format!(
+                "Cargo cleanup could not verify session '{}' containment: {error}",
+                pane.session
+            )
+        })?;
+        if !output.status.success() {
+            return Err(format!(
+                "Cargo cleanup refuses uncontained session '{}': {}",
+                pane.session,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn containment_command() -> Command {
+    Command::new("/usr/bin/env")
+}
+
+#[cfg(windows)]
+fn containment_command() -> Command {
+    let mut command = Command::new("wsl.exe");
+    command.args(["-d", &crate::files::host_distro(), "--cd", "~", "-e"]);
+    command
+}
+
 fn configured_provider_command() -> Result<Vec<String>, String> {
     let configured = std::env::var("T_HUB_RUST_STORAGE_COMMAND")
         .map_err(|_| "T_HUB_RUST_STORAGE_COMMAND is not configured".to_string())?;
@@ -1007,7 +1258,7 @@ fn provider_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn run_provider(request_path: &str, worktree_path: &str) -> Result<std::process::Output, String> {
+fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
     let configured = configured_provider_command()?;
     let mut command = Command::new(&configured[0]);
     command.args(&configured[1..]);
@@ -1020,93 +1271,12 @@ fn run_provider(request_path: &str, worktree_path: &str) -> Result<std::process:
         "--confirm",
         "--json",
     ]);
-    let inspect_leases = || {
-        crate::tmux::pane_info()
-            .map_err(|error| format!("Cargo cleanup lease inspection failed: {error}"))
-            .map(|panes| {
-                panes
-                    .into_iter()
-                    .any(|pane| path_within(&pane.cwd, worktree_path))
-            })
-    };
-    run_provider_with_lease_inspector(command, provider_timeout(), inspect_leases)
-}
-
-fn run_provider_with_lease_inspector(
-    mut command: Command,
-    timeout: Duration,
-    mut inspect_leases: impl FnMut() -> Result<bool, String>,
-) -> Result<std::process::Output, String> {
-    if inspect_leases()? {
-        return Err("Cargo cleanup refused because a live worktree session is present".into());
-    }
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("rust-storage retirement-clean could not start: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("rust-storage retirement-clean stdout was unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("rust-storage retirement-clean stderr was unavailable")?;
-    let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        let leased = match inspect_leases() {
-            Ok(leased) => leased,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        if leased {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Cargo cleanup stopped because a live worktree session appeared".into());
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("rust-storage retirement-clean wait failed: {error}"))?
-        {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("rust-storage retirement-clean timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "rust-storage retirement-clean stdout reader failed")??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "rust-storage retirement-clean stderr reader failed")??;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    reader
-        .by_ref()
-        .take((PROVIDER_OUTPUT_LIMIT + 1) as u64)
-        .read_to_end(&mut output)
-        .map_err(|error| format!("rust-storage retirement-clean output read failed: {error}"))?;
-    if output.len() > PROVIDER_OUTPUT_LIMIT {
-        return Err("rust-storage retirement-clean output exceeded the limit".into());
-    }
-    Ok(output)
+    crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        provider_timeout(),
+        PROVIDER_OUTPUT_LIMIT,
+    )
+    .map_err(|error| format!("rust-storage retirement-clean could not complete: {error}"))
 }
 
 #[cfg(not(windows))]
@@ -1609,38 +1779,204 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restart_preserves_interrupted_commit_for_explicit_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("retirements.json");
+        let operation_id = {
+            let coordinator = WorktreeCoordinator::load(store.clone()).unwrap();
+            let record = coordinator
+                .begin_retirement("/repo/worktree", "/requests/one.json")
+                .unwrap();
+            coordinator
+                .transition(&record.operation_id, RetirementState::Running, None)
+                .unwrap();
+            record.operation_id
+        };
+
+        let restarted = Arc::new(WorktreeCoordinator::load(store).unwrap());
+        restarted.recover_pending();
+
+        let recovered = restarted
+            .recovery_record(&operation_id, "/repo/worktree")
+            .unwrap();
+        assert_eq!(recovered.state, RetirementState::RecoveryRequired);
+        assert!(recovered
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("interrupted")));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn late_lease_stops_provider_before_its_filesystem_mutation() {
+    fn namespace_blocker_hides_real_target_from_shell_and_direct_chdir_aliases() {
         let directory = tempfile::tempdir().unwrap();
-        let ready = directory.path().join("provider-ready");
-        let mutation = directory.path().join("provider-mutated");
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            &format!(
-                "touch '{}'; sleep 30; touch '{}'",
-                ready.display(),
-                mutation.display()
-            ),
-        ]);
-        let inspections = std::sync::atomic::AtomicUsize::new(0);
-        let result = run_provider_with_lease_inspector(command, Duration::from_secs(5), || {
-            let attempt = inspections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if attempt == 0 {
-                return Ok(false);
-            }
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while !ready.exists() && std::time::Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            Ok(ready.exists())
-        });
+        let worktree = directory.path().join("worktree");
+        let alias = directory.path().join("worktree-alias");
+        let unrelated = directory.path().join("unrelated");
+        let request_path = directory.path().join("request.json");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+        let stat = std::fs::metadata(&worktree).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let record = coordinator
+            .begin_retirement(worktree.to_str().unwrap(), request_path.to_str().unwrap())
+            .unwrap();
+        coordinator
+            .write_provider_request(
+                &record,
+                RetirementCleanupCapture {
+                    worktree: CapturedWorktreeIdentity {
+                        path: worktree.to_str().unwrap().into(),
+                        device: stat.dev(),
+                        inode: stat.ino(),
+                        head: "1234567890123456789012345678901234567890".into(),
+                        branch: "feature".into(),
+                    },
+                    targets: vec![CapturedPathIdentity {
+                        path: worktree.join("target").to_str().unwrap().into(),
+                        device: stat.dev(),
+                        inode: stat.ino() + 1,
+                    }],
+                    dirty: false,
+                    merged: true,
+                    is_linked: true,
+                },
+            )
+            .unwrap();
+        let admission = coordinator
+            .admit_activity(unrelated.to_str().unwrap(), "spawn_terminal")
+            .unwrap();
+        let direct = format!(
+            "import os; os.chdir({:?}); s=os.stat('.'); assert (s.st_dev,s.st_ino)!=({},{})",
+            alias.to_str().unwrap(),
+            stat.dev(),
+            stat.ino()
+        );
+        let command = format!(
+            "cd {} && test \"$(stat -c %d:%i .)\" != {}:{} && python3 -c {}",
+            shell_quote(alias.to_str().unwrap()),
+            stat.dev(),
+            stat.ino(),
+            shell_quote(&direct),
+        );
+        let (contained, _) = admission
+            .contain_process(Some(&command), Vec::new())
+            .unwrap();
 
-        assert!(result
+        let status = Command::new("/bin/sh")
+            .args(["-c", contained.as_deref().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let session = format!(
+            "th_test_containment_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let (contained, env) = admission
+            .contain_process(Some("sleep 30"), Vec::new())
+            .unwrap();
+        crate::tmux::new_session_with_env(
+            &session,
+            unrelated.to_str().unwrap(),
+            contained.as_deref(),
+            &env,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pane = loop {
+            if let Some(pane) = crate::tmux::pane_info()
+                .unwrap()
+                .into_iter()
+                .find(|pane| pane.session == session)
+            {
+                break pane;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        verify_process_containment(
+            &[pane],
+            admission.blockers.first().expect("one exact blocker"),
+        )
+        .unwrap();
+        crate::tmux::kill_session_tree(&session).unwrap();
+    }
+
+    #[test]
+    fn uncontained_managed_process_blocks_cleanup() {
+        let target = CapturedWorktreeIdentity {
+            path: "/repo/worktree".into(),
+            device: 7,
+            inode: 11,
+            head: "1234567890123456789012345678901234567890".into(),
+            branch: "feature".into(),
+        };
+        let pane = crate::tmux::PaneInfo {
+            session: "th_uncontained".into(),
+            command: "sh".into(),
+            cwd: "/tmp".into(),
+            pid: std::process::id(),
+        };
+        assert!(verify_process_containment(&[pane], &target)
             .unwrap_err()
-            .contains("live worktree session appeared"));
-        assert!(!mutation.exists());
+            .contains("uncontained"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiple_targets_coordinate_without_holding_the_global_boundary() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        for name in ["first", "second"] {
+            let worktree = directory.path().join(name);
+            let request = directory.path().join(format!("{name}.json"));
+            std::fs::create_dir(&worktree).unwrap();
+            let stat = std::fs::metadata(&worktree).unwrap();
+            let record = coordinator
+                .begin_retirement(worktree.to_str().unwrap(), request.to_str().unwrap())
+                .unwrap();
+            coordinator
+                .write_provider_request(
+                    &record,
+                    RetirementCleanupCapture {
+                        worktree: CapturedWorktreeIdentity {
+                            path: worktree.to_str().unwrap().into(),
+                            device: stat.dev(),
+                            inode: stat.ino(),
+                            head: "1234567890123456789012345678901234567890".into(),
+                            branch: "feature".into(),
+                        },
+                        targets: vec![CapturedPathIdentity {
+                            path: worktree.join("target").to_str().unwrap().into(),
+                            device: stat.dev(),
+                            inode: stat.ino() + 1,
+                        }],
+                        dirty: false,
+                        merged: true,
+                        is_linked: true,
+                    },
+                )
+                .unwrap();
+        }
+        let unrelated = directory.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let admission = coordinator
+            .admit_activity(unrelated.to_str().unwrap(), "spawn_terminal")
+            .unwrap();
+
+        assert_eq!(admission.blockers.len(), 2);
+        assert!(coordinator.coordination.try_lock().is_ok());
+        assert!(coordinator
+            .admit_activity(
+                directory.path().join("first").to_str().unwrap(),
+                "spawn_terminal",
+            )
+            .is_err());
     }
 
     #[test]

@@ -1235,7 +1235,7 @@ pub(super) fn spawn_terminal_with_private_pane_command_and_id(
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let tmux_cwd = files::posix_form(&cwd_effective);
-    let _worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "spawn_terminal")?;
+    let worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "spawn_terminal")?;
     let public_pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
     let pane = private_pane_command.map(str::to_owned).or(public_pane);
     // Spawned terminals receive stable discovery plus a durable Crew identity.
@@ -1263,6 +1263,7 @@ pub(super) fn spawn_terminal_with_private_pane_command_and_id(
             pending_provider_marker(&provider_harness),
         ));
     }
+    let (pane, elevation) = worktree_admission.contain_process(pane.as_deref(), elevation)?;
     let spawn_result = match requested_session_id {
         Some(requested) => {
             spawn_tmux_terminal_with_id(requested, &tmux_cwd, pane.as_deref(), &elevation)

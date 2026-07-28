@@ -691,7 +691,9 @@ pub(super) fn commission_captain(
         return Err(error);
     }
     let tmux_cwd = files::posix_form(&project.repo_root);
+    let worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "commission_captain")?;
     let pane = crate::commands::pane_command(None, Some(&startup_command));
+    let (pane, elevation) = worktree_admission.contain_process(pane.as_deref(), elevation)?;
     let (_, tmux_session) = match spawn_tmux_terminal_with_id(
         &terminal_id,
         &tmux_cwd,

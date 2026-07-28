@@ -2761,6 +2761,7 @@ pub struct PaneInfo {
     pub session: String,
     pub command: String,
     pub cwd: String,
+    pub pid: u32,
 }
 
 /// One exact Codex rollout currently held open by a process under a T-Hub pane.
@@ -2906,7 +2907,7 @@ fgpid=$(ps -o tpgid= -p \"$pid\" 2>/dev/null | tr -d ' '); \
 case \"$fgpid\" in ''|*[!0-9]*|0) fgpid=\"$pid\";; esac; \
 line=$(tr '\\0' ' ' < /proc/$fgpid/cmdline 2>/dev/null); \
 case \"$line\" in *codex*) eff=codex;; *claude*) eff=claude;; esac;; esac; \
-printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
+printf '%s|%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\" \"$pid\"; done";
     let output = output_with_timeout(
         pane_info_command_with_args(script, &[socket]),
         tmux_cmd_timeout(),
@@ -2936,15 +2937,23 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(3, '|');
+        let mut parts = line.splitn(4, '|');
         let session = parts.next().unwrap_or("").trim().to_string();
         let command = parts.next().unwrap_or("").trim().to_string();
         let cwd = parts.next().unwrap_or("").trim().to_string();
+        let pid = parts.next().unwrap_or("").trim();
         if !session.is_empty() {
+            let pid = pid.parse::<u32>().map_err(|_| TmuxError {
+                op: "list-panes",
+                code: None,
+                io_kind: None,
+                message: "tmux returned a pane without an exact process identity".into(),
+            })?;
             out.push(PaneInfo {
                 session,
                 command,
                 cwd,
+                pid,
             });
         }
     }
