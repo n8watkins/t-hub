@@ -119,6 +119,15 @@ try:
     if authorization != b"start\n":
         raise RuntimeError("provider authorization was not received")
 
+    lifeline_pid = os.fork()
+    if lifeline_pid == 0:
+        lifeline_selector = selectors.DefaultSelector()
+        lifeline_selector.register(sys.stdin.buffer, selectors.EVENT_READ, "parent")
+        while True:
+            for _ in lifeline_selector.select():
+                os.read(sys.stdin.fileno(), 1)
+                terminate_owned_cgroup_on_parent_loss()
+
     child = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
@@ -127,7 +136,6 @@ try:
         start_new_session=True,
     )
     selector = selectors.DefaultSelector()
-    selector.register(sys.stdin.buffer, selectors.EVENT_READ, "parent")
     selector.register(child.stdout, selectors.EVENT_READ, "stdout")
     selector.register(child.stderr, selectors.EVENT_READ, "stderr")
     output = {"stdout": bytearray(), "stderr": bytearray()}
@@ -139,11 +147,6 @@ try:
             failure = "provider generation exceeded its timeout"
             break
         for key, _ in selector.select(min(remaining, 0.1)):
-            if key.data == "parent":
-                if os.read(sys.stdin.fileno(), 1) == b"":
-                    terminate_owned_cgroup_on_parent_loss()
-                failure = "provider supervisor received unexpected parent input"
-                break
             chunk = os.read(key.fileobj.fileno(), 8192)
             if chunk:
                 output[key.data].extend(chunk)
@@ -215,6 +218,18 @@ try:
             break
         if waited == 0:
             break
+
+    remaining = set()
+    cgroup_directories = 0
+    for current, directories, _ in os.walk("/sys/fs/cgroup" + path):
+        cgroup_directories += 1
+        if cgroup_directories > 256:
+            raise RuntimeError("provider cgroup tree exceeds the safe bound")
+        directories.sort()
+        values = pathlib.Path(current, "cgroup.procs").read_text().split()
+        remaining.update(int(value) for value in values)
+    if remaining != {os.getpid(), lifeline_pid}:
+        terminate_owned_cgroup_on_parent_loss()
 
     result = {
         "kind": "completed" if failure is None else "terminated",
@@ -5080,10 +5095,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let escaped_pid_path = directory.path().join("escaped.pid");
         let script = format!(
-            "import pathlib,subprocess,time; \
+            "import os,pathlib,subprocess; \
              child=subprocess.Popen(['/usr/bin/setsid','/bin/sleep','30']); \
-             pathlib.Path({:?}).write_text(str(child.pid)); \
-             time.sleep(30)",
+             pathlib.Path({:?}).write_text(f'{{os.getpid()}},{{child.pid}}')",
             escaped_pid_path.to_str().unwrap()
         );
         let mut provider = PreparedProviderProcess::spawn_command_with_timeout(
@@ -5103,8 +5117,13 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        let escaped_pid = std::fs::read_to_string(&escaped_pid_path).unwrap();
-        let escaped_pid = escaped_pid.trim();
+        let identities = std::fs::read_to_string(&escaped_pid_path).unwrap();
+        let (leader_pid, escaped_pid) = identities.trim().split_once(',').unwrap();
+        while Path::new(&format!("/proc/{leader_pid}")).exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Path::new(&format!("/proc/{escaped_pid}")).exists());
         provider.stdin.take();
         provider.finish_transport();
         managed_provider_stopped(&provider.identity).unwrap();
