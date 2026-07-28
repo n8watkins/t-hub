@@ -1204,52 +1204,54 @@ pub(super) fn cleanup_worktree_artifacts(
             }),
         },
     )?;
-    revalidate_admin_execution_target(ctx, &audit, &target)?;
-
-    let request_path = ctx.worktrees.next_request_path();
-    let request_path = request_path.to_string_lossy().into_owned();
-    let target_count = capture.targets.len();
-    let record = ctx
-        .worktrees
-        .begin_retirement_if_idle(&path, &request_path, |canonical_path| {
-            tmux::pane_info()
-                .map_err(|error| {
-                    format!("cleanup_worktree_artifacts lease inspection failed: {error}")
-                })
-                .map(|panes| {
-                    panes
-                        .into_iter()
-                        .filter(|pane| {
-                            crate::worktree_coordinator::path_within(&pane.cwd, canonical_path)
-                        })
-                        .map(|pane| pane.session)
-                        .collect()
-                })
-        })
-        .map_err(|error| error.to_string())?;
     let result: Result<Value, String> = (|| {
-        ctx.worktrees
-            .write_provider_request(&record, capture)
+        revalidate_admin_execution_target(ctx, &audit, &target)?;
+        let request_path = ctx.worktrees.next_request_path();
+        let request_path = request_path.to_string_lossy().into_owned();
+        let target_count = capture.targets.len();
+        let record = ctx
+            .worktrees
+            .begin_retirement_if_idle(&path, &request_path, |canonical_path| {
+                tmux::pane_info()
+                    .map_err(|error| {
+                        format!("cleanup_worktree_artifacts lease inspection failed: {error}")
+                    })
+                    .map(|panes| {
+                        panes
+                            .into_iter()
+                            .filter(|pane| {
+                                crate::worktree_coordinator::path_within(&pane.cwd, canonical_path)
+                            })
+                            .map(|pane| pane.session)
+                            .collect()
+                    })
+            })
             .map_err(|error| error.to_string())?;
-        ctx.worktrees.start_provider_worker(record.clone())?;
-        Ok(json!({
-            "accepted": "cleanup_worktree_artifacts",
-            "operation": "cleanupWorktree",
-            "target": target.authorization_target,
-            "retirementReservation": crate::worktree_coordinator::RetirementReservation::from(&record),
-            "targetCount": target_count,
-            "delegatedAdmin": audit,
-            "audited": true,
-            "sourceRemovalPerformed": false,
-        }))
+        let execution: Result<Value, String> = (|| {
+            ctx.worktrees
+                .write_provider_request(&record, capture)
+                .map_err(|error| error.to_string())?;
+            ctx.worktrees.start_provider_worker(record.clone())?;
+            Ok(json!({
+                "accepted": "cleanup_worktree_artifacts",
+                "operation": "cleanupWorktree",
+                "target": target.authorization_target,
+                "retirementReservation": crate::worktree_coordinator::RetirementReservation::from(&record),
+                "targetCount": target_count,
+                "delegatedAdmin": audit,
+                "audited": true,
+                "sourceRemovalPerformed": false,
+            }))
+        })();
+        if let Err(error) = &execution {
+            let _ = ctx.worktrees.transition(
+                &record.operation_id,
+                crate::worktree_coordinator::RetirementState::RecoveryRequired,
+                Some(error.clone()),
+            );
+        }
+        execution
     })();
-    if let Err(error) = &result {
-        let _ = ctx.worktrees.transition(
-            &record.operation_id,
-            crate::worktree_coordinator::RetirementState::RecoveryRequired,
-            Some(error.clone()),
-        );
-    }
     record_delegated_admin_execution_outcome(ctx, &audit, &result);
     result
 }
@@ -1365,41 +1367,43 @@ pub(super) fn recover_worktree_artifacts(
         },
     )?;
 
-    let current_target = resolve_admin_worktree_target(ctx, &path)?;
-    let current_authorization_target = match current_target.authorization_target {
-        crate::delegated_admin::AdminTarget::Worktree {
-            ship_slug,
-            worktree_id,
-        } => crate::delegated_admin::AdminTarget::WorktreeRetirement {
-            ship_slug,
-            worktree_id,
-            operation_id: operation_id.to_string(),
-        },
-        _ => return Err("recover_worktree_artifacts target identity is invalid".into()),
-    };
-    if current_authorization_target != authorization_target {
-        return Err(
-            "delegated admin: exact target ownership changed before cleanup recovery".into(),
-        );
-    }
-    let current_record = ctx
-        .worktrees
-        .recovery_record(&operation_id, &path)
-        .map_err(|error| error.to_string())?;
-    if current_record != record {
-        return Err("cleanup recovery reservation changed before worker ownership".into());
-    }
-    let resumed = ctx.worktrees.resume_recovery_worker(record.clone())?;
-    let result = Ok(json!({
-        "accepted": "recover_worktree_artifacts",
-        "operation": "cleanupWorktree",
-        "target": authorization_target,
-        "retirementReservation": crate::worktree_coordinator::RetirementReservation::from(&record),
-        "resumed": resumed,
-        "delegatedAdmin": audit,
-        "audited": true,
-        "sourceRemovalPerformed": false,
-    }));
+    let result: Result<Value, String> = (|| {
+        let current_target = resolve_admin_worktree_target(ctx, &path)?;
+        let current_authorization_target = match current_target.authorization_target {
+            crate::delegated_admin::AdminTarget::Worktree {
+                ship_slug,
+                worktree_id,
+            } => crate::delegated_admin::AdminTarget::WorktreeRetirement {
+                ship_slug,
+                worktree_id,
+                operation_id: operation_id.to_string(),
+            },
+            _ => return Err("recover_worktree_artifacts target identity is invalid".into()),
+        };
+        if current_authorization_target != authorization_target {
+            return Err(
+                "delegated admin: exact target ownership changed before cleanup recovery".into(),
+            );
+        }
+        let current_record = ctx
+            .worktrees
+            .recovery_record(&operation_id, &path)
+            .map_err(|error| error.to_string())?;
+        if current_record != record {
+            return Err("cleanup recovery reservation changed before worker ownership".into());
+        }
+        let resumed = ctx.worktrees.resume_recovery_worker(record.clone())?;
+        Ok(json!({
+            "accepted": "recover_worktree_artifacts",
+            "operation": "cleanupWorktree",
+            "target": authorization_target,
+            "retirementReservation": crate::worktree_coordinator::RetirementReservation::from(&record),
+            "resumed": resumed,
+            "delegatedAdmin": audit,
+            "audited": true,
+            "sourceRemovalPerformed": false,
+        }))
+    })();
     record_delegated_admin_execution_outcome(ctx, &audit, &result);
     result
 }
