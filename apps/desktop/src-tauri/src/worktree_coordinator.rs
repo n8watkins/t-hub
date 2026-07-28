@@ -2764,6 +2764,7 @@ trait WatchdogBackend {
     fn take_authorization(&mut self) -> Result<WatchdogAuthorizationEvidence, String>;
 }
 
+#[cfg(test)]
 fn execute_watchdog_lifecycle(
     backend: &mut impl WatchdogBackend,
 ) -> Result<WatchdogAuthorizationEvidence, String> {
