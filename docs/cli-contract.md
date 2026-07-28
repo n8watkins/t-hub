@@ -150,6 +150,7 @@ T-Hub does not currently define a project-level CLI configuration layer, so one 
 Endpoint discovery must remain compatible with the documented control environment variables and user handshake file while later reliability work adds stale-endpoint rediscovery.
 `th admin cleanup-worktree` requires the desktop backend to have an explicit `T_HUB_RUST_STORAGE_COMMAND`.
 The configured command is parsed into direct process arguments and receives `retirement-clean --request PATH --apply --confirm --json`.
+T-Hub captures the exact native and provider-namespace request identity and content, revalidates them immediately before process creation, and requires the provider to open only the exact request path supplied in that invocation.
 `T_HUB_RUST_STORAGE_TIMEOUT_SECS` may set a bounded provider timeout from 60 through 21600 seconds and defaults to 7200 seconds.
 
 ## Active Supervisory Workflow Commands

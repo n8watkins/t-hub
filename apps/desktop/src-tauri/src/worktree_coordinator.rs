@@ -8,6 +8,7 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1817,27 +1818,35 @@ impl WorktreeCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let panes = crate::tmux::pane_info()
             .map_err(|error| format!("Cargo cleanup containment inspection failed: {error}"))?;
-        let request_path = provider_request_path(&record.request_path)?;
-        verify_process_containment(
-            &panes,
-            &request.worktree,
-            &record.operation_id,
-            &request_path,
-        )?;
-        if self
-            .boundary_snapshot()
-            .iter()
-            .any(|(candidate, boundary)| {
-                path_within(candidate, &record.worktree_path)
-                    && boundary.admissions.load(Ordering::SeqCst) > 0
-            })
-        {
-            return Err(
-                "Cargo cleanup commit refused because worktree activity is admitted".into(),
-            );
-        }
-        drop(_boundary);
-        run_provider(&request_path)
+        let request_capture = capture_provider_request(&record.request_path)?;
+        invoke_provider_after_containment(
+            &request_capture,
+            || {
+                verify_process_containment(
+                    &panes,
+                    &request.worktree,
+                    &record.operation_id,
+                    &request_capture.provider_path,
+                )?;
+                if self
+                    .boundary_snapshot()
+                    .iter()
+                    .any(|(candidate, boundary)| {
+                        path_within(candidate, &record.worktree_path)
+                            && boundary.admissions.load(Ordering::SeqCst) > 0
+                    })
+                {
+                    return Err(
+                        "Cargo cleanup commit refused because worktree activity is admitted".into(),
+                    );
+                }
+                Ok(())
+            },
+            |request_path| {
+                drop(_boundary);
+                run_provider_command(request_path)
+            },
+        )
     }
 }
 
@@ -2447,7 +2456,24 @@ fn provider_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
+fn invoke_provider_after_containment<T>(
+    request: &CapturedProviderRequest,
+    containment: impl FnOnce() -> Result<(), String>,
+    invoke: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    containment()?;
+    invoke_provider_after_revalidation(request, invoke)
+}
+
+fn invoke_provider_after_revalidation<T>(
+    request: &CapturedProviderRequest,
+    invoke: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    request.revalidate()?;
+    invoke(&request.provider_path)
+}
+
+fn run_provider_command(request_path: &str) -> Result<std::process::Output, String> {
     let configured = configured_provider_command()?;
     let mut command = Command::new(&configured[0]);
     command.args(&configured[1..]);
@@ -2465,6 +2491,263 @@ fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
         PROVIDER_OUTPUT_LIMIT,
     )
     .map_err(|error| format!("rust-storage retirement-clean could not complete: {error}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderRequestIdentity {
+    device: Option<u64>,
+    inode: Option<u64>,
+    links: Option<u64>,
+    volume: Option<u64>,
+    file: Option<u64>,
+    length: u64,
+    modified_nanos: u128,
+    digest: [u8; 32],
+    provider_namespace: ProviderNamespaceIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderNamespaceIdentity {
+    device: u64,
+    inode: u64,
+    links: u64,
+    length: u64,
+    modified_nanos: u128,
+    digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedProviderRequest {
+    native_path: String,
+    provider_path: String,
+    identity: ProviderRequestIdentity,
+}
+
+impl CapturedProviderRequest {
+    fn revalidate(&self) -> Result<(), String> {
+        let current = capture_provider_request(&self.native_path)?;
+        if current.provider_path != self.provider_path || current.identity != self.identity {
+            return Err("provider request identity changed before invocation".into());
+        }
+        Ok(())
+    }
+}
+
+fn capture_provider_request(request_path: &str) -> Result<CapturedProviderRequest, String> {
+    let provider_path = provider_request_path(request_path)?;
+    let identity = capture_provider_request_identity(request_path, &provider_path)?;
+    Ok(CapturedProviderRequest {
+        native_path: request_path.to_string(),
+        provider_path,
+        identity,
+    })
+}
+
+fn capture_provider_request_identity(
+    request_path: &str,
+    provider_path: &str,
+) -> Result<ProviderRequestIdentity, String> {
+    let symlink = std::fs::symlink_metadata(request_path)
+        .map_err(|error| format!("could not inspect provider request path: {error}"))?;
+    if symlink.file_type().is_symlink() || !symlink.file_type().is_file() {
+        return Err("provider request path is not an exact regular file".into());
+    }
+    let mut file = open_provider_request(request_path)?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("could not inspect provider request file: {error}"))?;
+    if before.len() > INSPECTION_OUTPUT_LIMIT as u64 {
+        return Err("provider request exceeds the safe identity bound".into());
+    }
+    let mut contents = Vec::with_capacity(before.len() as usize);
+    file.read_to_end(&mut contents)
+        .map_err(|error| format!("could not hash provider request file: {error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("could not recheck provider request file: {error}"))?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err("provider request changed while capturing identity".into());
+    }
+    let modified_nanos = after
+        .modified()
+        .map_err(|error| format!("provider request modification time is unavailable: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "provider request modification time is invalid".to_string())?
+        .as_nanos();
+    let digest: [u8; 32] = Sha256::digest(&contents).into();
+    let initial_file_identity = provider_file_identity(&symlink)?;
+    let (device, inode, links, volume, file) = provider_file_identity(&after)?;
+    if initial_file_identity != (device, inode, links, volume, file) {
+        return Err("provider request changed while opening exact identity".into());
+    }
+    let provider_namespace = capture_provider_namespace_identity(provider_path)?;
+    Ok(ProviderRequestIdentity {
+        device,
+        inode,
+        links,
+        volume,
+        file,
+        length: after.len(),
+        modified_nanos,
+        digest,
+        provider_namespace,
+    })
+}
+
+#[cfg(unix)]
+fn open_provider_request(request_path: &str) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    options
+        .open(request_path)
+        .map_err(|error| format!("could not open exact provider request path: {error}"))
+}
+
+#[cfg(windows)]
+fn open_provider_request(request_path: &str) -> Result<std::fs::File, String> {
+    std::fs::File::open(request_path)
+        .map_err(|error| format!("could not open provider request path: {error}"))
+}
+
+#[cfg(unix)]
+fn capture_provider_namespace_identity(
+    provider_path: &str,
+) -> Result<ProviderNamespaceIdentity, String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut file = open_provider_request(provider_path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect provider namespace request: {error}"))?;
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut contents)
+        .map_err(|error| format!("could not hash provider namespace request: {error}"))?;
+    Ok(ProviderNamespaceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+        length: metadata.len(),
+        modified_nanos: metadata.mtime() as u128 * 1_000_000_000 + metadata.mtime_nsec() as u128,
+        digest: format!("{:x}", Sha256::digest(contents)),
+    })
+}
+
+#[cfg(windows)]
+fn capture_provider_namespace_identity(
+    provider_path: &str,
+) -> Result<ProviderNamespaceIdentity, String> {
+    const SCRIPT: &str = r#"
+import hashlib
+import json
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink < 1:
+        raise RuntimeError("provider namespace request is not an exact regular file")
+    body = b""
+    while True:
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            break
+        body += chunk
+        if len(body) > 1048576:
+            raise RuntimeError("provider namespace request exceeds the safe identity bound")
+    after = os.fstat(descriptor)
+    if (
+        (before.st_dev, before.st_ino, before.st_nlink, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_nlink, after.st_size, after.st_mtime_ns)
+    ):
+        raise RuntimeError("provider namespace request changed during identity capture")
+    print(json.dumps({
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "links": after.st_nlink,
+        "length": after.st_size,
+        "modifiedNanos": after.st_mtime_ns,
+        "digest": hashlib.sha256(body).hexdigest(),
+    }, separators=(",", ":")))
+finally:
+    os.close(descriptor)
+"#;
+    let mut command = containment_command();
+    command.args(["/usr/bin/python3", "-c", SCRIPT, provider_path]);
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        4096,
+    )
+    .map_err(|error| format!("could not inspect provider namespace request: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "could not inspect provider namespace request: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("provider namespace identity is invalid: {error}"))
+}
+
+#[cfg(unix)]
+fn provider_file_identity(
+    metadata: &std::fs::Metadata,
+) -> Result<
+    (
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+    ),
+    String,
+> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((
+        Some(metadata.dev()),
+        Some(metadata.ino()),
+        Some(metadata.nlink()),
+        None,
+        None,
+    ))
+}
+
+#[cfg(windows)]
+fn provider_file_identity(
+    metadata: &std::fs::Metadata,
+) -> Result<
+    (
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+    ),
+    String,
+> {
+    use std::os::windows::fs::MetadataExt;
+    Ok((
+        None,
+        None,
+        None,
+        Some(
+            metadata
+                .volume_serial_number()
+                .ok_or_else(|| "provider request volume identity is unavailable".to_string())?
+                as u64,
+        ),
+        Some(
+            metadata
+                .file_index()
+                .ok_or_else(|| "provider request file identity is unavailable".to_string())?,
+        ),
+    ))
 }
 
 #[cfg(not(windows))]
@@ -3534,6 +3817,48 @@ mod tests {
         ] {
             assert!(validate_posix_provider_request_path(invalid).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_review_provider_request_rejects_replacement_at_invocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = directory.path().join("request.json");
+        let replacement = directory.path().join("replacement.json");
+        std::fs::write(&request, br#"{"operation":"original"}"#).unwrap();
+        std::fs::write(&replacement, br#"{"operation":"changed!"}"#).unwrap();
+        let capture = capture_provider_request(request.to_str().unwrap()).unwrap();
+        let invocations = std::sync::atomic::AtomicUsize::new(0);
+        let result = invoke_provider_after_containment(
+            &capture,
+            || {
+                std::fs::rename(&replacement, &request).unwrap();
+                Ok(())
+            },
+            |_| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_review_provider_request_rejects_link_and_digest_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = directory.path().join("request.json");
+        let alias = directory.path().join("request-link.json");
+        std::fs::write(&request, b"exact-content").unwrap();
+        let capture = capture_provider_request(request.to_str().unwrap()).unwrap();
+        std::fs::hard_link(&request, &alias).unwrap();
+        assert!(capture.revalidate().is_err());
+        std::fs::remove_file(&alias).unwrap();
+
+        let capture = capture_provider_request(request.to_str().unwrap()).unwrap();
+        std::fs::write(&request, b"other-content").unwrap();
+        assert!(capture.revalidate().is_err());
     }
 
     struct InjectedProviderPathTransport {
