@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -675,7 +675,7 @@ impl WorktreeCoordinator {
                     "could not persist the running provider state: {error}"
                 ));
             }
-            match run_provider(&record.request_path) {
+            match run_provider(&record.request_path, &record.worktree_path) {
                 Ok(output) => classify_provider_output(&output, &request.targets),
                 Err(error) => ProviderCompletion::RecoveryRequired(error),
             }
@@ -1007,7 +1007,7 @@ fn provider_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
+fn run_provider(request_path: &str, worktree_path: &str) -> Result<std::process::Output, String> {
     let configured = configured_provider_command()?;
     let mut command = Command::new(&configured[0]);
     command.args(&configured[1..]);
@@ -1020,12 +1020,93 @@ fn run_provider(request_path: &str) -> Result<std::process::Output, String> {
         "--confirm",
         "--json",
     ]);
-    crate::bounded_exec::output_with_timeout_and_limit(
-        command,
-        provider_timeout(),
-        PROVIDER_OUTPUT_LIMIT,
-    )
-    .map_err(|error| format!("rust-storage retirement-clean could not complete: {error}"))
+    let inspect_leases = || {
+        crate::tmux::pane_info()
+            .map_err(|error| format!("Cargo cleanup lease inspection failed: {error}"))
+            .map(|panes| {
+                panes
+                    .into_iter()
+                    .any(|pane| path_within(&pane.cwd, worktree_path))
+            })
+    };
+    run_provider_with_lease_inspector(command, provider_timeout(), inspect_leases)
+}
+
+fn run_provider_with_lease_inspector(
+    mut command: Command,
+    timeout: Duration,
+    mut inspect_leases: impl FnMut() -> Result<bool, String>,
+) -> Result<std::process::Output, String> {
+    if inspect_leases()? {
+        return Err("Cargo cleanup refused because a live worktree session is present".into());
+    }
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("rust-storage retirement-clean could not start: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("rust-storage retirement-clean stdout was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("rust-storage retirement-clean stderr was unavailable")?;
+    let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
+    let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        let leased = match inspect_leases() {
+            Ok(leased) => leased,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if leased {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cargo cleanup stopped because a live worktree session appeared".into());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("rust-storage retirement-clean wait failed: {error}"))?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("rust-storage retirement-clean timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "rust-storage retirement-clean stdout reader failed")??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "rust-storage retirement-clean stderr reader failed")??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    reader
+        .by_ref()
+        .take((PROVIDER_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|error| format!("rust-storage retirement-clean output read failed: {error}"))?;
+    if output.len() > PROVIDER_OUTPUT_LIMIT {
+        return Err("rust-storage retirement-clean output exceeded the limit".into());
+    }
+    Ok(output)
 }
 
 #[cfg(not(windows))]
@@ -1528,6 +1609,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn late_lease_stops_provider_before_its_filesystem_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("provider-ready");
+        let mutation = directory.path().join("provider-mutated");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "touch '{}'; sleep 30; touch '{}'",
+                ready.display(),
+                mutation.display()
+            ),
+        ]);
+        let inspections = std::sync::atomic::AtomicUsize::new(0);
+        let result = run_provider_with_lease_inspector(command, Duration::from_secs(5), || {
+            let attempt = inspections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                return Ok(false);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            Ok(ready.exists())
+        });
+
+        assert!(result
+            .unwrap_err()
+            .contains("live worktree session appeared"));
+        assert!(!mutation.exists());
+    }
 
     #[test]
     fn quarantined_provider_refusal_requires_recovery() {
