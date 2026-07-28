@@ -177,6 +177,45 @@ fn retryable_error(message: impl std::fmt::Display) -> String {
     format!("{RETRYABLE_ERROR_MARKER}{message}")
 }
 
+fn is_retryable_error(message: &str) -> bool {
+    message.starts_with(RETRYABLE_ERROR_MARKER)
+}
+
+fn cortana_tmux_observation_error(context: &str, error: crate::tmux::TmuxError) -> String {
+    let retryable = error.is_retryable_observation();
+    let message = format!("{context}: {error}");
+    if retryable {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn cortana_harness_observation_error(
+    context: &str,
+    error: crate::harness::LaunchAttestationError,
+) -> String {
+    let retryable = error == crate::harness::LaunchAttestationError::UnreadableEvidence;
+    let message = format!("{context}: {error}");
+    if retryable {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+/// Keep an inconclusive Cortana observation outside the destructive quarantine
+/// branch. Definitive mismatches remain available to the caller as the inner
+/// error, while retryable observations return immediately with authority intact.
+fn separate_retryable_cortana_observation<T>(
+    result: Result<T, String>,
+) -> Result<Result<T, String>, String> {
+    match result {
+        Err(error) if is_retryable_error(&error) => Err(error),
+        result => Ok(result),
+    }
+}
+
 impl ControlResponse {
     fn ok(result: Value) -> Self {
         Self {
@@ -731,15 +770,48 @@ struct RegistryInner {
 ///
 /// Deliberately NOT the PRD §8 persistence layer - in-memory, per app run; the
 /// frontend still persists layout for restarts and seeds this via its first report.
-#[derive(Default)]
 pub struct TabRegistry {
     inner: Mutex<RegistryInner>,
     identity_transaction: Mutex<()>,
+    startup_authoritative: AtomicBool,
+}
+
+impl Default for TabRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(RegistryInner::default()),
+            identity_transaction: Mutex::new(()),
+            startup_authoritative: AtomicBool::new(true),
+        }
+    }
 }
 
 impl TabRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct the production startup projection before terminal liveness has
+    /// been observed. Reads and full-layout reports remain retryable until
+    /// [`Self::publish_startup`] publishes the reconciled projection.
+    pub fn new_pending_startup() -> Self {
+        Self {
+            inner: Mutex::new(RegistryInner::default()),
+            identity_transaction: Mutex::new(()),
+            startup_authoritative: AtomicBool::new(false),
+        }
+    }
+
+    pub fn startup_is_authoritative(&self) -> bool {
+        self.startup_authoritative.load(Ordering::Acquire)
+    }
+
+    pub fn require_authoritative_startup(&self) -> Result<(), String> {
+        if self.startup_is_authoritative() {
+            Ok(())
+        } else {
+            Err("workspace startup reconciliation is still pending".into())
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryInner> {
@@ -783,7 +855,7 @@ impl TabRegistry {
         Ok(normalized)
     }
 
-    pub fn replace(&self, tabs: Vec<TabRecord>) {
+    fn replace_inner(&self, tabs: Vec<TabRecord>, publish_startup: bool) {
         let mut g = self.lock();
         g.tabs = Self::normalize_tabs(tabs)
             .expect("internal tab fixtures must contain valid Workspace records");
@@ -795,6 +867,17 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
         }
         g.seq += 1;
+        if publish_startup {
+            self.startup_authoritative.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn replace(&self, tabs: Vec<TabRecord>) {
+        self.replace_inner(tabs, false);
+    }
+
+    pub fn publish_startup(&self, tabs: Vec<TabRecord>) {
+        self.replace_inner(tabs, true);
     }
 
     /// A UI up-sync with optimistic-concurrency: accepted (and revision bumped)
@@ -806,6 +889,7 @@ impl TabRegistry {
         active_tab_id: Option<String>,
         base_seq: Option<u64>,
     ) -> Result<ReportOutcome, String> {
+        self.require_authoritative_startup()?;
         let tabs = Self::normalize_tabs(tabs)?;
         let mut g = self.lock();
         if let Some(base) = base_seq {
@@ -859,6 +943,37 @@ impl TabRegistry {
             active_tab_id: g.active_tab_id.clone(),
             tabs: g.tabs.clone(),
         }
+    }
+
+    pub fn prune_gone_tiles_if_seq(
+        &self,
+        expected_seq: u64,
+        live_tile_ids: &std::collections::HashSet<String>,
+    ) -> Option<RegistrySnapshot> {
+        let mut g = self.lock();
+        if g.seq != expected_seq {
+            return None;
+        }
+        let gone = g
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.tile_ids.iter())
+            .filter(|tile_id| !live_tile_ids.contains(*tile_id))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        if gone.is_empty() {
+            return None;
+        }
+        g.retired_tile_ids.extend(gone.iter().cloned());
+        for tab in &mut g.tabs {
+            tab.tile_ids.retain(|tile_id| !gone.contains(tile_id));
+        }
+        g.seq = g.seq.saturating_add(1);
+        Some(RegistrySnapshot {
+            seq: g.seq,
+            active_tab_id: g.active_tab_id.clone(),
+            tabs: g.tabs.clone(),
+        })
     }
 
     /// The id of the tab whose name matches exactly, if any (named-placement reuse).
@@ -1717,19 +1832,16 @@ fn validate_runtime_identity(
         return Err(format!("{scope} providerSessionId requires a provider"));
     }
     match provider {
-        Some("claude") => {
+        Some("claude")
             if (strict || provider_session_id.is_some() && claude_uuid.is_some())
-                && provider_session_id != claude_uuid
-            {
-                return Err(format!(
-                    "{scope} Claude providerSessionId and claudeUuid must match"
-                ));
-            }
+                && provider_session_id != claude_uuid =>
+        {
+            return Err(format!(
+                "{scope} Claude providerSessionId and claudeUuid must match"
+            ));
         }
-        Some("codex") => {
-            if claude_uuid.is_some() {
-                return Err(format!("{scope} Codex identity must not carry claudeUuid"));
-            }
+        Some("codex") if claude_uuid.is_some() => {
+            return Err(format!("{scope} Codex identity must not carry claudeUuid"));
         }
         None if strict && claude_uuid.is_some() => {
             return Err(format!("{scope} claudeUuid requires the Claude provider"));
@@ -6454,6 +6566,29 @@ fn dispatch_with_caller(
     trusted_internal: bool,
 ) -> Result<Value, String> {
     enforce_delegated_admin_command(ctx, caller, command)?;
+    if matches!(
+        command,
+        "list_tabs"
+            | "list_captains"
+            | "new_tab"
+            | "close_tab"
+            | "rename_tab"
+            | "focus_tab"
+            | "focus_session"
+            | "move_tile"
+            | "report_workspace_tabs"
+            | "spawn_terminal"
+            | "history_resume"
+            | "start_agent"
+            | "reconcile_cortana"
+            | "commission_captain"
+            | "attach_captain"
+            | "create_worktree"
+    ) {
+        ctx.tabs
+            .require_authoritative_startup()
+            .map_err(retryable_error)?;
+    }
     match command {
         // ---- Read tier (PRD §11.2: allowed) --------------------------------
         "list_terminals" => list_terminals(),
@@ -7282,6 +7417,9 @@ use handlers_files::*;
 /// `list_tabs`. This is the ONE source of truth the UI's sidebar/overlay and an
 /// MCP captain both read; ship files remain the captain-side roster only.
 fn list_captains(ctx: &ControlContext) -> Result<Value, String> {
+    ctx.tabs
+        .require_authoritative_startup()
+        .map_err(retryable_error)?;
     let snap = ctx.captains.snapshot();
     let admin_grants = ctx.delegated_admin.active_grants();
     let mut captains = serde_json::to_value(&snap.captains).map_err(|e| e.to_string())?;
@@ -8339,7 +8477,10 @@ fn authorize_inflight_cortana_bootstrap(
     }
     tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
         .map_err(|error| {
-            format!("cortana_bootstrap: managed owner revalidation failed: {error}")
+            cortana_tmux_observation_error(
+                "cortana_bootstrap: managed owner revalidation failed",
+                error,
+            )
         })?;
     let expected = launch
         .expected_harness_launch_provenance
@@ -8361,7 +8502,9 @@ fn authorize_inflight_cortana_bootstrap(
         owner.tmux.pane_start_ticks,
         Instant::now() + Duration::from_secs(5),
     )
-    .map_err(|error| format!("cortana_bootstrap: Harness revalidation failed: {error}"))?;
+    .map_err(|error| {
+        cortana_harness_observation_error("cortana_bootstrap: Harness revalidation failed", error)
+    })?;
     if launch
         .harness_process
         .as_ref()
@@ -9201,10 +9344,14 @@ fn cleanup_cortana_managed_launch(
     owner: Option<&tmux::ManagedRuntimeOwnerToken>,
 ) -> Result<(), String> {
     match owner {
-        Some(owner) => tmux::retire_managed_runtime(&launch.tmux_target, owner)
-            .map_err(|error| format!("exact observed owner cleanup failed: {error}"))?,
-        None => tmux::retire_prepared_managed_runtime(&tmux_cortana_launch(launch))
-            .map_err(|error| format!("exact prepared owner cleanup failed: {error}"))?,
+        Some(owner) => {
+            tmux::retire_managed_runtime(&launch.tmux_target, owner).map_err(|error| {
+                cortana_tmux_observation_error("exact observed owner cleanup failed", error)
+            })?
+        }
+        None => tmux::retire_prepared_managed_runtime(&tmux_cortana_launch(launch)).map_err(
+            |error| cortana_tmux_observation_error("exact prepared owner cleanup failed", error),
+        )?,
     }
     ctx.captains.clear_prepared_cortana_managed_launch(launch)?;
     Ok(())
@@ -9594,7 +9741,10 @@ fn observe_cortana_harness_process(
         Instant::now() + Duration::from_secs(2),
     )
     .map_err(|error| {
-        format!("reconcile_cortana: managed Harness process attestation failed: {error}")
+        cortana_harness_observation_error(
+            "reconcile_cortana: managed Harness process attestation failed",
+            error,
+        )
     })
 }
 
@@ -9621,7 +9771,10 @@ fn revalidate_cortana_managed_owner_after_process_observation(
     let _ = ctx;
     tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
         .map_err(|error| {
-            format!("reconcile_cortana: managed launch owner changed after Harness observation: {error}")
+            cortana_tmux_observation_error(
+                "reconcile_cortana: managed launch owner changed after Harness observation",
+                error,
+            )
         })?;
     Ok(CortanaManagedObservationEvidence {
         process,
@@ -9771,7 +9924,7 @@ fn resolve_cortana_expected_harness_launch(
     Ok(expected)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn attest_cortana_managed_harness(
     ctx: &ControlContext,
     durable: &crate::cortana_reconcile::CortanaDurableIdentity,
@@ -9786,7 +9939,10 @@ fn attest_cortana_managed_harness(
         .ok_or("reconcile_cortana: Harness attestation lost its managed owner")?;
     tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
         .map_err(|error| {
-            format!("reconcile_cortana: managed launch owner is unverifiable: {error}")
+            cortana_tmux_observation_error(
+                "reconcile_cortana: managed launch owner is unverifiable",
+                error,
+            )
         })?;
     let mut current = durable.clone();
     if launch.harness_process.is_none() {
@@ -9872,8 +10028,9 @@ fn revalidate_active_cortana_authority(
         })
         .ok_or("active Cortana identity binding changed")?;
     let target = tmux_target(terminal_id);
-    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
-        .map_err(|error| format!("active Cortana managed owner changed: {error}"))?;
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
+        |error| cortana_tmux_observation_error("active Cortana managed owner changed", error),
+    )?;
     let observed = crate::harness::observe_scoped_harness_process(
         &target,
         harness,
@@ -9884,7 +10041,9 @@ fn revalidate_active_cortana_authority(
         owner.tmux.pane_start_ticks,
         Instant::now() + Duration::from_secs(1),
     )
-    .map_err(|error| format!("active Cortana Harness attestation failed: {error}"))?;
+    .map_err(|error| {
+        cortana_harness_observation_error("active Cortana Harness attestation failed", error)
+    })?;
     if observed == attestation.process {
         Ok(())
     } else {
@@ -9919,10 +10078,13 @@ fn revalidate_unresolved_cortana_attestation(
         return Err("unresolved Cortana Harness attestation is structurally invalid".into());
     }
     let target = tmux_target(terminal_id);
-    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
-        .map_err(|error| format!("unresolved Cortana managed owner changed: {error}"))?;
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
+        |error| cortana_tmux_observation_error("unresolved Cortana managed owner changed", error),
+    )?;
     let bearer = tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV)
-        .map_err(|error| format!("unresolved Cortana bearer inspection failed: {error}"))?
+        .map_err(|error| {
+            cortana_tmux_observation_error("unresolved Cortana bearer inspection failed", error)
+        })?
         .filter(|bearer| !bearer.is_empty())
         .ok_or("unresolved Cortana runtime has no retained session bearer")?;
     let observed = crate::harness::observe_scoped_harness_process(
@@ -9935,7 +10097,9 @@ fn revalidate_unresolved_cortana_attestation(
         owner.tmux.pane_start_ticks,
         Instant::now() + Duration::from_secs(1),
     )
-    .map_err(|error| format!("unresolved Cortana Harness attestation failed: {error}"))?;
+    .map_err(|error| {
+        cortana_harness_observation_error("unresolved Cortana Harness attestation failed", error)
+    })?;
     if observed == attestation.process {
         Ok(())
     } else {
@@ -9978,8 +10142,9 @@ fn observe_live_cortana_with_expected_provenance(
         })
         .ok_or("live Cortana identity binding changed")?;
     let target = tmux_target(terminal_id);
-    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
-        .map_err(|error| format!("live Cortana managed owner changed: {error}"))?;
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner)).map_err(
+        |error| cortana_tmux_observation_error("live Cortana managed owner changed", error),
+    )?;
     crate::harness::observe_scoped_harness_process(
         &target,
         harness,
@@ -9990,7 +10155,9 @@ fn observe_live_cortana_with_expected_provenance(
         owner.tmux.pane_start_ticks,
         deadline,
     )
-    .map_err(|error| format!("live Cortana Harness attestation failed: {error}"))
+    .map_err(|error| {
+        cortana_harness_observation_error("live Cortana Harness attestation failed", error)
+    })
 }
 
 fn finalize_cortana_active_attestation_recovery_observation(
@@ -10343,6 +10510,9 @@ fn reconcile_cortana(
     args: &Value,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    ctx.tabs
+        .require_authoritative_startup()
+        .map_err(retryable_error)?;
     reconcile_cortana_with_transition_count(ctx, args, trusted_internal, 0)
 }
 
@@ -10419,6 +10589,9 @@ fn reconcile_cortana_with_transition_count(
             Some(CORTANA_SPAWN_ADMISSION_REQUIRED)
         ) {
             if let Err(error) = &result {
+                if is_retryable_error(error) {
+                    return result;
+                }
                 let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
             }
             return result;
@@ -10459,6 +10632,9 @@ fn reconcile_cortana_with_transition_count(
         );
     }
     if let Err(error) = &result {
+        if is_retryable_error(error) {
+            return result;
+        }
         let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
     }
     result
@@ -10871,8 +11047,9 @@ fn reconcile_cortana_inner(
                     &tmux_cortana_launch(&launch),
                 )
                 .map_err(|error| {
-                    format!(
-                        "reconcile_cortana: prepared launch effect is alive but ownership is unverifiable: {error}"
+                    cortana_tmux_observation_error(
+                        "reconcile_cortana: prepared launch effect is alive but ownership is unverifiable",
+                        error,
                     )
                 })?;
                 durable = ctx.captains.record_cortana_runtime_owner(
@@ -10984,9 +11161,15 @@ fn reconcile_cortana_inner(
                             &tmux_target(terminal_id),
                             &tmux_cortana_owner(&owner),
                         ) {
-                            let reason = format!(
-                                "managed owner for gone terminal '{terminal_id}' remains populated or unverifiable: {error}"
+                            let reason = cortana_tmux_observation_error(
+                                &format!(
+                                    "managed owner for gone terminal '{terminal_id}' remains populated or unverifiable"
+                                ),
+                                error,
                             );
+                            if is_retryable_error(&reason) {
+                                return Err(reason);
+                            }
                             ctx.captains.mark_cortana_degraded(operation_id, &reason)?;
                             return Err(format!("reconcile_cortana: {reason}"));
                         }
@@ -11080,8 +11263,9 @@ fn reconcile_cortana_inner(
                 &tmux_cortana_owner(&basis.owner),
             )
             .map_err(|error| {
-                format!(
-                    "reconcile_cortana: prepared managed incumbent owner changed after WAL: {error}"
+                cortana_tmux_observation_error(
+                    "reconcile_cortana: prepared managed incumbent owner changed after WAL",
+                    error,
                 )
             })?;
             revalidate_unresolved_cortana_attestation(&durable)?;
@@ -11360,7 +11544,10 @@ fn reconcile_cortana_inner(
                 &tmux_cortana_owner(owner),
             )
             .map_err(|error| {
-                format!("reconcile_cortana: replacement owner could not be revalidated: {error}")
+                cortana_tmux_observation_error(
+                    "reconcile_cortana: replacement owner could not be revalidated",
+                    error,
+                )
             })?;
             claim_cortana_runtime(ctx, candidate)?;
             let identity_id = candidate
@@ -11465,7 +11652,7 @@ fn reconcile_cortana_inner(
                     .and_then(|observed| observed.active_result.as_ref())
                     .ok_or(CORTANA_ATTESTATION_REQUIRED)?
                     .clone();
-                match active_result {
+                match separate_retryable_cortana_observation(active_result)? {
                     Ok(()) => {
                         let committed =
                             ctx.captains.complete_cortana_keep(operation_id, &durable)?;
@@ -11499,7 +11686,7 @@ fn reconcile_cortana_inner(
                 .and_then(|observed| observed.legacy_result.as_ref())
                 .ok_or(CORTANA_ATTESTATION_REQUIRED)?
                 .clone();
-            match attestation {
+            match separate_retryable_cortana_observation(attestation)? {
                 Ok((expected_launch_provenance, process)) => {
                     let recovery =
                         crate::cortana_reconcile::CortanaActiveHarnessAttestationRecovery {
@@ -11658,9 +11845,12 @@ fn reconcile_cortana_inner(
                 &tmux_cortana_owner(owner),
             )
             .map_err(|error| {
-                format!(
-                    "reconcile_cortana: failed managed runtime '{}' could not be retired: {error}",
-                    candidate.terminal_id
+                cortana_tmux_observation_error(
+                    &format!(
+                        "reconcile_cortana: failed managed runtime '{}' could not be retired",
+                        candidate.terminal_id
+                    ),
+                    error,
                 )
             })?;
             ctx.tabs.retire_tile_locked(&candidate.terminal_id);
@@ -11718,8 +11908,9 @@ fn reconcile_cortana_inner(
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
-            return Err(format!(
-                "reconcile_cortana: terminal startup failed with durable prepared cleanup pending: {error}"
+            return Err(cortana_tmux_observation_error(
+                "reconcile_cortana: terminal startup failed with durable prepared cleanup pending",
+                error,
             ));
         }
     };

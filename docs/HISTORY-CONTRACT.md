@@ -136,6 +136,8 @@ Codex user-visible labels use normalized `event_msg` user messages rather than d
 
 Catalog bounds apply fairly after Harness and Project grouping.
 `HISTORY_ENTRY_LIMIT` is 500, `HISTORY_SOURCE_LIMIT` is 32, `HISTORY_LABEL_MAX_CHARS` is 120, `HISTORY_LAST_TEXT_MAX_CHARS` is 240, and `HISTORY_REASON_MAX_CHARS` is 240.
+Each Harness scan fairly selects at most 256 transcript candidates before parsing.
+Exceeding that source bound marks the source degraded and the catalog truncated instead of monopolizing WSL startup work.
 No chatty directory may evict every other Project or Harness.
 Source scanning must remain bounded and must not add sustained hidden-surface CPU or repeated Windows-to-WSL process churn.
 
@@ -209,6 +211,8 @@ The CLI remains noninteractive and follows [cli-contract.md](./cli-contract.md).
 Machine-readable responses use the stable envelope and structured error taxonomy.
 No surface reconstructs resume commands or archive targets independently.
 An unknown future Harness name may remain visible in the catalog, but every executable action is incompatible until a matching adapter is installed.
+The desktop defers its first production History scan until startup ownership reconciliation has had a chance to complete.
+Retryable control failures are retried while idle, and an unavailable initial catalog exposes an explicit Retry action.
 
 ## Verification
 

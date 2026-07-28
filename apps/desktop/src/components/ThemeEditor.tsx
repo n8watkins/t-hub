@@ -62,6 +62,7 @@ import { RecoveryReview } from "./RecoveryReview";
 import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
 // Claude hooks install/uninstall now lives in Settings (moved out of the sidebar).
 import { HookInstallPanel } from "./HookInstallPanel";
+import { CodexHookInstallPanel } from "./CodexHookInstallPanel";
 import { claudeHooksInstalled } from "../ipc/client05";
 // Hybrid keymap (WS-3): the interactive Keyboard section shows every command's
 // live direct/prefixed binding, opens the palette to rebind, and resets defaults.
@@ -901,12 +902,13 @@ function HotkeysSection() {
 }
 
 // ---------------------------------------------------------------------------
-// Hooks — Claude Code lifecycle hook install/uninstall (moved here from the
-// sidebar). The installed check runs when this section mounts (a deliberate
-// navigation), so there's no repeated "checking..." flash.
+// Hooks - provider-specific lifecycle hook management. Claude's installed check
+// runs when this section mounts. Codex owns its richer health check inside its
+// panel because trust and policy are separate from hook-file installation.
 // ---------------------------------------------------------------------------
 function HooksSection() {
   const [installed, setInstalled] = useState<boolean | null>(null);
+  const [provider, setProvider] = useState<"claude" | "codex">("claude");
   useEffect(() => {
     let alive = true;
     claudeHooksInstalled()
@@ -916,9 +918,52 @@ function HooksSection() {
       alive = false;
     };
   }, []);
-  // HookInstallPanel is self-contained (its own header/description/buttons), so
-  // it's rendered directly rather than wrapped in a Group.
-  return <HookInstallPanel agentBin="t-hub-agent" installed={installed} setInstalled={setInstalled} />;
+  return (
+    <div className="flex flex-col gap-3">
+      <div
+        className="inline-flex w-fit rounded border p-0.5"
+        style={{ borderColor: "var(--th-border)" }}
+        role="group"
+        aria-label="Hook provider"
+      >
+        {(["claude", "codex"] as const).map((value) => {
+          const selected = provider === value;
+          return (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => setProvider(value)}
+              className="rounded px-3 py-1 text-xs font-medium transition-colors"
+              style={{
+                color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
+                backgroundColor: selected ? "var(--th-tile-bg)" : "transparent",
+              }}
+            >
+              {value === "claude" ? "Claude" : "Codex"}
+            </button>
+          );
+        })}
+      </div>
+      {provider === "claude" ? (
+        <div
+          id="claude-hooks-panel"
+          className="rounded border p-3"
+          style={{ borderColor: "var(--th-border)" }}
+        >
+          <HookInstallPanel
+            agentBin="t-hub-agent"
+            installed={installed}
+            setInstalled={setInstalled}
+          />
+        </div>
+      ) : (
+        <div id="codex-hooks-panel">
+          <CodexHookInstallPanel agentBin="t-hub-agent" />
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,11 +1170,11 @@ function AboutSection() {
       <AboutGroup />
       <Group
         title="What is T-Hub"
-        description="A local, terminal-first cockpit for running and supervising many Claude Code sessions at once — free and open source, by n8builds. Windows + WSL."
+        description="A local, terminal-first cockpit for running and supervising many Codex and Claude coding-agent sessions at once. Free and open source, by n8builds. Windows + WSL."
       >
         <Bullet>Every terminal is a persistent tmux session — closing a tile detaches it; the session keeps running and can be re-adopted.</Bullet>
         <Bullet>Drag, resize, and reorder tiles freely — terminals never reload when they move.</Bullet>
-        <Bullet>Install the Claude hooks to light up the supervision tree, the attention queue, and live context/cost/usage.</Bullet>
+        <Bullet>Install Codex or Claude hooks to light up the supervision tree and attention queue. Claude hooks also supply live context, cost, and usage.</Bullet>
       </Group>
     </>
   );
@@ -1142,7 +1187,7 @@ function SetupSection() {
       <Step n={2}>Drag a tile’s header to rearrange the grid; drag a column/row gutter to resize. Drag a tile onto a workspace tab to move it there.</Step>
       <Step n={3}>Right-click a tile (or hold Shift over its “×”) to close or delete it; a plain “×” detaches (the session keeps running).</Step>
       <Step n={4}>Open the Files panel to browse the focused terminal’s project; click a file to preview or edit it.</Step>
-      <Step n={5}>Install Claude hooks in Settings → Hooks (pick which events) to get the supervision tree, attention queue, and live usage.</Step>
+      <Step n={5}>Install Codex or Claude hooks in Settings → Hooks to get the supervision tree and attention queue. Claude hooks also supply live context, cost, and usage.</Step>
     </Group>
   );
 }

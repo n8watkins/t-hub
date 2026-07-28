@@ -231,7 +231,7 @@ pub fn install_hooks_events(
     // bare `t-hub-agent` (the UI default) or a stale `/usr/bin/t-hub-agent`
     // fails with "not found" and no hook ever fires. We resolve a concrete path
     // inside WSL instead of trusting the passed value.
-    let resolved = resolve_agent_bin(agent_bin);
+    let resolved = resolve_agent_bin(agent_bin)?;
     install_hooks_at_events(&settings_path()?, &resolved, consent, events)
 }
 
@@ -256,10 +256,7 @@ pub fn install_hooks_events(
 /// `termhub` entries and rewrites them under the current marker + resolved agent
 /// path (the migration). We never WRITE anything but the current marker.
 #[cfg(not(feature = "devbuild"))]
-pub fn reconcile_managed_hooks() -> Result<()> {
-    // Same default the UI passes to the install command ("t-hub-agent"); the
-    // installer resolves it to a concrete absolute path inside WSL.
-    let agent_bin = resolve_agent_bin("t-hub-agent");
+pub fn reconcile_managed_hooks(agent_bin: &str) -> Result<()> {
     let path = settings_path()?;
     let existing = read_settings(&path)?;
 
@@ -268,6 +265,7 @@ pub fn reconcile_managed_hooks() -> Result<()> {
     if !hooks::any_managed(&existing) {
         return Ok(());
     }
+    let agent_bin = resolve_agent_bin(agent_bin)?;
     // Already current? No legacy marker AND every command already points at
     // agent_bin -> nothing to migrate, so DON'T rewrite settings.json. This runs on
     // every launch; only touch the file when an entry is genuinely stale.
@@ -294,13 +292,48 @@ pub fn managed_event_names() -> Result<Vec<String>> {
 }
 
 /// Resolve the absolute path to the `t-hub-agent` binary that the hooks will
-/// invoke. Prefers a login-shell `command -v` (finds wherever it's installed),
-/// then `~/.local/bin/t-hub-agent` (the standard install location), then the
-/// value the caller passed as a last resort.
+/// invoke.
+/// An executable absolute path supplied by packaged deployment wins so hook
+/// commands use the same digest-versioned helper the app verified.
+/// Manual installs fall back to a login-shell `command -v`, then
+/// `~/.local/bin/t-hub-agent`, then the caller's value.
+#[cfg(any(windows, test))]
+fn validate_absolute_wsl_agent_bin(path: &str) -> Result<()> {
+    if !path.starts_with('/')
+        || path.len() <= 1
+        || path.len() > 4096
+        || path.chars().any(char::is_control)
+        || path.contains('\\')
+        || path
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(anyhow!(
+            "packaged t-hub-agent path is not a canonical absolute WSL path"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
-fn resolve_agent_bin(passed: &str) -> String {
-    use std::os::windows::process::CommandExt;
+fn resolve_agent_bin(passed: &str) -> Result<String> {
     let distro = wsl_distro();
+    if passed.starts_with('/') {
+        validate_absolute_wsl_agent_bin(passed)?;
+        let exact = crate::wsl::executable_probe_command(&distro, passed);
+        let output =
+            crate::bounded_exec::output_with_timeout(exact, crate::bounded_exec::WSL_PROBE_TIMEOUT)
+                .context("verifying the exact packaged t-hub-agent path in WSL")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "verified packaged t-hub-agent is no longer executable at {passed}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        return Ok(passed.to_string());
+    }
+    use std::os::windows::process::CommandExt;
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["-d", &distro, "--", "bash", "-lc", "command -v t-hub-agent"])
         .creation_flags(0x0800_0000);
@@ -311,21 +344,21 @@ fn resolve_agent_bin(passed: &str) -> String {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if p.starts_with('/') {
-                return p;
+                return Ok(p);
             }
         }
     }
     if let Ok(home) = wsl_home(&distro) {
-        return format!("{home}/.local/bin/t-hub-agent");
+        return Ok(format!("{home}/.local/bin/t-hub-agent"));
     }
-    passed.to_string()
+    Ok(passed.to_string())
 }
 
 #[cfg(unix)]
-fn resolve_agent_bin(passed: &str) -> String {
+fn resolve_agent_bin(passed: &str) -> Result<String> {
     // An absolute path that actually exists wins.
     if passed.starts_with('/') && Path::new(passed).exists() {
-        return passed.to_string();
+        return Ok(passed.to_string());
     }
     let mut cmd = std::process::Command::new("bash");
     cmd.args(["-lc", "command -v t-hub-agent"]);
@@ -336,17 +369,17 @@ fn resolve_agent_bin(passed: &str) -> String {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if p.starts_with('/') {
-                return p;
+                return Ok(p);
             }
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return Path::new(&home)
+        return Ok(Path::new(&home)
             .join(".local/bin/t-hub-agent")
             .to_string_lossy()
-            .into_owned();
+            .into_owned());
     }
-    passed.to_string()
+    Ok(passed.to_string())
 }
 
 /// Path-injected core of [`install_hooks`] — operates on an explicit
@@ -466,7 +499,7 @@ pub fn uninstall_hooks_at(path: &Path) -> Result<InstallReport> {
 /// [`install_gate_at`].
 #[allow(dead_code)] // the distinct opt-in surface (UI command / operator action)
 pub fn install_gate(agent_bin: &str, consent: bool) -> Result<InstallReport> {
-    let resolved = resolve_agent_bin(agent_bin);
+    let resolved = resolve_agent_bin(agent_bin)?;
     install_gate_at(&settings_path()?, &resolved, consent)
 }
 
@@ -561,6 +594,19 @@ mod tests {
         if let Some(dir) = path.parent() {
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    #[test]
+    fn packaged_agent_path_requires_canonical_absolute_wsl_syntax() {
+        assert!(validate_absolute_wsl_agent_bin(
+            "/home/natkins/.local/lib/t-hub/agents/digest/t-hub-agent"
+        )
+        .is_ok());
+        assert!(validate_absolute_wsl_agent_bin("t-hub-agent").is_err());
+        assert!(validate_absolute_wsl_agent_bin("/home/natkins/../root/t-hub-agent").is_err());
+        assert!(validate_absolute_wsl_agent_bin(r"C:\Users\natha\t-hub-agent").is_err());
+        assert!(validate_absolute_wsl_agent_bin("/home/natkins//t-hub-agent").is_err());
+        assert!(validate_absolute_wsl_agent_bin("/home/natkins/t-hub-agent\n/root/evil").is_err());
     }
 
     #[test]

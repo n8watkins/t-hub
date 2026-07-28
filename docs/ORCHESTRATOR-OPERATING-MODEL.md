@@ -21,6 +21,8 @@ Concurrent startup attempts use a stable operation identity and serialize agains
 Recovery preserves Cortana's identity and checkpoints while replacing a missing terminal or Harness runtime at a later generation.
 When several candidates exist, reconciliation accepts only one deterministic authoritative generation and safely retires only older trusted duplicates.
 Equal highest generations, foreign identities, uncertain liveness, and untrusted live candidates fail closed into a visible degraded recovery state.
+Timed-out tmux probes, unreadable Harness process evidence, and safe duplicate in-flight retries preserve existing authority and leave reconciliation visibly in progress instead of quarantining a runtime or presenting an authoritative recovery failure.
+Quarantine revokes runtime authority and records exact recovery evidence without killing, detaching, closing, or deleting the tmux session.
 The runtime governor reserves capacity for Cortana and recovery before admitting ordinary implementation lanes.
 The installed runtime obtains provider capacity from a validated `T_HUB_PROVIDER_SESSION_CAPACITY` override when present or from the conservative packaged policy when the override is absent.
 The packaged policy is reported as degraded because it is not live provider quota telemetry, while a malformed or unavailable configured override fails closed.

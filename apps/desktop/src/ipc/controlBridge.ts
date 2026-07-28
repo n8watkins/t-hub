@@ -26,7 +26,7 @@ import { listen } from "@tauri-apps/api/event";
 import { isSatelliteWindow, useWorkspace } from "../store/workspace";
 import { useCaptain, type CaptainClaimRecord, type CrewRef } from "../store/captain";
 import { notify } from "../lib/notify";
-import { controlRequest } from "./controlClient";
+import { controlRequest, isRetryableControlError } from "./controlClient";
 import type { TabReport, TabReportResult } from "./types";
 
 /** Exact Tauri event the backend control listener emits to apply a UI mutation. */
@@ -70,6 +70,9 @@ let lastSeq = 0;
 // inside set(), so a plain flag is race-free here.
 let adoptingRegistry = false;
 let layoutSyncFailed = false;
+const STARTUP_RECONCILIATION_RETRY_MS = 1_000;
+const WORKSPACE_REGISTRY_BASELINE_KEY =
+  "t-hub.workspace.registry-baseline.v1";
 
 function surfaceLayoutSyncFailure(error: unknown): void {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
@@ -96,7 +99,9 @@ function adoptSync(args: ControlApply["args"]): boolean {
   if (typeof seq !== "number" || !Array.isArray(tabs)) return false;
   if (!hasWorkWorkspace(tabs as TabReport[])) return true;
   lastSeq = seq;
-  adoptAuthoritativeTabs(tabs as TabReport[]);
+  if (adoptAuthoritativeTabs(tabs as TabReport[])) {
+    persistAcknowledgedWorkspaceSnapshot(tabs as TabReport[], seq);
+  }
   return true;
 }
 
@@ -108,6 +113,316 @@ function tabReports(tabs: ReturnType<typeof useWorkspace.getState>["tabs"]): Tab
     kind: t.kind ?? (t.id === "captains-reserved" ? "captain" : "work"),
     tileIds: t.order,
   }));
+}
+
+interface WorkspaceRegistrySnapshot {
+  tabs: TabReport[];
+  activeTabId: string;
+}
+
+interface StartupWorkspaceDelta {
+  baselineTabs: TabReport[];
+  localTabs: TabReport[];
+}
+
+interface AcknowledgedWorkspaceSnapshot {
+  version: 1;
+  seq: number;
+  tabs: TabReport[];
+}
+
+function workspaceRegistrySnapshot(): WorkspaceRegistrySnapshot {
+  const { tabs, activeTabId } = useWorkspace.getState();
+  return {
+    tabs: tabReports(tabs),
+    activeTabId,
+  };
+}
+
+function validAcknowledgedTabs(value: unknown): value is TabReport[] {
+  if (!Array.isArray(value) || value.length === 0) return false;
+  const tabIds = new Set<string>();
+  const tileIds = new Set<string>();
+  for (const tab of value) {
+    if (!tab || typeof tab !== "object") return false;
+    const candidate = tab as Partial<TabReport>;
+    if (
+      typeof candidate.id !== "string" ||
+      candidate.id.length === 0 ||
+      typeof candidate.name !== "string" ||
+      !Array.isArray(candidate.tileIds) ||
+      !candidate.tileIds.every((id) => typeof id === "string") ||
+      (candidate.kind !== undefined &&
+        candidate.kind !== "work" &&
+        candidate.kind !== "captain") ||
+      tabIds.has(candidate.id)
+    ) {
+      return false;
+    }
+    tabIds.add(candidate.id);
+    for (const id of candidate.tileIds) {
+      if (tileIds.has(id)) return false;
+      tileIds.add(id);
+    }
+  }
+  return true;
+}
+
+export function loadAcknowledgedWorkspaceSnapshot():
+  | AcknowledgedWorkspaceSnapshot
+  | undefined {
+  if (typeof localStorage === "undefined") return undefined;
+  try {
+    const value = JSON.parse(
+      localStorage.getItem(WORKSPACE_REGISTRY_BASELINE_KEY) ?? "",
+    ) as Partial<AcknowledgedWorkspaceSnapshot>;
+    const seq = value.seq;
+    if (
+      value.version !== 1 ||
+      typeof seq !== "number" ||
+      !Number.isSafeInteger(seq) ||
+      seq < 0 ||
+      !validAcknowledgedTabs(value.tabs)
+    ) {
+      return undefined;
+    }
+    return {
+      version: 1,
+      seq,
+      tabs: value.tabs.map((tab) => ({ ...tab, tileIds: [...tab.tileIds] })),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function persistAcknowledgedWorkspaceSnapshot(
+  tabs: TabReport[],
+  seq: number,
+): void {
+  if (
+    typeof localStorage === "undefined" ||
+    !Number.isSafeInteger(seq) ||
+    seq < 0 ||
+    !validAcknowledgedTabs(tabs)
+  ) {
+    return;
+  }
+  try {
+    localStorage.setItem(
+      WORKSPACE_REGISTRY_BASELINE_KEY,
+      JSON.stringify({ version: 1, seq, tabs }),
+    );
+  } catch {}
+}
+
+function longestCommonSubsequence(left: string[], right: string[]): Set<string> {
+  const lengths = Array.from({ length: left.length + 1 }, () =>
+    Array<number>(right.length + 1).fill(0),
+  );
+  for (let i = 1; i <= left.length; i += 1) {
+    for (let j = 1; j <= right.length; j += 1) {
+      lengths[i][j] =
+        left[i - 1] === right[j - 1]
+          ? lengths[i - 1][j - 1] + 1
+          : Math.max(lengths[i - 1][j], lengths[i][j - 1]);
+    }
+  }
+
+  const result = new Set<string>();
+  let i = left.length;
+  let j = right.length;
+  while (i > 0 && j > 0) {
+    if (left[i - 1] === right[j - 1]) {
+      result.add(left[i - 1]);
+      i -= 1;
+      j -= 1;
+    } else if (lengths[i - 1][j] >= lengths[i][j - 1]) {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  return result;
+}
+
+function insertByLocalOrder<T>(
+  items: T[],
+  item: T,
+  localOrder: string[],
+  idOf: (value: T) => string,
+): void {
+  const id = idOf(item);
+  const localIndex = localOrder.indexOf(id);
+  for (let i = localIndex - 1; i >= 0; i -= 1) {
+    const preceding = items.findIndex((value) => idOf(value) === localOrder[i]);
+    if (preceding >= 0) {
+      items.splice(preceding + 1, 0, item);
+      return;
+    }
+  }
+  for (let i = localIndex + 1; i < localOrder.length; i += 1) {
+    const following = items.findIndex((value) => idOf(value) === localOrder[i]);
+    if (following >= 0) {
+      items.splice(following, 0, item);
+      return;
+    }
+  }
+  items.push(item);
+}
+
+export function rebaseStartupWorkspaceTabs(
+  authoritativeTabs: TabReport[],
+  baselineTabs: TabReport[],
+  localTabs: TabReport[],
+  eligibleTileIds?: ReadonlySet<string>,
+): TabReport[] {
+  const allowedTileIds =
+    eligibleTileIds ??
+    new Set([
+      ...authoritativeTabs.flatMap((tab) => tab.tileIds),
+      ...localTabs.flatMap((tab) =>
+        tab.tileIds.filter(
+          (id) => !baselineTabs.some((baseline) => baseline.tileIds.includes(id)),
+        ),
+      ),
+    ]);
+  const baselineById = new Map(baselineTabs.map((tab) => [tab.id, tab]));
+  const localById = new Map(localTabs.map((tab) => [tab.id, tab]));
+  const removedTabIds = new Set(
+    baselineTabs.filter((tab) => !localById.has(tab.id)).map((tab) => tab.id),
+  );
+  let rebased = authoritativeTabs
+    .filter((tab) => !removedTabIds.has(tab.id))
+    .map((tab) => ({ ...tab, tileIds: [...tab.tileIds] }));
+
+  for (const local of localTabs) {
+    const baseline = baselineById.get(local.id);
+    const existingIndex = rebased.findIndex((tab) => tab.id === local.id);
+    if (!baseline && existingIndex < 0) {
+      rebased.push({ ...local, tileIds: [] });
+      continue;
+    }
+    if (!baseline) continue;
+    if (existingIndex < 0) {
+      const changedLocally =
+        local.name !== baseline.name ||
+        local.kind !== baseline.kind ||
+        local.tileIds.length !== baseline.tileIds.length ||
+        local.tileIds.some((id, index) => id !== baseline.tileIds[index]);
+      if (changedLocally) rebased.push({ ...local, tileIds: [] });
+      continue;
+    }
+    const existing = rebased[existingIndex];
+    rebased[existingIndex] = {
+      ...existing,
+      name: local.name !== baseline.name ? local.name : existing.name,
+      kind: local.kind !== baseline.kind ? local.kind : existing.kind,
+    };
+  }
+
+  const baselineTabOrder = baselineTabs
+    .map((tab) => tab.id)
+    .filter((id) => localById.has(id));
+  const localExistingTabOrder = localTabs
+    .map((tab) => tab.id)
+    .filter((id) => baselineById.has(id));
+  const stationaryTabIds = longestCommonSubsequence(
+    baselineTabOrder,
+    localExistingTabOrder,
+  );
+  const movedTabIds = new Set(
+    localTabs
+      .filter((tab) => !baselineById.has(tab.id) || !stationaryTabIds.has(tab.id))
+      .map((tab) => tab.id),
+  );
+  const movedTabs = new Map(
+    rebased.filter((tab) => movedTabIds.has(tab.id)).map((tab) => [tab.id, tab]),
+  );
+  rebased = rebased.filter((tab) => !movedTabIds.has(tab.id));
+  const localTabOrder = localTabs.map((tab) => tab.id);
+  for (const tab of localTabs) {
+    const moved = movedTabs.get(tab.id);
+    if (moved) insertByLocalOrder(rebased, moved, localTabOrder, (value) => value.id);
+  }
+
+  const baselineLocation = new Map<string, string>();
+  const localLocation = new Map<string, string>();
+  for (const tab of baselineTabs) {
+    for (const id of tab.tileIds) baselineLocation.set(id, tab.id);
+  }
+  for (const tab of localTabs) {
+    for (const id of tab.tileIds) localLocation.set(id, tab.id);
+  }
+
+  const changedTileIds = new Set<string>();
+  for (const [id, tabId] of baselineLocation) {
+    if (localLocation.get(id) !== tabId) changedTileIds.add(id);
+  }
+  for (const [id, tabId] of localLocation) {
+    if (baselineLocation.get(id) !== tabId) changedTileIds.add(id);
+  }
+  for (const local of localTabs) {
+    const baseline = baselineById.get(local.id);
+    if (!baseline) continue;
+    const baselineOrder = baseline.tileIds.filter(
+      (id) => localLocation.get(id) === local.id,
+    );
+    const localOrder = local.tileIds.filter(
+      (id) => baselineLocation.get(id) === local.id,
+    );
+    const stationaryIds = longestCommonSubsequence(baselineOrder, localOrder);
+    for (const id of localOrder) {
+      if (!stationaryIds.has(id)) changedTileIds.add(id);
+    }
+  }
+
+  for (const tab of rebased) {
+    tab.tileIds = tab.tileIds.filter((id) => !changedTileIds.has(id));
+  }
+  for (const local of localTabs) {
+    const target = rebased.find((tab) => tab.id === local.id);
+    if (!target) continue;
+    for (const id of local.tileIds) {
+      if (changedTileIds.has(id) && allowedTileIds.has(id)) {
+        insertByLocalOrder(target.tileIds, id, local.tileIds, (value) => value);
+      }
+    }
+  }
+  return rebased;
+}
+
+export function rebaseStartupWorkspaceDeltas(
+  authoritativeTabs: TabReport[],
+  deltas: StartupWorkspaceDelta[],
+  liveTerminalIds?: ReadonlySet<string>,
+): TabReport[] {
+  const eligibleTileIds = new Set(
+    authoritativeTabs.flatMap((tab) => tab.tileIds),
+  );
+  for (const { baselineTabs, localTabs } of deltas) {
+    const baselineTileIds = new Set(
+      baselineTabs.flatMap((tab) => tab.tileIds),
+    );
+    for (const id of localTabs.flatMap((tab) => tab.tileIds)) {
+      if (
+        !baselineTileIds.has(id) &&
+        (!liveTerminalIds || liveTerminalIds.has(id))
+      ) {
+        eligibleTileIds.add(id);
+      }
+    }
+  }
+  return deltas.reduce(
+    (tabs, delta) =>
+      rebaseStartupWorkspaceTabs(
+        tabs,
+        delta.baselineTabs,
+        delta.localTabs,
+        eligibleTileIds,
+      ),
+    authoritativeTabs,
+  );
 }
 
 function hasWorkWorkspace(tabs: TabReport[]): boolean {
@@ -131,6 +446,72 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
   return true;
 }
 
+function terminalInventoryFingerprint(terminals: Array<{ id: string }>): string {
+  return terminals
+    .map((terminal) => terminal.id)
+    .sort()
+    .join("\0");
+}
+
+const TERMINAL_INVENTORY_STABILITY_ATTEMPTS = 3;
+const TERMINAL_ADOPTION_ATTEMPTS = 3;
+
+async function stableLiveTerminalIds(
+  listTerminals: () => Promise<Array<{ id: string }>>,
+): Promise<Set<string> | undefined> {
+  let previousFingerprint: string | undefined;
+  for (
+    let attempt = 0;
+    attempt < TERMINAL_INVENTORY_STABILITY_ATTEMPTS;
+    attempt += 1
+  ) {
+    const terminals = await listTerminals();
+    const fingerprint = terminalInventoryFingerprint(terminals);
+    if (fingerprint === previousFingerprint) {
+      return new Set(terminals.map((terminal) => terminal.id));
+    }
+    previousFingerprint = fingerprint;
+  }
+  return undefined;
+}
+
+function sameTerminalIds(
+  left: ReadonlySet<string>,
+  right: ReadonlySet<string>,
+): boolean {
+  return (
+    left.size === right.size &&
+    [...left].every((terminalId) => right.has(terminalId))
+  );
+}
+
+async function reconcileAndAdoptAuthoritativeTabs(
+  tabs: TabReport[],
+  seq: number,
+  reconcileTabs: (
+    tabs: TabReport[],
+    seq: number,
+    liveTerminalIds: ReadonlySet<string>,
+  ) => TabReport[],
+  listTerminals: () => Promise<Array<{ id: string }>>,
+): Promise<boolean> {
+  let liveTerminalIds = await stableLiveTerminalIds(listTerminals);
+  if (!liveTerminalIds) return false;
+  for (let attempt = 0; attempt < TERMINAL_ADOPTION_ATTEMPTS; attempt += 1) {
+    if (!adoptAuthoritativeTabs(reconcileTabs(tabs, seq, liveTerminalIds))) {
+      return false;
+    }
+    const verifiedLiveTerminalIds =
+      await stableLiveTerminalIds(listTerminals);
+    if (!verifiedLiveTerminalIds) return false;
+    if (sameTerminalIds(liveTerminalIds, verifiedLiveTerminalIds)) {
+      return true;
+    }
+    liveTerminalIds = verifiedLiveTerminalIds;
+  }
+  return false;
+}
+
 /**
  * Hydrate the UI from the server registry before the first layout report.
  *
@@ -140,7 +521,13 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
  * This also lets setTerminals() surface pre-existing sessions while the first
  * control request is still in flight.
  */
-export async function bootstrapWorkspaceTabs(): Promise<void> {
+export async function bootstrapWorkspaceTabs(
+  reconcileTabs: (
+    tabs: TabReport[],
+    seq: number,
+    liveTerminalIds: ReadonlySet<string>,
+  ) => TabReport[] = (tabs) => tabs,
+): Promise<boolean> {
   try {
     const res = (await controlRequest("list_tabs")) as {
       seq?: unknown;
@@ -154,10 +541,28 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
       !Array.isArray(res.tabs) ||
       res.tabs.length === 0
     ) {
-      return;
+      return false;
     }
 
     const serverTabs = res.tabs as TabReport[];
+    const { listTerminals, reportWorkspaceTabs } = await import("./client");
+    const reconcileWithTerminalInventory = (
+      tabs: TabReport[],
+      seq: number,
+      liveTerminalIds: ReadonlySet<string>,
+    ): TabReport[] => {
+      const authoritativeTileIds = new Set(
+        tabs.flatMap((tab) => tab.tileIds),
+      );
+      return reconcileTabs(tabs, seq, liveTerminalIds).map((tab) => ({
+        ...tab,
+        tileIds: tab.tileIds.filter(
+          (terminalId) =>
+            authoritativeTileIds.has(terminalId) ||
+            liveTerminalIds.has(terminalId),
+        ),
+      }));
+    };
     lastSeq = res.seq;
     const local = useWorkspace.getState();
     const localWork = local.tabs.filter((tab) => tab.id !== "captains-reserved");
@@ -182,26 +587,56 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
         useWorkspace.getState().addTab();
         repairedLocal = useWorkspace.getState();
       }
-      const { reportWorkspaceTabs } = await import("./client");
+      const repairLiveTerminalIds = await stableLiveTerminalIds(listTerminals);
+      if (!repairLiveTerminalIds) return false;
+      const repairTabs = reconcileWithTerminalInventory(
+        tabReports(repairedLocal.tabs).map((tab) => ({
+          ...tab,
+          tileIds: tab.tileIds.filter((terminalId) =>
+            repairLiveTerminalIds.has(terminalId),
+          ),
+        })),
+        res.seq,
+        repairLiveTerminalIds,
+      );
       const repaired = await reportWorkspaceTabs(
-        tabReports(repairedLocal.tabs),
+        repairTabs,
         repairedLocal.activeTabId,
         res.seq,
       );
       if (typeof (repaired as { error?: unknown }).error === "string") {
         surfaceLayoutSyncFailure((repaired as { error: string }).error);
+        return false;
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
-      if (!repaired.error && repaired.stale && Array.isArray(repaired.tabs)) {
-        adoptAuthoritativeTabs(repaired.tabs);
+      if (repaired.stale && Array.isArray(repaired.tabs)) {
+        return await reconcileAndAdoptAuthoritativeTabs(
+          repaired.tabs,
+          repaired.seq,
+          reconcileWithTerminalInventory,
+          listTerminals,
+        );
       }
-      return;
+      return await reconcileAndAdoptAuthoritativeTabs(
+        repairTabs,
+        repaired.seq,
+        reconcileWithTerminalInventory,
+        listTerminals,
+      );
     }
 
-    adoptAuthoritativeTabs(serverTabs);
+    return await reconcileAndAdoptAuthoritativeTabs(
+      serverTabs,
+      res.seq,
+      reconcileWithTerminalInventory,
+      listTerminals,
+    );
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
-    surfaceLayoutSyncFailure(error);
+    if (!isRetryableControlError(error)) {
+      surfaceLayoutSyncFailure(error);
+    }
+    return false;
   }
 }
 
@@ -221,7 +656,10 @@ let captainsBootstrapping = false;
  *  captain store (records missing arrays coerce to empty - the store renders
  *  from whatever the server sent). Returns true when adopted. Exported for the
  *  reconciliation tests (the seq guard + the A1 empty guard). */
-export function adoptCaptainsSnapshot(sync: unknown): boolean {
+export function adoptCaptainsSnapshot(
+  sync: unknown,
+  options?: { authoritativeStartup?: boolean },
+): boolean {
   if (!sync || typeof sync !== "object") return false;
   const { seq, captains } = sync as { seq?: unknown; captains?: unknown };
   if (typeof seq !== "number" || !Array.isArray(captains)) return false;
@@ -299,7 +737,7 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
       state: r.state,
     });
   }
-  useCaptain.getState().adoptCaptainsRegistry(records);
+  useCaptain.getState().adoptCaptainsRegistry(records, options);
   return true;
 }
 
@@ -509,6 +947,7 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
 export function startControlBridge(): void {
   if (typeof window === "undefined") return;
   if (isSatelliteWindow()) return;
+  if (!("__TAURI_INTERNALS__" in window)) return;
   void listen<ControlApply>(CONTROL_APPLY_EVENT, (ev) => {
     const payload = ev.payload;
     if (!payload || typeof payload.command !== "string") return;
@@ -522,7 +961,6 @@ export function startControlBridge(): void {
   });
 
   startTabReporter();
-  startCaptainsBootstrap();
 }
 
 /**
@@ -540,7 +978,7 @@ export function startControlBridge(): void {
  * snapshot. `captainsBootstrapping` is held true for the whole run so mid-loop
  * partial `sync_captains` forwards are suppressed (see {@link adoptCaptainsSync}).
  */
-export async function bootstrapCaptains(): Promise<void> {
+export async function bootstrapCaptains(): Promise<boolean> {
   captainsBootstrapping = true;
   try {
     const res = (await controlRequest("list_captains")) as {
@@ -572,17 +1010,38 @@ export async function bootstrapCaptains(): Promise<void> {
     const finalRes = missing.length
       ? ((await controlRequest("list_captains")) as typeof res)
       : res;
-    adoptCaptainsSnapshot(finalRes);
+    return adoptCaptainsSnapshot(finalRes, { authoritativeStartup: true });
   } catch {
     // Not under Tauri or the control channel is down - locally persisted
     // designations stand until a sync_captains forward arrives.
+    return false;
   } finally {
     captainsBootstrapping = false;
   }
 }
 
+/**
+ * Gate one Captain reconciliation attempt on an authoritative workspace
+ * bootstrap. This remains a small exported coordination seam so callers and
+ * tests cannot accidentally validate persisted Captain pins against stale
+ * local workspace tiles.
+ */
+export async function bootstrapCaptainsAfterWorkspace(
+  workspaceBootstrap: Promise<boolean>,
+): Promise<boolean> {
+  if (!(await workspaceBootstrap)) return false;
+  return bootstrapCaptains();
+}
+
 function startCaptainsBootstrap(): void {
-  void bootstrapCaptains();
+  const reconcile = (): void => {
+    void bootstrapCaptains().then((authoritative) => {
+      if (!authoritative) {
+        window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
+      }
+    });
+  };
+  reconcile();
 }
 
 /** Test-only: reset the captains reconciliation singletons between cases (this
@@ -602,14 +1061,21 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
  * Up-sync USER-originated workspace-tab changes to the core's AUTHORITATIVE tab
  * registry (TASK C / #22, headless-org) whenever the layout or active tab
  * changes. Reports are SERIALIZED (at most one in flight; trailing changes
- * coalesce into one follow-up) and carry `baseSeq`; on a stale rejection the
- * returned authoritative snapshot is adopted - the rare concurrent local change
- * loses to the server, by design. Failures (e.g. not under Tauri) are swallowed.
+ * coalesce into one follow-up) and carry `baseSeq`. Failures (e.g. not under
+ * Tauri) are swallowed.
  */
 function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
+  const startupLocal = workspaceRegistrySnapshot();
+  const acknowledgedStartup = loadAcknowledgedWorkspaceSnapshot();
+  const startupDeltas: StartupWorkspaceDelta[] = [
+    {
+      baselineTabs: acknowledgedStartup?.tabs ?? startupLocal.tabs,
+      localTabs: startupLocal.tabs,
+    },
+  ];
 
   const report = (): void => {
     if (adoptingRegistry) return; // never echo a server-applied snapshot back up
@@ -622,11 +1088,16 @@ function startTabReporter(): void {
       return;
     }
     inFlight = true;
+    pending = false;
     const { tabs, activeTabId } = useWorkspace.getState();
     const payload = tabReports(tabs);
     void import("./client")
-      .then((m) => m.reportWorkspaceTabs(payload, activeTabId, lastSeq))
-      .then((res: TabReportResult | void) => {
+      .then(async (m) => {
+        const res: TabReportResult | void = await m.reportWorkspaceTabs(
+          payload,
+          activeTabId,
+          lastSeq,
+        );
         if (res?.error) {
           throw new Error(res.error);
         }
@@ -634,10 +1105,42 @@ function startTabReporter(): void {
         if (res && typeof res.seq === "number") {
           lastSeq = res.seq;
           if (res.stale && Array.isArray(res.tabs)) {
-            // A server mutation raced this report: converge on the registry.
-            adoptAuthoritativeTabs(res.tabs);
+            let rebasedTabs: TabReport[] = [];
+            await reconcileAndAdoptAuthoritativeTabs(
+              res.tabs,
+              res.seq,
+              (tabs, _seq, liveTerminalIds) => {
+                rebasedTabs = rebaseStartupWorkspaceDeltas(
+                  tabs,
+                  startupDeltas,
+                  liveTerminalIds,
+                );
+                return rebasedTabs;
+              },
+              m.listTerminals,
+            );
+            if (startupDeltas.length > 0) {
+              startupDeltas.push({
+                baselineTabs: rebasedTabs,
+                localTabs: rebasedTabs,
+              });
+              pending = true;
+            }
+          } else {
+            persistAcknowledgedWorkspaceSnapshot(payload, res.seq);
+            if (startupDeltas.length > 0) {
+              const currentTabs = workspaceRegistrySnapshot().tabs;
+              startupDeltas.length = 0;
+              if (pending) {
+                startupDeltas.push({
+                  baselineTabs: payload,
+                  localTabs: currentTabs,
+                });
+              }
+            }
           }
         }
+        return res;
       })
       .catch((error) => {
         // Keep the local layout usable, but make a real Tauri failure visible.
@@ -656,15 +1159,42 @@ function startTabReporter(): void {
   // mirrors the active tab for default spawn placement + focus proofs).
   useWorkspace.subscribe((state, prev) => {
     if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId) {
+      if (startupDeltas.length > 0 && !adoptingRegistry) {
+        startupDeltas[startupDeltas.length - 1].localTabs =
+          workspaceRegistrySnapshot().tabs;
+      }
       report();
     }
   });
   // Read the authoritative registry before the first report so a cold webview
   // cannot overwrite server-side workspaces with its boot-time local snapshot.
-  void bootstrapWorkspaceTabs().finally(() => {
-    bootstrapping = false;
-    report();
-  });
+  // An indeterminate WSL/control result is not authority: keep reports gated and
+  // retry until startup reconciliation succeeds. Captain adoption starts only
+  // after that same workspace boundary, so a persisted pin cannot validate
+  // itself against a stale local tab during a race.
+  const reconcile = (): void => {
+    void bootstrapWorkspaceTabs((tabs, _seq, liveTerminalIds) => {
+      return rebaseStartupWorkspaceDeltas(
+        tabs,
+        startupDeltas,
+        liveTerminalIds,
+      );
+    }).then((authoritative) => {
+      if (!authoritative) {
+        window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
+        return;
+      }
+      const reconciledTabs = workspaceRegistrySnapshot().tabs;
+      startupDeltas.push({
+        baselineTabs: reconciledTabs,
+        localTabs: reconciledTabs,
+      });
+      bootstrapping = false;
+      report();
+      startCaptainsBootstrap();
+    });
+  };
+  reconcile();
 }
 
 // Run the subscription on import (side-effect module, mirroring themeBootstrap).

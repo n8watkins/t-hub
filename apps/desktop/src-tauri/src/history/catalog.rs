@@ -18,7 +18,12 @@ const HISTORY_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_RESULT_LIMIT: usize = 100;
 pub const HISTORY_ENTRY_LIMIT: usize = 500;
 pub const HISTORY_SOURCE_LIMIT: usize = 32;
-const MAX_FILES_PER_SOURCE: usize = 4_096;
+// The catalog returns at most 500 rows across both providers. Reading thousands
+// of 128 KiB transcript windows through the packaged Windows-to-WSL UNC bridge
+// can monopolize WSL for minutes and starve startup ownership checks. A fair 256
+// candidates per provider still supplies 512 rows before the result cap while
+// preserving quiet-project sampling and reporting source truncation explicitly.
+const MAX_FILES_PER_SOURCE: usize = 256;
 const MAX_FILES_PER_GROUP: usize = 128;
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_CANDIDATES_PER_DIRECTORY: usize = 256;

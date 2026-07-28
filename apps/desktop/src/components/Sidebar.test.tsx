@@ -5,7 +5,7 @@
 // the workspaces list, the terminal pool behind the captain rows) are stubbed
 // - this suite pins the SECTION layout, not their internals.
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 
 vi.mock("./HistoryList", () => ({
   HistoryList: () => <div data-testid="history-list" />,
@@ -37,7 +37,11 @@ vi.mock("./TerminalPool", () => ({
 
 import { Sidebar, RECENT_BODY_MAX_PX, RECENT_ROW_APPROX_PX } from "./Sidebar";
 import { useCaptain } from "../store/captain";
-import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import {
+  CAPTAINS_TAB_ID,
+  useWorkspace,
+  type WorkspaceTab,
+} from "../store/workspace";
 import type { TerminalInfo } from "../ipc/types";
 
 function term(id: string): TerminalInfo {
@@ -110,5 +114,59 @@ describe("Sidebar History cap", () => {
     expect(capped!.className).toContain("overflow-y-auto");
     // The capped wrapper is the one holding the History list body.
     expect(capped!.querySelector('[data-testid="history-list"]')).toBeTruthy();
+  });
+
+  it("keeps History outside the independently scrolling workspace list", () => {
+    useWorkspace.setState({
+      tabs: [
+        { id: "t1", name: "Workspace 1", order: ["cap00001"] },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          id: `empty-${index}`,
+          name: `Empty ${index}`,
+          order: [],
+        })),
+      ],
+    });
+    const { getByTestId } = render(<Sidebar mode="full" />);
+    const workspaces = getByTestId("workspaces-list");
+    const history = getByTestId("history-list");
+    const workspaceSection = workspaces.closest("section");
+    const historySection = history.closest("section");
+
+    expect(workspaceSection?.className).toContain("flex-1");
+    expect(workspaceSection?.className).toContain("min-h-0");
+    expect(workspaces.parentElement?.className).toContain("overflow-y-auto");
+    expect(historySection?.className).toContain("shrink-0");
+    expect(workspaces.parentElement?.contains(history)).toBe(false);
+  });
+});
+
+describe("Sidebar empty-workspace cleanup", () => {
+  it("offers one safe bulk action and preserves the live workspace", () => {
+    useWorkspace.setState({
+      tabs: [
+        { id: "live", name: "Live", order: ["cap00001"] },
+        { id: "empty-1", name: "Empty 1", order: [] },
+        { id: "empty-2", name: "Empty 2", order: [] },
+        {
+          id: CAPTAINS_TAB_ID,
+          name: "Captain Workspace",
+          kind: "captain",
+          order: [],
+        },
+      ],
+      activeTabId: "live",
+      focusedId: "cap00001",
+    });
+    const { getByRole } = render(<Sidebar mode="full" />);
+
+    fireEvent.click(
+      getByRole("button", { name: "Close 2 empty workspaces" }),
+    );
+
+    expect(useWorkspace.getState().tabs.map((tab) => tab.id)).toEqual([
+      "live",
+      CAPTAINS_TAB_ID,
+    ]);
   });
 });

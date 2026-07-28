@@ -50,7 +50,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// History:
 ///   - `1` — initial 0.5 contract: registry/metrics/git/journal/hook + status.
-pub const PROTOCOL_VERSION: u32 = 2;
+///   - `2` - journal frames carry exact replay provenance.
+///   - `3` - replay scans expose an explicit durable cursor boundary.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Logical channel a [`Frame`] travels on. The single stdio pipe is multiplexed
 /// by this tag so the transport can prioritize control/metrics over bulk reads
@@ -267,8 +269,11 @@ pub enum AgentToCore {
         entry: EventJournalEntry,
         replayed: bool,
     },
+    /// The durable cursor reached by a replay scan. This may advance beyond the
+    /// last emitted journal entry when compaction dropped trailing status data.
+    ReplayBoundary { last_seq: u64 },
     /// Marks the end of a [`CoreToAgent::ReplayJournal`] batch; `last_seq` is the
-    /// highest sequence replayed (so the core can advance its cursor).
+    /// durable replay boundary reported immediately beforehand.
     ReplayComplete { last_seq: u64 },
     /// Out-of-band agent-level error not tied to a specific request.
     Error { message: String },
@@ -857,6 +862,20 @@ mod tests {
                 assert_eq!(entry.payload["cwd"], "/home/u/proj");
             }
             other => panic!("expected Journal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_boundary_roundtrips() {
+        let frame = AgentFrame {
+            channel: Channel::Events,
+            msg: AgentToCore::ReplayBoundary { last_seq: 42 },
+        };
+        let line = encode_agent(&frame).unwrap();
+        let back = decode_agent(&line).unwrap();
+        match back.msg {
+            AgentToCore::ReplayBoundary { last_seq } => assert_eq!(last_seq, 42),
+            other => panic!("expected ReplayBoundary, got {other:?}"),
         }
     }
 

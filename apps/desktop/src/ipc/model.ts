@@ -128,6 +128,62 @@ export interface InstallReport {
   message: string;
 }
 
+// --- Codex native lifecycle hooks (src/codex/hooks_install.rs) -------------
+
+/** Health state for T-Hub's user-level Codex lifecycle hook producer. */
+export type CodexHookStatus =
+  | "notInstalled"
+  | "needsReview"
+  | "healthy"
+  | "disabled"
+  | "modified"
+  | "drifted"
+  | "blockedByManagedPolicy";
+
+/** How each Codex lifecycle outcome reaches T-Hub. */
+export interface CodexHookCapabilities {
+  sessionStart: string;
+  userPrompt: string;
+  permission: string;
+  completion: string;
+  sessionEnd: string;
+  question: string;
+  failure: string;
+}
+
+/** Read-only Codex hook, policy, executable, and trust health. */
+export interface CodexHooksHealth {
+  status: CodexHookStatus;
+  hooksPath: string;
+  configPath: string;
+  requirementsPath: string;
+  managedEvents: string[];
+  missingEvents: string[];
+  executablePath: string;
+  executableOk: boolean;
+  /** True when the installed helper advertises native Codex hook support. */
+  agentCapable: boolean;
+  /** Helper version from its machine-readable capability report, when valid. */
+  agentVersion: string | null;
+  /** Effective Codex `[features].hooks` state after managed/local precedence. */
+  hooksEnabled: boolean;
+  inlineUserHooksPresent: boolean;
+  projectHooksPresent: boolean;
+  pluginConfigPresent: boolean;
+  managedHooksPresent: boolean;
+  managedOnlyPolicy: boolean;
+  capabilities: CodexHookCapabilities;
+}
+
+/** Result of installing, repairing, or uninstalling T-Hub's Codex hooks. */
+export interface CodexHooksInstallReport {
+  hooksPath: string;
+  changed: boolean;
+  backedUp: boolean;
+  managedEvents: number;
+  health: CodexHooksHealth;
+}
+
 // --- Status bridge snapshot (src/claude/status.rs) -------------------------
 
 /** One rate-limit window from the statusline `rate_limits` block. */

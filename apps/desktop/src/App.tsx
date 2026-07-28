@@ -20,6 +20,7 @@ import { controlRequest } from "./ipc/controlClient";
 import {
   createCortanaRecoveryOperation,
   cortanaFailureMessage,
+  isAmbiguousCortanaFailure,
 } from "./lib/cortanaStartup";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
@@ -259,7 +260,13 @@ export default function App() {
         }
       },
       onError: (error) => {
+        const stillRunning = isAmbiguousCortanaFailure(error);
         cortanaRecoveryOperation.failure(error);
+        if (stillRunning) {
+          console.warn("Cortana recovery is still running", error);
+          setCortanaRecoveryError(null);
+          return;
+        }
         console.error("Cortana recovery failed", error);
         setCortanaRecoveryError(cortanaFailureMessage(error));
       },

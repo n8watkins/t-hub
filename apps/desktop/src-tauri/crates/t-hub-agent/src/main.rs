@@ -2,11 +2,13 @@
 
 //! `t-hub-agent` — the WSL-side control agent (PLAN.md Workstream A).
 //!
-//! Launched by the T-Hub core as:
+//! Packaged Windows builds deploy and verify this exact helper at
+//! `~/.local/bin/t-hub-agent` in the configured WSL distro, then launch it as:
 //! ```text
-//! wsl.exe -d <distro> -- t-hub-agent --stdio
+//! wsl.exe -d <distro> --cd ~ -e bash -lc \
+//!     "exec $HOME/.local/bin/t-hub-agent --stdio"
 //! ```
-//! or directly on a unix dev box (`t-hub-agent --stdio`). It speaks the
+//! The developer override and unix dev path launch it directly. It speaks the
 //! versioned NDJSON protocol from `t-hub-protocol` over **stdin/stdout**
 //! (stderr is reserved for human-readable diagnostics so it never corrupts the
 //! frame stream).
@@ -17,9 +19,11 @@
 //!   Windows app closing, replayed to the core on connect.
 //! - Serve control RPCs: tmux/session registry ([`registry`]), host metrics +
 //!   git/worktree queries ([`host`]).
-//! - Ingest the Claude hook → journal spine: `--hook <EVENT>` mode reads the
-//!   hook's JSON from stdin, appends a durable journal entry, and exits 0 so
-//!   Claude's turn is never blocked ([`hook`]).
+//! - Ingest provider lifecycle evidence into the journal. `--hook <EVENT>`
+//!   handles Claude hooks, while `--codex-hook <EVENT>` and `--codex-tap`
+//!   handle native interactive hooks and structured headless Codex events.
+//!   Short-lived hook handlers exit 0 so a provider turn is never blocked
+//!   ([`hook`], [`codex`]).
 //! - Ingest Claude's **statusline** JSON: `--statusline` mode reads the
 //!   statusline payload from stdin, appends a durable `StatusSnapshot` journal
 //!   entry, prints a one-line readout to stdout (so it's a valid statusline
@@ -66,6 +70,8 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 /// - `--codex-hook <EVENT>` Native Codex hook ingest with an explicit provider
 ///                          boundary, including payloads such as `SessionEnd`
 ///                          that do not carry provider-distinguishing fields.
+/// - `--capabilities-json` Print a machine-readable compatibility contract for
+///                         launchers and hook installers, then exit.
 /// - `--codex-unobserved` Record one credential-safe degraded marker for an
 ///                        interactive Codex TUI in its exact owning tmux pane
 ///                        when structured telemetry is unavailable.
@@ -98,6 +104,9 @@ enum Mode {
     CodexHook {
         event: String,
     },
+    /// Machine-readable compatibility contract for callers that must verify
+    /// optional agent behavior before installing a command that depends on it.
+    Capabilities,
     /// Explicit degraded marker for an interactive Codex TUI without lifecycle
     /// telemetry, bound to its exact owning tmux pane.
     CodexUnobserved,
@@ -132,6 +141,7 @@ fn parse_args() -> Args {
                     std::process::exit(1);
                 }
             },
+            "--capabilities-json" => mode = Mode::Capabilities,
             "--codex-unobserved" => mode = Mode::CodexUnobserved,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
@@ -199,6 +209,25 @@ fn main() {
                 eprintln!("t-hub-agent --codex-hook {event}: unexpected error: {error:#}");
             }
             // Observation hooks must never block Codex.
+            std::process::exit(0);
+        }
+
+        // ------------------------------------------------------------------
+        // --capabilities-json: short-lived machine-readable compatibility
+        // contract. It must not touch the journal or depend on runtime state.
+        // ------------------------------------------------------------------
+        Mode::Capabilities => {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "schemaVersion": 1,
+                    "agentVersion": env!("CARGO_PKG_VERSION"),
+                    "capabilities": [
+                        "codex-native-hooks-v1",
+                    ],
+                }))
+                .expect("static capability contract is serializable")
+            );
             std::process::exit(0);
         }
 

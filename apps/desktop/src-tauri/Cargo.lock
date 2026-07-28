@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "t-hub"
-version = "0.3.135"
+version = "0.3.140"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -4234,7 +4234,7 @@ dependencies = [
 
 [[package]]
 name = "t-hub-agent"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

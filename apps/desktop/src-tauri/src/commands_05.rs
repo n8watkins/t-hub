@@ -139,13 +139,16 @@ pub async fn ingest_status(
 /// MUST be true (collected explicitly in the UI) or this refuses.
 #[tauri::command]
 pub async fn install_claude_hooks(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
     events: Vec<String>,
 ) -> Result<crate::claude::InstallReport, String> {
     // `events` is the user's selection; an empty vec means "all" (handled in the
     // installer). The managed set is reconciled to exactly this selection.
-    crate::claude::install::install_hooks_events(&agent_bin, consent, &events)
+    let packaged_agent = ensure_packaged_hook_helper(&state)?;
+    let agent_bin = packaged_agent.as_deref().unwrap_or(&agent_bin);
+    crate::claude::install::install_hooks_events(agent_bin, consent, &events)
         .map_err(|e| e.to_string())
 }
 
@@ -169,71 +172,76 @@ pub async fn claude_hooks_managed() -> Result<Vec<String>, String> {
 
 // --- Codex native lifecycle hook installer ---
 
+fn ensure_packaged_hook_helper(state: &AppState) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        state
+            .agent
+            .deploy_packaged_agent(&crate::default_distro())
+            .map(|deployed| Some(deployed.wsl_path))
+            .map_err(|error| {
+                format!(
+                    "bundled WSL helper deployment failed; refusing hook operation with an \
+                     unverified helper: {error}"
+                )
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Ok(None)
+    }
+}
+
 #[tauri::command]
 pub async fn install_codex_hooks(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
-    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+    let packaged_agent = ensure_packaged_hook_helper(&state)?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin, packaged_agent.as_deref())
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::install(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-        consent,
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::install_runtime(&paths, consent).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn repair_codex_hooks(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
-    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+    let packaged_agent = ensure_packaged_hook_helper(&state)?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin, packaged_agent.as_deref())
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::repair(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-        consent,
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::repair_runtime(&paths, consent).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn uninstall_codex_hooks(
     agent_bin: String,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
-    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+    let paths = crate::codex::hooks_install::runtime_paths_for_uninstall(&agent_bin)
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::uninstall(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::uninstall_runtime(&paths).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn codex_hooks_health(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     project_root: Option<String>,
 ) -> Result<crate::codex::hooks_install::ProducerHealth, String> {
-    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+    let packaged_agent = ensure_packaged_hook_helper(&state)?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin, packaged_agent.as_deref())
         .map_err(|error| error.to_string())?;
     let project_root = project_root
         .as_deref()
         .map(crate::codex::hooks_install::host_project_path)
         .transpose()
         .map_err(|error| error.to_string())?;
-    crate::codex::hooks_install::health_at_with_project(
-        &paths.codex_home,
-        &paths.requirements_path,
-        &paths.agent_bin,
-        project_root.as_deref(),
-    )
-    .map_err(|error| error.to_string())
+    crate::codex::hooks_install::health_runtime(&paths, project_root.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 // --- item-3 Pillar C: the BLOCKING PreToolUse gate - a DISTINCT opt-in (HIGH-1) ---
@@ -246,10 +254,13 @@ pub async fn codex_hooks_health(
 /// DISTINCT UI opt-in that names the blocking behavior) or this refuses.
 #[tauri::command]
 pub async fn install_claude_gate(
+    state: tauri::State<'_, AppState>,
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::claude::InstallReport, String> {
-    crate::claude::install::install_gate(&agent_bin, consent).map_err(|e| e.to_string())
+    let packaged_agent = ensure_packaged_hook_helper(&state)?;
+    let agent_bin = packaged_agent.as_deref().unwrap_or(&agent_bin);
+    crate::claude::install::install_gate(agent_bin, consent).map_err(|e| e.to_string())
 }
 
 /// Remove ONLY the blocking gate (its distinct opt-out), leaving observe hooks intact.

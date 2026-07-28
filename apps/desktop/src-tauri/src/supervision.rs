@@ -515,6 +515,17 @@ impl Supervisor {
                 }
             }
 
+            JournalEventType::CoreAction
+                if payload
+                    .and_then(|value| value.get("lifecycle"))
+                    .and_then(Value::as_str)
+                    == Some("question_resolved")
+                    && entry.status == SessionStatus::NeedsQuestion
+                    && !entry.main_stopped =>
+            {
+                entry.status = SessionStatus::Working;
+            }
+
             JournalEventType::Notification => match notification_type {
                 // Informational pings - NOT needs-input. `idle_prompt` is the 60s
                 // "Claude is waiting for your input" idle ping (~88% of real
@@ -1152,6 +1163,42 @@ mod tests {
             3,
         );
         assert_eq!(s.status("o1"), SessionStatus::NeedsPermission);
+    }
+
+    #[test]
+    fn question_resolution_returns_the_session_to_working() {
+        let mut s = sup();
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::Elicitation,
+            2,
+        );
+        assert_eq!(s.status("o1"), SessionStatus::NeedsQuestion);
+
+        s.ingest_with_payload(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::CoreAction,
+            3,
+            Some(&serde_json::json!({
+                "lifecycle": "question_resolved",
+                "question_request_id": "question-1"
+            })),
+        );
+        assert_eq!(s.status("o1"), SessionStatus::Working);
     }
 
     // --- Notification hook discrimination (voice-cue-gate) -------------------

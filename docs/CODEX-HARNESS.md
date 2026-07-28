@@ -80,11 +80,21 @@ agent session's T-Hub control capability and durable assignment.
 Missing, stale, conflicting, wrong-provider, wrapper-obscured, unreadable, or
 changed launch evidence fails closed and transactionally rolls back only the
 newly owned terminal and session binding.
-Before `exec` of today's unmirrored interactive Codex TUI, the owning pane invokes `t-hub-agent --codex-unobserved` so runtime health is visibly degraded, transport is unavailable, and status is unknown instead of falsely Working.
+Before `exec` of an interactive Codex TUI, the owning pane invokes `t-hub-agent --codex-unobserved` as the conservative baseline so runtime health is visibly degraded, transport is unavailable, and status is unknown instead of falsely Working.
 Failure to establish that degraded marker prevents Codex launch.
-A future provider-native hook or trusted app-server mirror remains the structured telemetry path, and any later permission posture that is missing, unobserved, or changed must fail closed or remain visibly degraded until authoritative evidence restores confidence.
+Consent-installed native Codex hooks can then provide structured session, prompt, permission, question, completion, and session-end lifecycle evidence.
+Exact interactive failure and context telemetry still require a trusted structured event source, and any later permission posture that is missing, unobserved, or changed must fail closed or remain visibly degraded until authoritative evidence restores confidence.
 Harness bypass is not T-Hub control authority, durable assignment authority,
 or General authority.
+
+## Lifecycle hooks
+
+Settings owns consent-gated install, health, repair, and uninstall actions for T-Hub entries in `$CODEX_HOME/hooks.json`.
+On packaged Windows builds, health checks, installation, and repair first deploy and digest-verify the exact bundled `t-hub-agent` described in [SESSION_AWARENESS.md](./SESSION_AWARENESS.md); failure leaves the hook operation closed.
+Uninstall remains available without that helper so stale managed entries can always be removed.
+The installer also requires the deployed helper to advertise native Codex-hook capability, preserves unrelated user, project, plugin, and centrally managed hook configuration, and never fabricates Codex trust approval.
+Codex hook enablement remains controlled by its feature configuration, while command trust and per-handler enablement remain reviewable through Codex's own `/hooks` surface.
+The managed `PreToolUse` and `PostToolUse` handlers match only `request_user_input`; prompt, question, option, and response content is not persisted, and hook-supplied transcript and working-directory paths are ignored.
 
 ## Provisioning
 

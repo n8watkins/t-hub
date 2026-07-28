@@ -54,7 +54,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use parking_lot::Mutex;
@@ -533,6 +533,18 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(8);
 /// Flush a pending batch the moment it reaches this many DECODED bytes, so a
 /// firehose stays responsive (and memory bounded) even within one window.
 const MAX_BATCH_BYTES: usize = 256 * 1024;
+/// Reservation period for terminal-output events across the whole process.
+///
+/// `AppHandle::emit` queues work onto the Windows host event loop without
+/// backpressure. A continuous PTY firehose could therefore enqueue roughly 100
+/// quarter-megabyte events per second, starving the window pump for 5-20 seconds
+/// even though each reader already coalesced its own socket frames. Reserving one
+/// process-wide slot every 20 ms keeps the host below that measured saturation
+/// point and naturally backpressures the reader sockets. The first event after an
+/// idle period remains immediate, so normal typing does not inherit a fixed delay.
+const OUTPUT_EMIT_PERIOD: Duration = Duration::from_millis(20);
+static NEXT_OUTPUT_EMIT: std::sync::LazyLock<StdMutex<Instant>> =
+    std::sync::LazyLock::new(|| StdMutex::new(Instant::now()));
 /// Raw socket read size. A single read can carry several NDJSON frames, which the
 /// loop parses out of its own accumulation buffer.
 const RECV_BUF: usize = 16 * 1024;
@@ -609,6 +621,24 @@ fn emit_batch(authority: &GenerationAuthority, batch: &mut Vec<u8>) {
     authority.dispatch(ReaderEvent::Output(std::mem::take(batch)));
 }
 
+fn reserve_output_emit_delay(now: Instant, next_slot: &mut Instant, period: Duration) -> Duration {
+    let slot = (*next_slot).max(now);
+    *next_slot = slot + period;
+    slot.saturating_duration_since(now)
+}
+
+fn throttle_output_emit() {
+    let delay = {
+        let mut next_slot = NEXT_OUTPUT_EMIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reserve_output_emit_delay(Instant::now(), &mut next_slot, OUTPUT_EMIT_PERIOD)
+    };
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
 /// The attach stream ended — an explicit `{"exit"}` frame, or EOF/error on the
 /// socket. Neither PROVES the pane's process exited: the server-side attach
 /// client also exits on a detach (`tmux detach-client`), and the connection also
@@ -649,6 +679,7 @@ fn prepare_stream_end(id: &str, code: Option<i32>) -> PreparedStreamEnd {
 fn emit_reader_event(app: &AppHandle, id: &str, event: ReaderEvent) {
     match event {
         ReaderEvent::Output(bytes) => {
+            throttle_output_emit();
             let payload = OutputEvent {
                 id: id.to_string(),
                 base64: STANDARD.encode(bytes),
@@ -981,6 +1012,88 @@ mod tests {
         }
         assert_eq!(batch, b"foobar");
         assert_eq!(STANDARD.encode(&batch), STANDARD.encode(b"foobar"));
+    }
+
+    #[test]
+    fn output_emit_slot_calculation_preserves_an_immediate_idle_event() {
+        let start = Instant::now();
+        let mut next_slot = start;
+        assert_eq!(
+            reserve_output_emit_delay(start, &mut next_slot, OUTPUT_EMIT_PERIOD),
+            Duration::ZERO
+        );
+        assert_eq!(
+            reserve_output_emit_delay(start, &mut next_slot, OUTPUT_EMIT_PERIOD),
+            OUTPUT_EMIT_PERIOD
+        );
+        assert_eq!(
+            reserve_output_emit_delay(
+                start + OUTPUT_EMIT_PERIOD * 3,
+                &mut next_slot,
+                OUTPUT_EMIT_PERIOD,
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn sustained_output_is_process_throttled_and_post_idle_output_is_prompt() {
+        const READER_COUNT: usize = 4;
+        const EVENTS_PER_READER: usize = 4;
+        const EVENT_COUNT: usize = READER_COUNT * EVENTS_PER_READER;
+
+        {
+            let mut next_slot = NEXT_OUTPUT_EMIT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *next_slot = Instant::now();
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(READER_COUNT + 1));
+        let (timestamps_tx, timestamps_rx) = std::sync::mpsc::channel();
+        let readers = (0..READER_COUNT)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let timestamps_tx = timestamps_tx.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..EVENTS_PER_READER {
+                        throttle_output_emit();
+                        timestamps_tx.send(Instant::now()).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(timestamps_tx);
+
+        barrier.wait();
+        let mut timestamps = timestamps_rx.iter().collect::<Vec<_>>();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        timestamps.sort_unstable();
+
+        assert_eq!(timestamps.len(), EVENT_COUNT);
+        let flood_span = timestamps.last().unwrap().duration_since(timestamps[0]);
+        let minimum_span = OUTPUT_EMIT_PERIOD * (EVENT_COUNT as u32 - 2);
+        assert!(
+            flood_span >= minimum_span,
+            "{EVENT_COUNT} events escaped the process-wide throttle in {flood_span:?}"
+        );
+
+        std::thread::sleep(OUTPUT_EMIT_PERIOD * 2);
+        let idle_emit_started = Instant::now();
+        throttle_output_emit();
+        let idle_latency = idle_emit_started.elapsed();
+        assert!(
+            idle_latency < OUTPUT_EMIT_PERIOD,
+            "first post-idle event waited {idle_latency:?}"
+        );
+
+        println!(
+            "terminal output flood: {EVENT_COUNT} events from {READER_COUNT} readers spanned \
+             {flood_span:?}; first post-idle event returned in {idle_latency:?}"
+        );
     }
 
     #[test]

@@ -23,9 +23,9 @@ import type { TabReport, TerminalInfo, TerminalId, TerminalState } from "../../i
  *   - not closeable (closeTab/closeWorkspace refuse it).
  * Its `order` is the authoritative record of which tiles are placed as agents,
  * which is how placement survives a server registry sync. adoptRegistry consults
- * the captain registry ONLY as a liveness fallback (see {@link captainRegistryIds}),
- * via an accessor the captain store registers - so this store keeps NO static
- * dependency on the captain store.
+ * the authoritative Captain claims ONLY as a liveness fallback (see
+ * {@link SliceDeps.captainRegistryIds}), via an accessor the captain store
+ * registers - so this store keeps NO static dependency on the captain store.
  */
 export const CAPTAINS_TAB_ID = "captains-reserved";
 export const CAPTAINS_TAB_NAME = "Captain Workspace";
@@ -374,6 +374,10 @@ export interface WorkspaceState {
    *  immediately. PRESERVES sessions on switch (setActiveTab) and pop-out
    *  (popOutTab) — those never call this. No-op on the last tab (mirrors closeTab). */
   closeWorkspace: (id: string) => void;
+  /** Close every empty work workspace that can be removed while preserving at
+   *  least one work workspace. Never kills or detaches a terminal because only
+   *  tabs with an empty order qualify. Returns the closed tab IDs. */
+  closeEmptyWorkspaces: () => string[];
   /** Activate a tab (moves focus onto one of its tiles). */
   setActiveTab: (id: string) => void;
   /** Activate the tab at strip index `i` (0-based); no-op if out of range. */
@@ -470,8 +474,10 @@ export interface SliceDeps {
     id: TerminalId,
     killTerminal: (id: TerminalId) => Promise<void>,
   ) => Promise<void>;
-  /** A synchronous read of the authoritative AGENT id set (registered by captain.ts). */
+  /** Server-backed Captain/Cortana terminal IDs used as authoritative liveness. */
   captainRegistryIds: () => Iterable<TerminalId>;
+  /** Local presentation IDs protected during pre-registry recovery and workspace close. */
+  agentPresentationIds: () => Iterable<TerminalId>;
   /** The tab id this window was opened to render in isolation, or null (main window). */
   satelliteTab: string | null;
   /** In-flight recall guard (#7), keyed by sessionId. */

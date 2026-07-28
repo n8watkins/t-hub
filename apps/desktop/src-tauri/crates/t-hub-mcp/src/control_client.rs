@@ -29,11 +29,13 @@ use serde_json::Value;
 /// finish within this wall-clock budget.
 const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
+const CORTANA_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
-        "commission_captain" | "dispatch_crew" | "history_resume" | "reconcile_cortana"
-        | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
+        "reconcile_cortana" => CORTANA_RECONCILIATION_TIMEOUT,
+        "commission_captain" | "dispatch_crew" | "history_list" | "history_resume"
+        | "list_tabs" | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
 }
@@ -2082,6 +2084,37 @@ mod tests {
         Close,
     }
 
+    struct TestControlHandshake {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl TestControlHandshake {
+        fn new(addr: &str, token: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("t-hub-mcp-process-handshake-{}", new_request_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("control.json");
+            std::fs::write(
+                &file,
+                serde_json::to_vec(&serde_json::json!({
+                    "addr": addr,
+                    "token": token,
+                    "pid": std::process::id(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Self { dir, file }
+        }
+    }
+
+    impl Drop for TestControlHandshake {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// A fake control server that services a scripted SEQUENCE of connections. For
     /// each entry it accepts one connection, reads the one request line (captured
     /// for assertions), then either writes `Some(reply)` or, on `None`, drops the
@@ -2368,10 +2401,15 @@ mod tests {
     }
 
     fn run_mcp_spawn_process(addr: &str, token: &str) -> (std::process::Output, Duration) {
+        // Pin both initial discovery and transport-recovery discovery to this
+        // process-local server. Otherwise a WSL developer machine with the
+        // production app running can redirect the recovery leg to its live
+        // Windows control.json, making this process E2E test non-hermetic.
+        let handshake = TestControlHandshake::new(addr, token);
         let mut child = Command::new(mcp_binary())
             .env("T_HUB_CONTROL_ADDR", addr)
             .env("T_HUB_CONTROL_TOKEN", token)
-            .env_remove("T_HUB_CONTROL_FILE")
+            .env("T_HUB_CONTROL_FILE", &handshake.file)
             .env_remove("T_HUB_SESSION_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -3169,7 +3207,11 @@ mod tests {
         );
         assert_eq!(
             response_timeout_for_command("history_list"),
-            CONTROL_DEADLINE
+            LONG_ORCHESTRATION_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for_command("list_tabs"),
+            LONG_ORCHESTRATION_TIMEOUT
         );
         assert!(timeout_message("history_resume", 1, "read").contains("120s"));
         let pending = pending_request_message(
