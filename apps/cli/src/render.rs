@@ -452,7 +452,7 @@ pub fn worktrees(
             ),
             (
                 format!("th worktree new {repo_root} <branch>"),
-                "new worktree (recycles a reapable one first)",
+                "create a backend-guarded worktree",
             ),
         ],
     );
@@ -525,29 +525,13 @@ pub fn prune_plan(
         if dry_run { "." } else { " - executed above." },
     );
 
-    if dry_run && reaps > 0 {
-        next(
-            ui,
-            &[
-                (
-                    format!("th worktree prune {repo_root} --yes"),
-                    "execute this plan",
-                ),
-                (
-                    format!("th worktree ls {repo_root}"),
-                    "the full lifecycle table",
-                ),
-            ],
-        );
-    } else {
-        next(
-            ui,
-            &[(
-                format!("th worktree ls {repo_root}"),
-                "the full lifecycle table",
-            )],
-        );
-    }
+    next(
+        ui,
+        &[(
+            format!("th worktree ls {repo_root}"),
+            "the full lifecycle table",
+        )],
+    );
 }
 
 /// `th tabs`.
