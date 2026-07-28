@@ -346,20 +346,8 @@ fn wsl_home(distro: &str) -> Result<String> {
 
 #[cfg(windows)]
 fn verify_wsl_agent_bin(distro: &str, agent_bin: &str) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-
     validate_canonical_absolute_posix(agent_bin)?;
-    let mut command = std::process::Command::new("wsl.exe");
-    command
-        .arg("-d")
-        .arg(distro)
-        .arg("--")
-        .arg("bash")
-        .arg("-c")
-        .arg("test -x \"$1\"")
-        .arg("t-hub-agent")
-        .arg(agent_bin)
-        .creation_flags(0x0800_0000);
+    let command = crate::wsl::executable_probe_command(distro, agent_bin);
     let output =
         crate::bounded_exec::output_with_timeout(command, crate::bounded_exec::WSL_PROBE_TIMEOUT)
             .context(format!(

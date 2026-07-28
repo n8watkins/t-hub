@@ -58,6 +58,8 @@ mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
 mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS proxy (no browser Origin)
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
+#[cfg(any(windows, test))]
+mod wsl; // Shared Windows-to-WSL command construction.
 
 use agent::AgentBridge;
 use claude::StatusBridge;

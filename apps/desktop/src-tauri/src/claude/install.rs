@@ -318,23 +318,10 @@ fn validate_absolute_wsl_agent_bin(path: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn resolve_agent_bin(passed: &str) -> Result<String> {
-    use std::os::windows::process::CommandExt;
     let distro = wsl_distro();
     if passed.starts_with('/') {
         validate_absolute_wsl_agent_bin(passed)?;
-        let mut exact = std::process::Command::new("wsl.exe");
-        exact
-            .args([
-                "-d",
-                &distro,
-                "--",
-                "bash",
-                "-c",
-                "test -x \"$1\"",
-                "t-hub-agent",
-                passed,
-            ])
-            .creation_flags(0x0800_0000);
+        let exact = crate::wsl::executable_probe_command(&distro, passed);
         let output =
             crate::bounded_exec::output_with_timeout(exact, crate::bounded_exec::WSL_PROBE_TIMEOUT)
                 .context("verifying the exact packaged t-hub-agent path in WSL")?;
@@ -346,6 +333,7 @@ fn resolve_agent_bin(passed: &str) -> Result<String> {
         }
         return Ok(passed.to_string());
     }
+    use std::os::windows::process::CommandExt;
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["-d", &distro, "--", "bash", "-lc", "command -v t-hub-agent"])
         .creation_flags(0x0800_0000);
