@@ -445,6 +445,39 @@ describe("workspace registry bootstrap", () => {
     expect(useWorkspace.getState().registryAdopted).toBe(false);
   });
 
+  it("bounds startup reconciliation during continuous terminal churn", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-existing"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 4,
+      activeTabId: "work-1",
+      tabs: [
+        {
+          id: "work-1",
+          name: "Workspace 1",
+          kind: "work",
+          tileIds: ["term-existing"],
+        },
+        { id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] },
+      ],
+    });
+    let inventoryCalls = 0;
+    invoke.mockImplementation(async (command: string) => {
+      if (command !== "list_terminals") {
+        throw new Error(`unexpected invoke: ${command}`);
+      }
+      inventoryCalls += 1;
+      return [{ id: `term-${inventoryCalls}` }];
+    });
+
+    await expect(bootstrapWorkspaceTabs()).resolves.toBe(false);
+
+    expect(inventoryCalls).toBe(3);
+    expect(useWorkspace.getState().registryAdopted).toBe(false);
+  });
+
   it("preserves a terminal registered after the startup inventory snapshot", async () => {
     seed([
       { id: "work-1", name: "Workspace 1", order: ["term-existing"] },

@@ -2986,6 +2986,31 @@ fn report_workspace_tabs_replaces_the_registry() {
 }
 
 #[test]
+fn terminal_inventory_prunes_only_the_registry_revision_it_observed() {
+    let tabs = TabRegistry::new();
+    tabs.replace(vec![TabRecord {
+        id: "work".into(),
+        name: "Workspace".into(),
+        tile_ids: vec!["live".into(), "gone".into()],
+    }]);
+    let observed_seq = tabs.snapshot_full().seq;
+    let live = std::collections::HashSet::from(["live".to_string()]);
+
+    let pruned = tabs
+        .prune_gone_tiles_if_seq(observed_seq, &live)
+        .expect("unchanged registry should converge to terminal inventory");
+    assert_eq!(pruned.tabs[0].tile_ids, vec!["live"]);
+
+    tabs.replace(vec![TabRecord {
+        id: "work".into(),
+        name: "Workspace".into(),
+        tile_ids: vec!["live".into(), "new".into()],
+    }]);
+    assert!(tabs.prune_gone_tiles_if_seq(pruned.seq, &live).is_none());
+    assert_eq!(tabs.snapshot()[0].tile_ids, vec!["live", "new"]);
+}
+
+#[test]
 fn create_worktree_named_placement_reuses_a_tab_by_name() {
     // TASK C: a create_worktree with a tabName that already exists resolves to
     // the SAME tab id (no duplicate), and the forward carries that id so the

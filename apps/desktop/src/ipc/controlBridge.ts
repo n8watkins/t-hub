@@ -453,11 +453,18 @@ function terminalInventoryFingerprint(terminals: Array<{ id: string }>): string 
     .join("\0");
 }
 
+const TERMINAL_INVENTORY_STABILITY_ATTEMPTS = 3;
+const TERMINAL_ADOPTION_ATTEMPTS = 3;
+
 async function stableLiveTerminalIds(
   listTerminals: () => Promise<Array<{ id: string }>>,
-): Promise<Set<string>> {
+): Promise<Set<string> | undefined> {
   let previousFingerprint: string | undefined;
-  for (;;) {
+  for (
+    let attempt = 0;
+    attempt < TERMINAL_INVENTORY_STABILITY_ATTEMPTS;
+    attempt += 1
+  ) {
     const terminals = await listTerminals();
     const fingerprint = terminalInventoryFingerprint(terminals);
     if (fingerprint === previousFingerprint) {
@@ -465,6 +472,7 @@ async function stableLiveTerminalIds(
     }
     previousFingerprint = fingerprint;
   }
+  return undefined;
 }
 
 function sameTerminalIds(
@@ -488,17 +496,20 @@ async function reconcileAndAdoptAuthoritativeTabs(
   listTerminals: () => Promise<Array<{ id: string }>>,
 ): Promise<boolean> {
   let liveTerminalIds = await stableLiveTerminalIds(listTerminals);
-  for (;;) {
+  if (!liveTerminalIds) return false;
+  for (let attempt = 0; attempt < TERMINAL_ADOPTION_ATTEMPTS; attempt += 1) {
     if (!adoptAuthoritativeTabs(reconcileTabs(tabs, seq, liveTerminalIds))) {
       return false;
     }
     const verifiedLiveTerminalIds =
       await stableLiveTerminalIds(listTerminals);
+    if (!verifiedLiveTerminalIds) return false;
     if (sameTerminalIds(liveTerminalIds, verifiedLiveTerminalIds)) {
       return true;
     }
     liveTerminalIds = verifiedLiveTerminalIds;
   }
+  return false;
 }
 
 /**
@@ -577,6 +588,7 @@ export async function bootstrapWorkspaceTabs(
         repairedLocal = useWorkspace.getState();
       }
       const repairLiveTerminalIds = await stableLiveTerminalIds(listTerminals);
+      if (!repairLiveTerminalIds) return false;
       const repairTabs = reconcileWithTerminalInventory(
         tabReports(repairedLocal.tabs).map((tab) => ({
           ...tab,

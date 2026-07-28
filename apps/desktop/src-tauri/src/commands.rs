@@ -717,6 +717,23 @@ pub(crate) fn forward_captains_sync(
     fanout.emit_event(crate::control::APPLY_EVENT_CHANNEL, &payload);
 }
 
+fn forward_tabs_sync(
+    app: &tauri::AppHandle,
+    snapshot: &crate::control::RegistrySnapshot,
+    fanout: &crate::control::EventFanout,
+) {
+    let sync = match serde_json::to_value(snapshot) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("t-hub: workspace snapshot serialize failed: {error}");
+            return;
+        }
+    };
+    let payload = serde_json::json!({ "command": "sync_tabs", "args": { "sync": sync } });
+    let _ = app.emit(crate::control::APPLY_EVENT_CHANNEL, &payload);
+    fanout.emit_event(crate::control::APPLY_EVENT_CHANNEL, &payload);
+}
+
 #[tauri::command]
 pub async fn kill_terminal(
     app: tauri::AppHandle,
@@ -771,7 +788,10 @@ pub async fn kill_terminal(
 pub async fn list_terminals(
     app: tauri::AppHandle,
     remote: tauri::State<'_, RemotePtyManager>,
+    registry: tauri::State<'_, std::sync::Arc<crate::control::TabRegistry>>,
+    fanout: tauri::State<'_, std::sync::Arc<crate::control::EventFanout>>,
 ) -> Result<Vec<TerminalInfo>, String> {
+    let registry_seq = registry.snapshot_full().seq;
     // Snapshot what the reconciliation needs from the in-memory map BEFORE we
     // hop to a blocking thread: a `tmux_session -> canonical id` map. The closure
     // is `'static`, so it can't borrow `&State`; this owned snapshot is all the
@@ -917,6 +937,16 @@ pub async fn list_terminals(
         // (no-ops on a dropped connection), so it can't block or double-free. We
         // never touch tmux here — the session is already gone.
         drop(dead);
+    }
+
+    if registry.startup_is_authoritative() {
+        let live_tile_ids = infos
+            .iter()
+            .map(|terminal| terminal.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(snapshot) = registry.prune_gone_tiles_if_seq(registry_seq, &live_tile_ids) {
+            forward_tabs_sync(&app, &snapshot, &fanout);
+        }
     }
 
     Ok(infos)

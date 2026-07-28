@@ -945,6 +945,37 @@ impl TabRegistry {
         }
     }
 
+    pub fn prune_gone_tiles_if_seq(
+        &self,
+        expected_seq: u64,
+        live_tile_ids: &std::collections::HashSet<String>,
+    ) -> Option<RegistrySnapshot> {
+        let mut g = self.lock();
+        if g.seq != expected_seq {
+            return None;
+        }
+        let gone = g
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.tile_ids.iter())
+            .filter(|tile_id| !live_tile_ids.contains(*tile_id))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        if gone.is_empty() {
+            return None;
+        }
+        g.retired_tile_ids.extend(gone.iter().cloned());
+        for tab in &mut g.tabs {
+            tab.tile_ids.retain(|tile_id| !gone.contains(tile_id));
+        }
+        g.seq = g.seq.saturating_add(1);
+        Some(RegistrySnapshot {
+            seq: g.seq,
+            active_tab_id: g.active_tab_id.clone(),
+            tabs: g.tabs.clone(),
+        })
+    }
+
     /// The id of the tab whose name matches exactly, if any (named-placement reuse).
     fn id_for_name(&self, name: &str) -> Option<String> {
         self.lock()
