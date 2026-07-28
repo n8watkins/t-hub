@@ -11922,7 +11922,6 @@ fn reconcile_cortana_inner(
     }
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let terminal_id = suffix[..8].to_string();
-    ctx.identity.bind_tile(&identity.id, &terminal_id)?;
     let spawn_args = json!({
         "cwd": home,
         "name": "Cortana",
@@ -11959,6 +11958,7 @@ fn reconcile_cortana_inner(
         &launch,
         expected_harness_launch_provenance,
     )?;
+    ctx.identity.bind_tile(&identity.id, &terminal_id)?;
     let prepared_launch = ctx
         .captains
         .cortana_identity()
