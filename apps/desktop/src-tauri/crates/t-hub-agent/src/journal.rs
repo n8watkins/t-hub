@@ -2,15 +2,15 @@
 //!
 //! The journal is the authority for reconstruction *intent*: it survives the
 //! Windows app closing (it lives on the WSL VHDX), and is replayed to the core
-//! on every reconnect. It is an append-only file of newline-delimited JSON —
-//! one [`EventJournalEntry`] per line — so it is crash-tolerant by construction
-//! (a torn final line is detected and ignored on open).
+//! on every reconnect. Current writers append one [`EventJournalEntry`] per
+//! newline-delimited JSON record, so the file is crash-tolerant by construction
+//! (a torn final record is detected and ignored on open).
 //!
 //! ## Durability
 //! Each [`Journal::append`] acquires the journal's interprocess transaction
 //! lock, allocates the next sequence from durable head state, writes one complete
 //! line, and `fsync`s both the journal and head state before returning.
-//! A stale or torn head state is rebuilt from complete journal lines.
+//! A stale or torn head state is rebuilt from complete journal records.
 //!
 //! ## Why a file, not SQLite (here)
 //! The agent's journal is a *write-mostly, append-only, replay-from-cursor* log;
@@ -359,8 +359,8 @@ impl Journal {
         }
     }
 
-    /// Scan the file and return its complete, parseable line count plus the byte
-    /// boundary before any torn trailing line.
+    /// Scan complete physical records to rebuild durable sequence state and the
+    /// byte boundary before any torn trailing record.
     fn recover_head(path: &Path) -> Result<HeadState> {
         let file = match Self::open_private_file(path, false) {
             Ok(f) => f,
