@@ -480,6 +480,9 @@ export async function bootstrapWorkspaceTabs(
 
     const serverTabs = res.tabs as TabReport[];
     const { listTerminals, reportWorkspaceTabs } = await import("./client");
+    const registeredBeforeInventory = new Set(
+      Object.keys(useWorkspace.getState().terminals),
+    );
     const liveTerminalIds = new Set(
       (await listTerminals()).map((terminal) => terminal.id),
     );
@@ -487,15 +490,21 @@ export async function bootstrapWorkspaceTabs(
       tabs: TabReport[],
       seq: number,
     ): TabReport[] => {
+      const eligibleTerminalIds = new Set(liveTerminalIds);
+      for (const terminalId of Object.keys(useWorkspace.getState().terminals)) {
+        if (!registeredBeforeInventory.has(terminalId)) {
+          eligibleTerminalIds.add(terminalId);
+        }
+      }
       const authoritativeTileIds = new Set(
         tabs.flatMap((tab) => tab.tileIds),
       );
-      return reconcileTabs(tabs, seq, liveTerminalIds).map((tab) => ({
+      return reconcileTabs(tabs, seq, eligibleTerminalIds).map((tab) => ({
         ...tab,
         tileIds: tab.tileIds.filter(
           (terminalId) =>
             authoritativeTileIds.has(terminalId) ||
-            liveTerminalIds.has(terminalId),
+            eligibleTerminalIds.has(terminalId),
         ),
       }));
     };
@@ -547,7 +556,9 @@ export async function bootstrapWorkspaceTabs(
           reconcileWithTerminalInventory(repaired.tabs, repaired.seq),
         );
       }
-      return adoptAuthoritativeTabs(repairTabs);
+      return adoptAuthoritativeTabs(
+        reconcileWithTerminalInventory(repairTabs, repaired.seq),
+      );
     }
 
     return adoptAuthoritativeTabs(

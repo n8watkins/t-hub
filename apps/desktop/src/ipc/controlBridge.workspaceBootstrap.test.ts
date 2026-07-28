@@ -445,6 +445,169 @@ describe("workspace registry bootstrap", () => {
     expect(useWorkspace.getState().registryAdopted).toBe(false);
   });
 
+  it("preserves a terminal registered after the startup inventory snapshot", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-existing"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 4,
+      activeTabId: "work-1",
+      tabs: [
+        {
+          id: "work-1",
+          name: "Workspace 1",
+          kind: "work",
+          tileIds: ["term-existing"],
+        },
+        { id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] },
+      ],
+    });
+    invoke.mockImplementation(async (command: string) => {
+      if (command !== "list_terminals") {
+        throw new Error(`unexpected invoke: ${command}`);
+      }
+      useWorkspace.setState((state) => ({
+        terminals: {
+          ...state.terminals,
+          "term-new": {
+            id: "term-new",
+            tmuxSession: "th_term-new",
+            cwd: "",
+            title: "New terminal",
+            state: "live",
+          },
+        },
+        tabs: state.tabs.map((tab) =>
+          tab.id === "work-1"
+            ? { ...tab, order: [...tab.order, "term-new"] }
+            : tab,
+        ),
+      }));
+      return [{ id: "term-existing" }];
+    });
+    const baseline = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-existing"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain" as const,
+        tileIds: [],
+      },
+    ];
+
+    await expect(
+      bootstrapWorkspaceTabs((tabs, _seq, liveTerminalIds) =>
+        rebaseStartupWorkspaceDeltas(
+          tabs,
+          [
+            {
+              baselineTabs: baseline,
+              localTabs: useWorkspace.getState().tabs.map((tab) => ({
+                id: tab.id,
+                name: tab.name,
+                kind:
+                  tab.id === CAPTAINS_TAB_ID
+                    ? ("captain" as const)
+                    : ("work" as const),
+                tileIds: [...tab.order],
+              })),
+            },
+          ],
+          liveTerminalIds,
+        ),
+      ),
+    ).resolves.toBe(true);
+
+    expect(
+      useWorkspace.getState().tabs.find((tab) => tab.id === "work-1")?.order,
+    ).toEqual(["term-existing", "term-new"]);
+  });
+
+  it("preserves a terminal registered during Captain-only repair", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-existing"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 1,
+      activeTabId: CAPTAINS_TAB_ID,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "list_terminals") {
+        return [{ id: "term-existing" }];
+      }
+      if (command === "report_workspace_tabs") {
+        useWorkspace.setState((state) => ({
+          terminals: {
+            ...state.terminals,
+            "term-new": {
+              id: "term-new",
+              tmuxSession: "th_term-new",
+              cwd: "",
+              title: "New terminal",
+              state: "live",
+            },
+          },
+          tabs: state.tabs.map((tab) =>
+            tab.id === "work-1"
+              ? { ...tab, order: [...tab.order, "term-new"] }
+              : tab,
+          ),
+        }));
+        return { seq: 2, stale: false };
+      }
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+    const baseline = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-existing"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain" as const,
+        tileIds: [],
+      },
+    ];
+
+    await expect(
+      bootstrapWorkspaceTabs((tabs, _seq, liveTerminalIds) =>
+        rebaseStartupWorkspaceDeltas(
+          tabs,
+          [
+            {
+              baselineTabs: baseline,
+              localTabs: useWorkspace.getState().tabs.map((tab) => ({
+                id: tab.id,
+                name: tab.name,
+                kind:
+                  tab.id === CAPTAINS_TAB_ID
+                    ? ("captain" as const)
+                    : ("work" as const),
+                tileIds: [...tab.order],
+              })),
+            },
+          ],
+          liveTerminalIds,
+        ),
+      ),
+    ).resolves.toBe(true);
+
+    expect(
+      useWorkspace.getState().tabs.find((tab) => tab.id === "work-1")?.order,
+    ).toEqual(["term-existing", "term-new"]);
+  });
+
   it("retains startup deltas across consecutive stale server snapshots", () => {
     const initial = [
       {
