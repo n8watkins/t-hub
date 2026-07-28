@@ -175,7 +175,7 @@ The supervisory workflow is active through the shared control operation catalog.
 - After restart, reserved work resumes automatically, while an interrupted running provider commit becomes `RecoveryRequired` and needs the separately approved explicit recovery flow.
 - Ambiguous provider failures remain active as `RecoveryRequired`; only a structured refusal proving every target stayed at its original path releases the reservation as failed.
 - Active cleanup reservations block matching worktree creation, terminal spawning, history resume, and agent starting.
-- Cargo cleanup removes and later rebuilds target artifacts.
+- Cargo cleanup removes target artifacts; subsequent Cargo builds recreate them.
 - It does not compress targets in place, remove a Git worktree, detach UI state, or delete a branch.
 - `th admin maintain-session` performs bounded non-destructive maintenance on one exact live T-Hub session after revalidating the current grant, actor, supervisor, and target ownership.
 - `th admin recover-resource` accepts a session, ship, or worktree target and either performs bounded maintenance or records an authoritative recovery plan when direct mutation is unsafe.
