@@ -1088,10 +1088,7 @@ pub async fn git_worktree_add(
     cwd: String,
     path: String,
     branch: Option<String>,
-    coordinator: tauri::State<
-        '_,
-        std::sync::Arc<crate::worktree_coordinator::WorktreeCoordinator>,
-    >,
+    coordinator: tauri::State<'_, std::sync::Arc<crate::worktree_coordinator::WorktreeCoordinator>>,
 ) -> Result<String, String> {
     git_worktree_add_with_coordinator(cwd, path, branch, coordinator.inner().clone()).await
 }
@@ -1311,9 +1308,8 @@ mod tests {
             "seed",
         ]);
 
-        let coordinator = std::sync::Arc::new(
-            crate::worktree_coordinator::WorktreeCoordinator::ephemeral(),
-        );
+        let coordinator =
+            std::sync::Arc::new(crate::worktree_coordinator::WorktreeCoordinator::ephemeral());
         coordinator
             .begin_retirement(
                 target.to_str().unwrap(),
