@@ -637,10 +637,14 @@ static OUTPUT_DISPATCHER: std::sync::LazyLock<SyncSender<QueuedReaderEvent>> =
                     }
                     let QueuedReaderEvent { app, id, event, .. } = queued;
                     match event {
-                        event @ ReaderEvent::Output(_) => throttle_output_emit(|| {
+                        // Reserve the process-wide output slot and sleep OUTSIDE the
+                        // reservation lock, then emit. The dispatcher is the only
+                        // caller, so one serialized reservation paces every terminal.
+                        event @ ReaderEvent::Output(_) => {
+                            throttle_output_emit();
                             generation
                                 .dispatch_if_authoritative(|| emit_reader_event(&app, &id, event));
-                        }),
+                        }
                         event @ ReaderEvent::StreamEnd(_) => {
                             generation
                                 .dispatch_if_authoritative(|| emit_reader_event(&app, &id, event));
