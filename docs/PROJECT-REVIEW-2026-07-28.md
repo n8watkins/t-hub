@@ -238,13 +238,48 @@ The orphan set includes the entire `NATIVE-*` pivot series, for a pivot that was
 **#72 is superseded and can simply be closed.**
 `main` already carries the keyed HMAC chain (`audit.rs:43-47`), `verify_self` (`audit.rs:882`), `startup_integrity_check` (`audit.rs:945`), and the standalone `verify` / `verify_with_head` entry points.
 
-### 10. Test-suite flake surface
+### 10. The Rust suite is not reliably green: roughly one flaky failure per full run
 
-125 `sleep`-based waits across the Rust sources, 45 of them inside `control/tests.rs`.
-There is no `serial_test` usage and no `nextest`.
-Sleep-based synchronization is the mechanism behind several previously observed flakes.
+This was measured, not inferred.
+Two full serial `control::tests` runs on a cleared `-L t-hub-test` socket each produced exactly one failure, and **a different test each time**:
 
-Worth revisiting as part of the finding 3 split: prefer poll-to-deadline over fixed sleeps.
+| Run | Failure | Result |
+| --- | --- | --- |
+| 1 | `attach_reaps_idle_terminal_with_stalled_client` | 442 passed, 1 failed |
+| 2 | `process_level_permission_attestation_rejects_missing_wrong_provider_and_wrappers` | 442 passed, 1 failed |
+
+Both pass in isolation in seconds.
+
+CI on `main` shows the same rate.
+The last two red runs were each a single failure on yet another distinct test:
+
+| Run | Date | Failure | Result |
+| --- | --- | --- | --- |
+| `30324679793` | 2026-07-28 | `preview::supervisor::tests::target_killing_its_direct_parent_is_still_reaped_by_watchdog` | 789 passed, 1 failed |
+| `30211407061` | 2026-07-26 | `control::tests::audit_refusal_refunds_governor_admission` | 1220 passed, 1 failed |
+
+So roughly 2 of the last 8 pushes to `main` went red on a single flaky test.
+
+**This is the most corrosive finding in this document.**
+A suite that fails randomly at this rate trains everyone to re-run rather than investigate, which is precisely how a real regression gets waved through.
+It also means a green CI run is partly luck rather than evidence.
+
+Contributing mechanisms:
+
+- 125 `sleep`-based waits across the Rust sources, 45 of them inside `control/tests.rs`.
+  Fixed sleeps encode a timing assumption that a loaded runner violates.
+- No `serial_test` and no `nextest`.
+- Tests shell out to a real tmux on a socket keyed by NAME (`-L t-hub-test`), not by worktree.
+  Two runs in two worktrees therefore share one tmux server, and the spawn governor reads live-session headroom off it, so a concurrent run looks like consumed capacity.
+- Session names truncate to 8 characters, so fixed-name fixtures collide (`admin-alpha` and `admin-alice` both become `th_admin-al`).
+
+Suggested direction, worth sequencing right after the finding 3 split since both touch the same file:
+
+1. Replace fixed sleeps with poll-to-deadline helpers.
+   This is the pattern that already fixed `scoped_harness_attestation`.
+2. Give each test process its own tmux socket via `T_HUB_TMUX_SOCKET` rather than relying on the shared default.
+3. Adopt `nextest` for per-test process isolation and real retry accounting, so a flake is visibly a flake rather than a red build.
+4. Track the flake rate explicitly, so it can be driven down rather than absorbed.
 
 ---
 
@@ -260,4 +295,5 @@ Worth revisiting as part of the finding 3 split: prefer poll-to-deadline over fi
 | 6 | Bound handshake age and check `pid` liveness | small | low | kills the false app-down class |
 | 7 | Close PR #72, rebase or close #67 | small | none | clears the queue |
 | 8 | Make the default test profile honest about what it skips | small | low | removes a false-confidence trap |
-| 9 | Prune orphaned docs; finish Powder Phase B | medium | low | reduces noise |
+| 9 | Drive down the flake rate (finding 10) | medium | low | a green run stops being luck |
+| 10 | Prune orphaned docs; finish Powder Phase B | medium | low | reduces noise |
