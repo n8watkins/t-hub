@@ -113,6 +113,37 @@ export function tlog(tag: string, ...args: unknown[]): void {
 }
 
 /**
+ * PHASE MARKER - an always-on, un-gated timing sample.
+ *
+ * Deliberately NOT behind `diagEnabled` like [`tlog`]. The whole point is to get
+ * numbers off a NORMAL run on the user's machine without asking them to flip a
+ * debug flag first, so the markers have to fire by default. That is only safe
+ * because they are RARE by construction: a boot emits under a dozen and a
+ * workspace switch emits one per visible tile. Never call this per output chunk,
+ * per frame, or inside the pool sync loop - use `tlog` there, which is gated.
+ *
+ * `phase` is a stable `area:event` key (e.g. `boot:first-paint`,
+ * `switch:unparked`) so lines can be grepped and diffed across builds. `at` is
+ * `performance.now()`, i.e. milliseconds since page load, which makes boot
+ * markers directly readable as "time since launch" with no correlation needed.
+ *
+ * Read the results with: `grep '"t":"mark"' <diag file>`
+ */
+export function dmark(phase: string, detail?: Record<string, unknown>): void {
+  try {
+    const at =
+      typeof performance !== "undefined" && typeof performance.now === "function"
+        ? Math.round(performance.now())
+        : -1;
+    shipToFile(
+      JSON.stringify({ t: "mark", phase, at, ...(detail ? { d: detail } : {}) }),
+    );
+  } catch {
+    // A marker must never break the path it measures.
+  }
+}
+
+/**
  * Mirror an already-emitted console.warn/error (or a window error event) into the
  * diag file under a level tag, WITHOUT re-logging to the console (the original
  * call already did). Used by the console/window hooks below.

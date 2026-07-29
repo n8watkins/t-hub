@@ -27,6 +27,7 @@ import { isSatelliteWindow, useWorkspace } from "../store/workspace";
 import { useCaptain, type CaptainClaimRecord, type CrewRef } from "../store/captain";
 import { notify } from "../lib/notify";
 import { controlRequest, isRetryableControlError } from "./controlClient";
+import { dmark } from "../lib/diag";
 import type { TabReport, TabReportResult } from "./types";
 
 /** Exact Tauri event the backend control listener emits to apply a UI mutation. */
@@ -460,18 +461,39 @@ async function stableLiveTerminalIds(
   listTerminals: () => Promise<Array<{ id: string }>>,
 ): Promise<Set<string> | undefined> {
   let previousFingerprint: string | undefined;
+  // Phase marker inputs: these walks are SEQUENTIAL (each must observe the state
+  // after the previous, which is the whole point - they converge on an inventory
+  // that stopped changing), so they defeat listTerminals' in-flight dedup by
+  // construction and their cost adds up on the boot critical path. Recording the
+  // walk count + elapsed here is what tells us whether that actually matters on a
+  // real machine, or whether the persistent WSL agent makes each walk cheap.
+  const startedAt = typeof performance !== "undefined" ? performance.now() : 0;
+  let walks = 0;
+  const mark = (outcome: string): void => {
+    dmark("boot:inventory", {
+      outcome,
+      walks,
+      ms:
+        typeof performance !== "undefined"
+          ? Math.round(performance.now() - startedAt)
+          : -1,
+    });
+  };
   for (
     let attempt = 0;
     attempt < TERMINAL_INVENTORY_STABILITY_ATTEMPTS;
     attempt += 1
   ) {
     const terminals = await listTerminals();
+    walks += 1;
     const fingerprint = terminalInventoryFingerprint(terminals);
     if (fingerprint === previousFingerprint) {
+      mark("stable");
       return new Set(terminals.map((terminal) => terminal.id));
     }
     previousFingerprint = fingerprint;
   }
+  mark("indeterminate");
   return undefined;
 }
 
@@ -1187,7 +1209,15 @@ function startTabReporter(): void {
   // retry until startup reconciliation succeeds. Captain adoption starts only
   // after that same workspace boundary, so a persisted pin cannot validate
   // itself against a stale local tab during a race.
+  // Phase markers: the authoritative layout does not exist until this resolves,
+  // and it re-arms every STARTUP_RECONCILIATION_RETRY_MS until it does (the
+  // backend withholds TabRegistry until a background tmux snapshot lands). The
+  // attempt count is the signal that matters - one attempt means the backend was
+  // ready, several means boot spent whole seconds waiting on it.
+  let reconcileAttempts = 0;
   const reconcile = (): void => {
+    reconcileAttempts += 1;
+    dmark("boot:reconcile-attempt", { attempt: reconcileAttempts });
     void bootstrapWorkspaceTabs((tabs, _seq, liveTerminalIds) => {
       return rebaseStartupWorkspaceDeltas(
         tabs,
@@ -1199,6 +1229,7 @@ function startTabReporter(): void {
         window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
         return;
       }
+      dmark("boot:reconcile-authoritative", { attempts: reconcileAttempts });
       const reconciledTabs = workspaceRegistrySnapshot().tabs;
       startupDeltas.push({
         baselineTabs: reconciledTabs,

@@ -8,7 +8,7 @@ import { render, screen } from "@testing-library/react";
 import { TileErrorBoundary } from "./TileErrorBoundary";
 
 // The boundary logs to the diag sink (Tauri/file-backed); stub it web-safe.
-vi.mock("../lib/diag", () => ({ tlog: () => {} }));
+vi.mock("../lib/diag", () => ({ tlog: () => {}, dmark: () => {} }));
 
 /** A stand-in tile: throws on render iff its id looks like debris (`ghost*`),
  *  mirroring a bad/dead/weird session whose tile fails to materialize. */

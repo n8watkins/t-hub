@@ -2784,6 +2784,66 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
+    /// Replace a durable `cortana.identity_id` that names an identity the store no
+    /// longer HOLDS with a freshly minted one, inside the active recovery.
+    ///
+    /// The load-time identity GC (`prune_dead_generation`) retires every identity
+    /// whose session tile is gone - the routine outcome of a restart after
+    /// Cortana's tmux session died - while this record keeps referencing the
+    /// pruned id. Without a rebind that state is TERMINAL: resolving the durable
+    /// identity fails, and even re-minting one cannot commit because
+    /// `observed_launch_matches_recovery` requires the observed launch's identity
+    /// to equal `cortana.identity_id`. Rebinding here keeps the pair consistent so
+    /// the recovery proceeds exactly like any other generation bump.
+    ///
+    /// Deliberately narrow: only inside `Recovering` for the caller's own
+    /// operation, only when the record still names `stale_identity_id`, and it
+    /// touches NOTHING else (generation stays put, so the "identity and positive
+    /// generation are recorded together" invariant is preserved by construction).
+    /// Verifying that the stale id is genuinely unresolvable - and not merely
+    /// revoked - is the caller's job; this type holds no identity store.
+    /// Idempotent for a retried dispatch that already rebound to `identity_id`.
+    pub(super) fn rebind_pruned_cortana_identity(
+        &self,
+        operation_id: &str,
+        stale_identity_id: &str,
+        identity_id: &str,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        if identity_id.trim().is_empty() || identity_id == stale_identity_id {
+            return Err("reconcile_cortana: pruned identity replacement is not a fresh id".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let active = match &current.cortana.recovery {
+            crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. } => {
+                operation_id.as_str()
+            }
+            _ => {
+                return Err(
+                    "reconcile_cortana: pruned identity rebind requires an active recovery".into(),
+                )
+            }
+        };
+        if active != operation_id {
+            return Err("reconcile_cortana: pruned identity rebind operation changed".into());
+        }
+        match current.cortana.identity_id.as_deref() {
+            Some(existing) if existing == identity_id => return Ok(current.cortana.clone()),
+            Some(existing) if existing == stale_identity_id => {}
+            _ => {
+                return Err(
+                    "reconcile_cortana: durable identity changed before the pruned rebind".into(),
+                )
+            }
+        }
+        let previous = current.clone();
+        current.cortana.identity_id = Some(identity_id.to_string());
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     pub(super) fn prepare_cortana_orphan_replacement(
         &self,
         operation_id: &str,

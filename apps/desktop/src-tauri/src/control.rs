@@ -11949,19 +11949,53 @@ fn reconcile_cortana_inner(
         }
     } else {
         match durable.identity_id.as_deref() {
-            Some(identity_id) => {
-                let identity = ctx.identity.get(identity_id).ok_or_else(|| {
-                    format!(
-                        "reconcile_cortana: durable identity '{identity_id}' is unavailable or revoked"
-                    )
-                })?;
-                if identity.role != crate::identity::Role::Cortana {
-                    return Err(
-                        "reconcile_cortana: durable identity no longer has the Cortana role".into(),
-                    );
+            Some(identity_id) => match ctx.identity.get(identity_id) {
+                Some(identity) => {
+                    if identity.role != crate::identity::Role::Cortana {
+                        return Err(
+                            "reconcile_cortana: durable identity no longer has the Cortana role"
+                                .into(),
+                        );
+                    }
+                    (identity, false)
                 }
-                (identity, false)
-            }
+                // A durable pointer at an identity the store no longer HOLDS is a
+                // stale pointer, not a security event - and it is the routine
+                // outcome of a restart: the load-time GC (`prune_dead_generation`,
+                // see lib.rs setup) retires every identity whose session tile is
+                // gone, which is exactly what a dead Cortana tmux session leaves
+                // behind, while captains.json keeps referencing the pruned id.
+                // Erroring here made that state PERMANENT: every 30s reconcile
+                // failed identically ("durable identity '<id>' is unavailable or
+                // revoked") with no path back, because nothing else rewrites
+                // `cortana.identity_id`. Mint a fresh Cortana identity and REBIND
+                // the durable record to it, so the recovery proceeds exactly like
+                // any other generation bump. The rebind is required, not
+                // cosmetic: `observed_launch_matches_recovery` refuses to commit a
+                // launch whose identity differs from `cortana.identity_id`, so a
+                // mint without it would just move the wedge downstream.
+                //
+                // A REVOKED id keeps the hard error: revocation is a deliberate
+                // "this credential is burned" act with a durable tombstone, and
+                // silently re-minting past it would defeat that.
+                None if !ctx.identity.is_revoked(identity_id) => {
+                    let identity = ctx.identity.mint(crate::identity::Role::Cortana)?;
+                    if let Err(error) = ctx.captains.rebind_pruned_cortana_identity(
+                        operation_id,
+                        identity_id,
+                        &identity.id,
+                    ) {
+                        let _ = ctx.identity.retire(&identity.id);
+                        return Err(error);
+                    }
+                    (identity, true)
+                }
+                None => {
+                    return Err(format!(
+                        "reconcile_cortana: durable identity '{identity_id}' is revoked"
+                    ));
+                }
+            },
             None => (ctx.identity.mint(crate::identity::Role::Cortana)?, true),
         }
     };

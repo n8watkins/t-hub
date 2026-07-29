@@ -212,6 +212,115 @@ fn reconcile_cortana_is_idempotent_and_recovers_the_same_identity() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+/// A durable `cortana.identity_id` pointing at an identity the store no longer
+/// HOLDS must self-heal, not wedge. The load-time GC (`prune_dead_generation`,
+/// wired in lib.rs setup) retires every identity whose session tile is gone -
+/// exactly what a restart after Cortana's tmux session died leaves behind -
+/// while captains.json keeps referencing the pruned id. Erroring on that made
+/// the state PERMANENT: nothing else rewrites `cortana.identity_id`, so every
+/// 30s reconcile failed identically and the UI banner never cleared. A REVOKED
+/// id is different: revocation is a deliberate burn with a durable tombstone, so
+/// it must keep failing closed rather than silently re-minting past it.
+#[test]
+fn reconcile_cortana_remints_a_pruned_durable_identity_but_not_a_revoked_one() {
+    let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+    let sink = Arc::new(RecordingSink {
+        calls: StdMutex::new(Vec::new()),
+    });
+    let mut ctx = test_ctx("cortana-durable-identity-gc")
+        .with_live_sessions(|| Ok(Vec::new()))
+        .with_apply_sink(sink);
+    ctx.addr = "127.0.0.1:4242".into();
+    ctx.tab_registry().replace(vec![TabRecord {
+        id: CAPTAIN_WORKSPACE_ID.into(),
+        name: CAPTAIN_WORKSPACE_NAME.into(),
+        tile_ids: vec![],
+    }]);
+    let home = std::env::temp_dir().join(format!(
+        "t-hub-cortana-durable-identity-home-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let (harness_bin_dir, harness_command) = test_harness_command("codex");
+
+    let created = dispatch(
+        &ctx,
+        "reconcile_cortana",
+        &json!({
+            "operationId": "cortana-gc-1",
+            "testOrchestratorHome": home,
+            "testStartupCommand": harness_command,
+        }),
+    )
+    .unwrap();
+    assert_eq!(created["action"], "create");
+    let created_terminal = created["terminalId"].as_str().unwrap().to_string();
+    let pruned_identity = created["identityId"].as_str().unwrap().to_string();
+
+    // The restart shape: the runtime is gone, and the load-time GC has already
+    // retired its identity while the durable record still names it.
+    reap_test_tmux_session_and_assert_absent(&tmux_target(&created_terminal));
+    assert!(ctx.identity.retire(&pruned_identity).unwrap());
+    assert!(ctx.identity.get(&pruned_identity).is_none());
+    assert!(!ctx.identity.is_revoked(&pruned_identity));
+    assert_eq!(
+        ctx.captains.cortana_identity().identity_id.as_deref(),
+        Some(pruned_identity.as_str()),
+        "the durable record must still reference the pruned identity"
+    );
+
+    let healed = dispatch(
+        &ctx,
+        "reconcile_cortana",
+        &json!({
+            "operationId": "cortana-gc-2",
+            "testOrchestratorHome": home,
+            "testStartupCommand": harness_command,
+        }),
+    )
+    .unwrap();
+    assert_eq!(healed["action"], "recover");
+    assert_eq!(healed["healthy"], true);
+    let healed_identity = healed["identityId"].as_str().unwrap().to_string();
+    assert_ne!(
+        healed_identity, pruned_identity,
+        "a pruned durable identity must be replaced by a freshly minted one"
+    );
+    // The durable record is rebound, so the next reconcile resolves cleanly
+    // instead of re-reading the dead pointer.
+    assert_eq!(
+        ctx.captains.cortana_identity().identity_id.as_deref(),
+        Some(healed_identity.as_str())
+    );
+    let healed_terminal = healed["terminalId"].as_str().unwrap().to_string();
+
+    // A REVOKED durable identity still fails closed.
+    reap_test_tmux_session_and_assert_absent(&tmux_target(&healed_terminal));
+    assert!(ctx.identity.revoke(&healed_identity).unwrap());
+    let error = dispatch(
+        &ctx,
+        "reconcile_cortana",
+        &json!({
+            "operationId": "cortana-gc-3",
+            "testOrchestratorHome": home,
+            "testStartupCommand": harness_command,
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("is revoked"),
+        "a revoked durable identity must fail closed, got: {error}"
+    );
+    assert_eq!(
+        ctx.captains.cortana_identity().identity_id.as_deref(),
+        Some(healed_identity.as_str()),
+        "a refused reconcile must not rebind the durable record"
+    );
+
+    let _ = std::fs::remove_dir_all(harness_bin_dir);
+    let _ = std::fs::remove_dir_all(home);
+}
+
 #[test]
 fn cortana_bootstrap_requires_exact_live_authority_and_returns_a_bounded_redacted_snapshot() {
     if tmux::managed_runtime_preflight().is_err() {

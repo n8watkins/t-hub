@@ -10,7 +10,7 @@ vi.mock("./CaptainOverlay", () => ({ CaptainOverlay: () => null }));
 vi.mock("./TileErrorBoundary", () => ({
   TileErrorBoundary: ({ children }: { children: React.ReactNode }) => children,
 }));
-vi.mock("../lib/diag", () => ({ tlog: () => {} }));
+vi.mock("../lib/diag", () => ({ tlog: () => {}, dmark: () => {} }));
 
 import { TerminalPoolProvider } from "./TerminalPool";
 import { useCaptain } from "../store/captain";
