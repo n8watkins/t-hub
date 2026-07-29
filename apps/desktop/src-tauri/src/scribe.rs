@@ -805,12 +805,14 @@ fn take_fresh_latest_status() -> Option<ScribeStatus> {
 
 #[tauri::command]
 pub fn scribe_status_start(app: tauri::AppHandle) -> Result<(), String> {
+    crate::hangwatch::note_command("scribe_status_start");
     start_scribe_status_emitter(app);
     Ok(())
 }
 
 #[tauri::command]
 pub fn scribe_status_stop() -> Result<(), String> {
+    crate::hangwatch::note_command("scribe_status_stop");
     stop_scribe_status_emitter();
     Ok(())
 }

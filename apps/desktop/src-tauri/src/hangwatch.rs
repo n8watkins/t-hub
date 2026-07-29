@@ -30,6 +30,43 @@ pub fn note_emit() {
     EMIT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// ATTRIBUTION for a detected block: which command the main thread most recently
+/// began, and how many have begun in total.
+///
+/// Without this the watchdog can only say "the pump was starved 6,211ms" and
+/// nothing about WHY - which is exactly where a real investigation stalled: 73
+/// blocks in one hour totalling 28.9s, a `keydown` observed blocked 296ms right
+/// after one, and no way to attribute any of it. Only 13 of those 73 correlated
+/// with the one suspect we had, so the remaining 60 had no lead at all.
+///
+/// A `Mutex<String>` is acceptable here specifically because it is only ever held
+/// for a pointer-swap-length critical section on either side, never across I/O.
+/// The probe closure reads it on the main thread, so it must never block: it uses
+/// `try_lock` and reports "?" rather than waiting.
+static LAST_COMMAND: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static COMMAND_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record that `name` is beginning on the main thread. Called from the Tauri
+/// command layer. Cheap: one counter bump plus a short-lived lock, and it gives
+/// up immediately rather than ever waiting on the lock.
+#[inline]
+pub fn note_command(name: &str) {
+    COMMAND_COUNT.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut slot) = LAST_COMMAND.try_lock() {
+        slot.clear();
+        slot.push_str(name);
+    }
+}
+
+/// The most recent command name, or "?" when the slot is contended. Never blocks.
+fn last_command() -> String {
+    match LAST_COMMAND.try_lock() {
+        Ok(slot) if !slot.is_empty() => slot.clone(),
+        Ok(_) => "none".to_string(),
+        Err(_) => "?".to_string(),
+    }
+}
+
 /// Probe cadence + the stall threshold, measured as the GAP between consecutive
 /// main-thread probe RUNS. LOWERED to hunt the residual "staggered" sub-500ms
 /// stutter (A1): probe every 100ms and log whenever two consecutive probe runs land
@@ -51,7 +88,7 @@ pub fn spawn(app: tauri::AppHandle) {
         // timing. So the probe only computes the gap since the PREVIOUS probe run +
         // the emit delta, then hands the numbers back over this channel; the
         // (blocking) diag_log write happens HERE, on the watchdog's own bg thread.
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, u64, String, u64)>();
         let start = Instant::now();
         // Shared across probe closures (only the main thread mutates them, so the two
         // swaps never race): ms-since-`start` of the last probe RUN, and the emit
@@ -60,33 +97,45 @@ pub fn spawn(app: tauri::AppHandle) {
         // posted); a 0 sentinel skips the first probe (no prior run to diff).
         let last_run = std::sync::Arc::new(AtomicU64::new(0));
         let last_emit = std::sync::Arc::new(AtomicU64::new(0));
+        let last_cmds = std::sync::Arc::new(AtomicU64::new(0));
         loop {
             // Drain + log any stalls the probe handed back (off the main thread).
-            while let Ok((gap, emits)) = rx.try_recv() {
+            while let Ok((gap, emits, cmd, cmds)) = rx.try_recv() {
+                // `lastCommand` is the command the main thread most recently BEGAN,
+                // and `cmdsDuringBlock` how many began across the stall - together
+                // they attribute a block instead of just timing it.
                 crate::diag::diag_log(format!(
-                    "{{\"t\":\"hang\",\"src\":\"rust-main\",\"blockedMs\":{},\"ghostRisk\":{},\"emitsDuringBlock\":{}}}",
+                    "{{\"t\":\"hang\",\"src\":\"rust-main\",\"blockedMs\":{},\"ghostRisk\":{},\"emitsDuringBlock\":{},\"lastCommand\":\"{}\",\"cmdsDuringBlock\":{}}}",
                     gap,
                     gap >= 5000,
-                    emits
+                    emits,
+                    cmd.replace('"', ""),
+                    cmds
                 ));
             }
             std::thread::sleep(PERIOD);
             let tx = tx.clone();
             let last_run = last_run.clone();
             let last_emit = last_emit.clone();
+            let last_cmds = last_cmds.clone();
             // Post a probe to the main thread; it runs once the pump services it. The
             // GAP between this run and the previous one spans any block that starved
             // the pump in between. (Err only if the loop is shutting down.)
             let _ = app.run_on_main_thread(move || {
                 let now_ms = start.elapsed().as_millis() as u64;
                 let now_emits = EMIT_COUNT.load(Ordering::Relaxed);
+                let now_cmds = COMMAND_COUNT.load(Ordering::Relaxed);
                 let prev_ms = last_run.swap(now_ms, Ordering::Relaxed);
                 let prev_emits = last_emit.swap(now_emits, Ordering::Relaxed);
+                let prev_cmds = last_cmds.swap(now_cmds, Ordering::Relaxed);
                 if prev_ms != 0 {
                     let gap = now_ms.saturating_sub(prev_ms);
                     if gap >= STALL_MS {
                         let emits = now_emits.wrapping_sub(prev_emits);
-                        let _ = tx.send((gap, emits)); // non-blocking handoff; NO I/O here
+                        let cmds = now_cmds.wrapping_sub(prev_cmds);
+                        // last_command() uses try_lock, so this stays I/O- and
+                        // wait-free on the very thread it is measuring.
+                        let _ = tx.send((gap, emits, last_command(), cmds));
                     }
                 }
             });

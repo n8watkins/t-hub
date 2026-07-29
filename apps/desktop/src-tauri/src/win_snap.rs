@@ -120,6 +120,7 @@ pub fn store_max_button_rect(rect: MaxButtonRect) {
 /// the global the Windows hit-test consults. No-op effect on unix.
 #[tauri::command]
 pub fn set_maximize_button_rect(rect: MaxButtonRect) {
+    crate::hangwatch::note_command("set_maximize_button_rect");
     store_max_button_rect(rect);
 }
 
