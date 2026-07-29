@@ -526,6 +526,9 @@ impl RemotePty {
 
     /// Send keystrokes to the remote PTY: `{"write":"<b64>"}`.
     pub fn write(&mut self, data: &[u8]) -> Result<(), String> {
+        // The user is typing into this terminal, so its echo gets latency
+        // privilege for a short window (see INTERACTIVE_ECHO_WINDOW).
+        note_terminal_input(&self.id);
         let mut frame = serde_json::to_vec(&json!({ "write": STANDARD.encode(data) }))
             .map_err(|e| format!("remote_pty: serialize write frame failed: {e}"))?;
         frame.push(b'\n');
@@ -641,7 +644,12 @@ static OUTPUT_DISPATCHER: std::sync::LazyLock<SyncSender<QueuedReaderEvent>> =
                         // reservation lock, then emit. The dispatcher is the only
                         // caller, so one serialized reservation paces every terminal.
                         event @ ReaderEvent::Output(_) => {
-                            throttle_output_emit();
+                            // Echo for a terminal being typed into bypasses the
+                            // shared 100ms schedule; everything else stays paced,
+                            // so the aggregate bound on background output holds.
+                            if !is_interactive(&id) {
+                                throttle_output_emit();
+                            }
                             generation
                                 .dispatch_if_authoritative(|| emit_reader_event(&app, &id, event));
                         }
@@ -744,16 +752,105 @@ fn reserve_output_emit_delay(now: Instant, next_slot: &mut Instant, period: Dura
     slot.saturating_duration_since(now)
 }
 
-fn throttle_output_emit() {
+/// How long a terminal stays LATENCY-PRIVILEGED after receiving input.
+///
+/// THE TYPING-LATENCY FIX. The process-wide slot above bounds total emit volume
+/// to ~10 events/sec across the WHOLE app, which is what stops a background
+/// firehose starving the Windows host loop. But a keystroke's ECHO is itself an
+/// output event, so it had to queue behind every other terminal's output: with a
+/// busy agent running anywhere in the fleet, typing echo inherited hundreds of
+/// milliseconds of queueing. Measured on 0.3.150 as a `keydown` blocked 208ms,
+/// and reported as "there is a delay when I type". The original comment's claim
+/// that "the first event after an idle period remains immediate, so normal typing
+/// does not inherit a fixed delay" holds only when the rest of the fleet is idle -
+/// which, in a tool for supervising many agents, is the uncommon case.
+///
+/// So a terminal that just received input skips the shared reservation for a short
+/// window. That is safe against what the throttle exists to prevent, because the
+/// exemption is bounded three ways: only terminals the user is actively typing
+/// into qualify, the window is short, and interactive echo is inherently
+/// low-volume (a few small events per keystroke) - unlike the multi-terminal
+/// attach floods that motivated the throttle. Everything else stays on the shared
+/// schedule, so the aggregate bound still holds for background output.
+const INTERACTIVE_ECHO_WINDOW: Duration = Duration::from_millis(600);
+
+/// Terminals that recently received input, with the instant their privilege ends.
+/// Pruned opportunistically on write, so it stays the size of the set of
+/// terminals actually being typed into.
+static INTERACTIVE_UNTIL: std::sync::LazyLock<StdMutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Mark `id` as being actively typed into. Called from the write path, which is
+/// exactly the keystroke path.
+fn note_terminal_input(id: &str) {
+    let deadline = Instant::now() + INTERACTIVE_ECHO_WINDOW;
+    let mut map = INTERACTIVE_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.retain(|_, until| *until > Instant::now());
+    map.insert(id.to_string(), deadline);
+}
+
+/// Whether `id`'s output should bypass the shared emit schedule right now.
+fn is_interactive(id: &str) -> bool {
+    let map = INTERACTIVE_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(id).is_some_and(|until| *until > Instant::now())
+}
+
+/// Whether ANY terminal is currently being typed into.
+fn any_interactive() -> bool {
+    let now = Instant::now();
+    let map = INTERACTIVE_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.values().any(|until| *until > now)
+}
+
+/// Compressed pacing used while the user is typing anywhere in the fleet.
+///
+/// Exempting the typed terminal (above) is NOT sufficient on its own, because
+/// `throttle_output_emit` sleeps on the SINGLE dispatcher thread: a typed
+/// terminal's echo still waits behind whatever background events are already
+/// queued ahead of it, up to the channel depth - roughly 400ms of head-of-line
+/// blocking that no per-terminal exemption can reach.
+///
+/// Reordering to fix that is not an option: a terminal's output bytes must be
+/// emitted in arrival order or the pane renders garbage, so an interactive event
+/// cannot jump the queue. Instead, while ANYONE is typing, background events are
+/// paced at this shorter period so the queue ahead drains promptly.
+///
+/// The aggregate-volume bound the throttle exists for is preserved in the way that
+/// matters: this applies only during a typing window (600ms, self-expiring), so a
+/// sustained background flood with no user input is paced exactly as before. It
+/// trades a brief, user-initiated burst of throughput for interactive latency,
+/// which is the correct trade at precisely the moment the user is waiting on the
+/// screen.
+const OUTPUT_EMIT_PERIOD_INTERACTIVE: Duration = Duration::from_millis(10);
+
+/// Pace one background output emit at `period`. The period is a PARAMETER, not
+/// read from ambient state, so a test can exercise this deterministically - and so
+/// the caller's choice of period is visible at the call site.
+fn throttle_output_emit_at(period: Duration) {
     let delay = {
         let mut next_slot = NEXT_OUTPUT_EMIT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        reserve_output_emit_delay(Instant::now(), &mut next_slot, OUTPUT_EMIT_PERIOD)
+        reserve_output_emit_delay(Instant::now(), &mut next_slot, period)
     };
     if !delay.is_zero() {
         std::thread::sleep(delay);
     }
+}
+
+/// Pace a background emit, compressing the period while anyone is typing.
+fn throttle_output_emit() {
+    throttle_output_emit_at(if any_interactive() {
+        OUTPUT_EMIT_PERIOD_INTERACTIVE
+    } else {
+        OUTPUT_EMIT_PERIOD
+    });
 }
 
 fn queue_reader_event(
@@ -810,7 +907,14 @@ fn prepare_stream_end(id: &str, code: Option<i32>) -> PreparedStreamEnd {
 fn emit_reader_event(app: &AppHandle, id: &str, event: ReaderEvent) {
     match event {
         ReaderEvent::Output(bytes) => {
-            throttle_output_emit();
+            // NO throttle here. Pacing belongs to the DISPATCHER, which is this
+            // function's only caller (see OUTPUT_DISPATCHER) and whose comment
+            // already states that one serialized reservation paces every terminal.
+            // Reserving a second slot here meant every output event paid the period
+            // TWICE - an effective global rate of 5 events/sec rather than the
+            // documented 10, and double the latency - and it silently defeated the
+            // interactive bypass, since a typed terminal exempted at the dispatcher
+            // was re-throttled here.
             let payload = OutputEvent {
                 id: id.to_string(),
                 base64: STANDARD.encode(bytes),
@@ -1187,12 +1291,142 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that assert on the PROCESS-GLOBAL emit pacing state
+    /// (`NEXT_OUTPUT_EMIT` and `INTERACTIVE_UNTIL`). Without this they race under
+    /// cargo's default parallelism: one test marking a terminal interactive
+    /// compresses the very period another is measuring, and the failure reads as a
+    /// throttle regression rather than cross-test contamination. Resetting the
+    /// globals at test start is NOT sufficient - the interference is concurrent,
+    /// not merely leftover.
+    static EMIT_PACING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn typed_terminal_echo_bypasses_the_shared_emit_schedule() {
+        let _serial = EMIT_PACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // THE TYPING-LATENCY CONTRACT. The shared 100ms slot bounds total emit
+        // volume, but a keystroke's echo is itself an output event, so it used to
+        // queue behind every other terminal's output - measured in the field as a
+        // `keydown` blocked 208ms while an agent was producing output elsewhere.
+        //
+        // A terminal that just received input must therefore be exempt, and a
+        // terminal that has NOT received input must stay paced (or the exemption
+        // would defeat the starvation protection it is carved out of).
+        let quiet = "quiet000";
+        let typed = "typed000";
+
+        assert!(
+            !is_interactive(typed),
+            "a terminal with no input must not be privileged"
+        );
+
+        note_terminal_input(typed);
+        assert!(
+            is_interactive(typed),
+            "a terminal just written to must be privileged"
+        );
+        assert!(
+            !is_interactive(quiet),
+            "privilege must be PER TERMINAL - one terminal being typed into must \
+             not exempt the whole fleet, or background floods ride along"
+        );
+
+        // The window must actually expire, so a terminal left alone returns to the
+        // shared schedule rather than keeping privilege forever.
+        {
+            let mut map = INTERACTIVE_UNTIL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.insert(typed.to_string(), Instant::now() - Duration::from_millis(1));
+        }
+        assert!(
+            !is_interactive(typed),
+            "privilege must lapse once the echo window passes"
+        );
+
+        // And the lapsed entry must not accumulate: a later write prunes it.
+        note_terminal_input("other000");
+        {
+            let map = INTERACTIVE_UNTIL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                !map.contains_key(typed),
+                "expired entries must be pruned, not retained per terminal forever"
+            );
+        }
+        // Clean up so the shared static cannot leak privilege into other tests.
+        INTERACTIVE_UNTIL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    #[test]
+    fn background_pacing_compresses_only_while_someone_is_typing() {
+        let _serial = EMIT_PACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Exempting the typed terminal is not enough by itself: `throttle_output_emit`
+        // sleeps on the SINGLE dispatcher thread, so a typed terminal's echo still
+        // waits behind background events already queued ahead of it. Reordering is
+        // not permitted (a pane's bytes must stay in arrival order), so background
+        // pacing compresses during a typing window to drain that queue promptly -
+        // and must return to the full period once typing stops, or the aggregate
+        // bound the throttle exists for would be permanently weakened.
+        INTERACTIVE_UNTIL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        assert!(!any_interactive(), "no input yet");
+
+        note_terminal_input("typist0");
+        assert!(any_interactive(), "typing must compress background pacing");
+        assert!(
+            OUTPUT_EMIT_PERIOD_INTERACTIVE < OUTPUT_EMIT_PERIOD,
+            "the interactive period must actually be shorter"
+        );
+
+        // Expire it and confirm the full period is restored.
+        {
+            let mut map = INTERACTIVE_UNTIL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.insert(
+                "typist0".to_string(),
+                Instant::now() - Duration::from_millis(1),
+            );
+        }
+        assert!(
+            !any_interactive(),
+            "background pacing must return to the full period once typing stops"
+        );
+        INTERACTIVE_UNTIL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     #[test]
     fn sustained_output_is_process_throttled_and_post_idle_output_is_prompt() {
+        let _serial = EMIT_PACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         const READER_COUNT: usize = 4;
         const EVENTS_PER_READER: usize = 4;
         const EVENT_COUNT: usize = READER_COUNT * EVENTS_PER_READER;
 
+        // This test asserts the FULL background period, which now depends on no
+        // terminal being mid-typing (see OUTPUT_EMIT_PERIOD_INTERACTIVE). Both the
+        // slot and the interactive set are process-global, so reset both here
+        // rather than relying on test order - otherwise a sibling test that marked
+        // a terminal interactive silently compresses the pacing this measures, and
+        // the failure reads as a throttle regression instead of contamination.
+        INTERACTIVE_UNTIL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         {
             let mut next_slot = NEXT_OUTPUT_EMIT
                 .lock()
@@ -1209,7 +1443,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     for _ in 0..EVENTS_PER_READER {
-                        throttle_output_emit();
+                        throttle_output_emit_at(OUTPUT_EMIT_PERIOD);
                         timestamps_tx.send(Instant::now()).unwrap();
                     }
                 })
@@ -1234,7 +1468,7 @@ mod tests {
 
         std::thread::sleep(OUTPUT_EMIT_PERIOD * 2);
         let idle_emit_started = Instant::now();
-        throttle_output_emit();
+        throttle_output_emit_at(OUTPUT_EMIT_PERIOD);
         let idle_latency = idle_emit_started.elapsed();
         assert!(
             idle_latency < OUTPUT_EMIT_PERIOD,
