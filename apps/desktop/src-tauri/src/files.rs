@@ -409,11 +409,13 @@ fn wsl_unc_to_posix_for_distro(path: &str, distro: &str) -> Result<String, Strin
 
 #[tauri::command]
 pub fn wsl_folder_dialog_initial_path(path: String) -> Result<String, String> {
+    crate::hangwatch::note_command("wsl_folder_dialog_initial_path");
     posix_to_wsl_unc(&path, &configured_wsl_distro())
 }
 
 #[tauri::command]
 pub fn wsl_folder_dialog_selection(selected_path: String) -> Result<String, String> {
+    crate::hangwatch::note_command("wsl_folder_dialog_selection");
     wsl_unc_to_posix_for_distro(&selected_path, &configured_wsl_distro())
 }
 
@@ -421,6 +423,7 @@ pub fn wsl_folder_dialog_selection(selected_path: String) -> Result<String, Stri
 /// distro-aware bridge used by the Explorer picker.
 #[tauri::command]
 pub fn normalize_wsl_path(path: String) -> Result<String, String> {
+    crate::hangwatch::note_command("normalize_wsl_path");
     let trimmed = path.trim();
     if trimmed.starts_with('/') && !trimmed.starts_with("//") {
         return normalize_posix_wsl_path(trimmed);

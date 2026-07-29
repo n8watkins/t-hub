@@ -988,6 +988,27 @@ pub(crate) fn new_prepared_managed_session_with_env(
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut last_error = None;
+    // Backoff between ownership polls, NOT a fixed 10ms.
+    //
+    // Each iteration costs THREE probes (session effect identity, managed owner,
+    // session liveness), and on Windows every probe is its own `wsl.exe` process
+    // spawn. A flat 10ms therefore let one failed launch fire several HUNDRED
+    // wsl.exe spawns across the 5s deadline - measured in the field at 300-478
+    // live wsl.exe in a burst, which starved the Windows host loop hard enough to
+    // show up as multi-second main-thread blocks and visible typing latency. With
+    // a Cortana launch failing every 30s, that burst repeated indefinitely.
+    //
+    // On Linux these probes are cheap local calls, which is why 10ms looked fine
+    // in dev and in the test suite. The cost is platform-asymmetric, so the poll
+    // has to be paced for the expensive side.
+    //
+    // Growing 10ms -> 250ms keeps a FAST first observation (a healthy launch
+    // converges in the first couple of iterations, so the common path is
+    // unchanged) while bounding a failing one to roughly a dozen iterations
+    // instead of hundreds.
+    const OWNER_POLL_INITIAL: Duration = Duration::from_millis(10);
+    const OWNER_POLL_MAX: Duration = Duration::from_millis(250);
+    let mut poll_backoff = OWNER_POLL_INITIAL;
     while std::time::Instant::now() < deadline {
         match observe_session_effect_identity(name)
             .and_then(|tmux| observe_managed_runtime_owner(&launch.tools, unit_name, nonce, tmux))
@@ -998,7 +1019,14 @@ pub(crate) fn new_prepared_managed_session_with_env(
         if session_liveness(name) == SessionLiveness::Gone {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Never sleep past the deadline: a launch that is going to fail should
+        // report at 5s, not overshoot waiting on a long backoff.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(poll_backoff.min(remaining));
+        poll_backoff = (poll_backoff * 2).min(OWNER_POLL_MAX);
     }
     let unit_cleanup = retire_prepared_managed_runtime(launch);
     let session_cleanup = kill_session(name);

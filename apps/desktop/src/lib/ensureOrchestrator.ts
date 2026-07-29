@@ -29,6 +29,24 @@ export const CORTANA_RECONCILE_OPERATION_ID = "t-hub.desktop.cortana.startup.v1"
  */
 export const CORTANA_RECONCILE_INTERVAL_MS = 30_000;
 
+/**
+ * Ceiling for the consecutive-failure backoff below.
+ *
+ * The healthy cadence is cheap, but a reconcile that keeps FAILING is not: each
+ * attempt spawns a WSL -> tmux -> systemd probe tree on the Windows host. A
+ * permanently-wedged Cortana therefore used to hammer that every 30s forever -
+ * observed in the field at 2,891 consecutive failures in a single session, with
+ * the resulting `wsl.exe` churn showing up as multi-second main-thread blocks and
+ * visible input latency across the whole app (the same starvation mechanism
+ * PERF-AUDIT documents).
+ *
+ * Backing off converges to one probe every 5 minutes, which still recovers
+ * promptly once whatever was broken is fixed, while costing ~1/10th of the
+ * spawns. It deliberately does NOT give up: a wedge that needs a code fix should
+ * keep reporting itself, just not at a cost the user can feel while typing.
+ */
+export const CORTANA_RECONCILE_MAX_BACKOFF_MS = 300_000;
+
 export interface CortanaReconcileResult {
   operationId: string;
   action: "keep" | "adopt" | "recover" | "create" | "degraded";
@@ -130,9 +148,35 @@ export function createCortanaReconciliationMonitor({
   let stopped = false;
   let inFlight = false;
   let trailingRun = false;
-  let timer: ReturnType<typeof globalThis.setInterval> | undefined;
+  let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
   let terminalId: string | null = null;
   let terminalWasObserved = false;
+  // Consecutive unhealthy outcomes, driving the backoff. Reset by any HEALTHY
+  // result (so a recovered fleet immediately returns to the normal cadence) and
+  // by an explicit user retry.
+  let consecutiveFailures = 0;
+
+  /** The delay before the next POLL: the configured cadence while healthy, then
+   *  doubling per consecutive failure up to the 5-minute ceiling. */
+  const nextDelay = (): number => {
+    if (consecutiveFailures === 0) return intervalMs;
+    const scaled = intervalMs * 2 ** Math.min(consecutiveFailures, 20);
+    return Math.min(
+      Number.isFinite(scaled) ? scaled : CORTANA_RECONCILE_MAX_BACKOFF_MS,
+      CORTANA_RECONCILE_MAX_BACKOFF_MS,
+    );
+  };
+
+  /** Re-arm the single poll timer. A self-rescheduling timeout rather than a
+   *  fixed interval, so the delay can grow while Cortana stays unhealthy. */
+  const schedule = () => {
+    if (stopped || !started) return;
+    if (timer !== undefined) globalThis.clearTimeout(timer);
+    timer = globalThis.setTimeout(() => {
+      timer = undefined;
+      run();
+    }, nextDelay());
+  };
 
   const run = () => {
     if (stopped) return;
@@ -147,17 +191,26 @@ export function createCortanaReconciliationMonitor({
         const result = parseCortanaReconcileResult(value);
         if (terminalId !== result.terminalId) terminalWasObserved = false;
         terminalId = result.terminalId;
+        // A parsed DEGRADED result is still an unhealthy outcome: the backend
+        // answered, but Cortana is not up. Back off on it exactly like a thrown
+        // transport failure, since the retry cost is identical either way.
+        consecutiveFailures = result.healthy ? 0 : consecutiveFailures + 1;
         onResult(result);
       })
       .catch((error) => {
-        if (!stopped) onError(error);
+        if (stopped) return;
+        consecutiveFailures += 1;
+        onError(error);
       })
       .finally(() => {
         inFlight = false;
         if (!stopped && trailingRun) {
           trailingRun = false;
           run();
+          return;
         }
+        // Re-arm AFTER the outcome is known, so the next delay reflects it.
+        schedule();
       });
   };
 
@@ -166,10 +219,13 @@ export function createCortanaReconciliationMonitor({
       if (started || stopped) return;
       started = true;
       run();
-      timer = globalThis.setInterval(run, intervalMs);
     },
     requestNow() {
       if (!started || stopped) return;
+      // An explicit user retry (the banner's Retry button) clears the backoff:
+      // the person is asking for an attempt NOW, and if it fails the counter
+      // simply climbs again from one.
+      consecutiveFailures = 0;
       run();
     },
     observeTerminals(terminals) {
@@ -189,7 +245,7 @@ export function createCortanaReconciliationMonitor({
       if (stopped) return;
       stopped = true;
       trailingRun = false;
-      if (timer !== undefined) globalThis.clearInterval(timer);
+      if (timer !== undefined) globalThis.clearTimeout(timer);
       timer = undefined;
     },
   };

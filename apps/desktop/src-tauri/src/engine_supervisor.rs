@@ -531,6 +531,7 @@ fn parse_managed_flag(v: Option<&str>) -> bool {
 pub fn engine_runtime_status(
     state: tauri::State<'_, runtime::SharedSnapshot>,
 ) -> SupervisorSnapshot {
+    crate::hangwatch::note_command("engine_runtime_status");
     state
         .0
         .lock()
