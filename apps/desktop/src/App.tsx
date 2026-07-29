@@ -136,6 +136,15 @@ function useTitlebarReveal(
 
 export default function App() {
   const [cortanaRecoveryError, setCortanaRecoveryError] = useState<string | null>(null);
+  // A DISMISSED Cortana failure message. The reconciliation monitor re-checks
+  // every 30s, so a persistent backend failure re-set the same error forever and
+  // the alert had no way out - it sat over the canvas permanently. Dismissing
+  // records the message and suppresses the banner while the failure stays
+  // IDENTICAL; a different failure (or a recovery, which clears this) surfaces
+  // again, so dismissing silences one known problem rather than the channel.
+  const [dismissedCortanaError, setDismissedCortanaError] = useState<
+    string | null
+  >(null);
   const [cortanaRecoveryOperation] = useState(createCortanaRecoveryOperation);
   const cortanaReconciliationMonitor = useRef<CortanaReconciliationMonitor | null>(null);
   // A satellite starts with the supervision sidebar hidden — it's a focused
@@ -254,6 +263,9 @@ export default function App() {
 
         authoritativeTerminalId = result.terminalId;
         setCortanaRecoveryError(null);
+        // Recovered: forget any dismissal so a LATER failure with the same text
+        // is surfaced again rather than silently swallowed.
+        setDismissedCortanaError(null);
         const workspace = useWorkspace.getState();
         if (workspace.terminals[result.terminalId]) {
           workspace.moveTileToCaptainsTab(result.terminalId);
@@ -409,21 +421,34 @@ export default function App() {
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
-      {cortanaRecoveryError && !SATELLITE && (
-        <div
-          className="absolute left-1/2 top-10 z-50 flex -translate-x-1/2 items-center gap-3 rounded border border-red-700/70 bg-red-950/95 px-4 py-2 text-xs text-red-100 shadow-lg"
-          role="alert"
-        >
-          <span>Cortana startup failed: {cortanaRecoveryError}</span>
-          <button
-            type="button"
-            className="rounded bg-red-800 px-2 py-1 font-medium hover:bg-red-700"
-            onClick={() => cortanaReconciliationMonitor.current?.requestNow()}
+      {cortanaRecoveryError &&
+        cortanaRecoveryError !== dismissedCortanaError &&
+        !SATELLITE && (
+          <div
+            className="absolute left-1/2 top-10 z-50 flex max-w-[min(46rem,calc(100%-2rem))] -translate-x-1/2 items-start gap-3 rounded border border-red-700/70 bg-red-950/95 px-4 py-2 text-xs text-red-100 shadow-lg"
+            role="alert"
           >
-            Retry
-          </button>
-        </div>
-      )}
+            <span className="min-w-0 py-0.5 leading-relaxed">
+              Cortana startup failed: {cortanaRecoveryError}
+            </span>
+            <button
+              type="button"
+              className="shrink-0 rounded bg-red-800 px-2 py-1 font-medium hover:bg-red-700"
+              onClick={() => cortanaReconciliationMonitor.current?.requestNow()}
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              aria-label="Dismiss Cortana startup error"
+              title="Dismiss (reappears if the failure changes)"
+              className="-mr-1 shrink-0 rounded px-1.5 py-1 font-medium leading-none text-red-300 hover:bg-red-900/70 hover:text-red-100"
+              onClick={() => setDismissedCortanaError(cortanaRecoveryError)}
+            >
+              ✕
+            </button>
+          </div>
+        )}
       {/* Lifecycle keybinds (feat/lifecycle): Ctrl/Cmd+Shift+W deletes the focused
           terminal's session behind a confirm (Ctrl/Cmd+W still detaches). Renders
           only its confirm dialog when armed. */}
