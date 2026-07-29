@@ -152,16 +152,107 @@ describe("createCortanaReconciliationMonitor", () => {
 
     monitor.start();
     expect(reconcile).toHaveBeenCalledTimes(1);
+    // The poll is SELF-RESCHEDULING (it re-arms only after an outcome is known,
+    // so the failure backoff can widen the delay). Overlap is therefore
+    // prevented by construction rather than by the trailing-run collapse: no
+    // tick can even occur while a request is in flight. The trailing-run path
+    // still exists for EVENT-driven runs and is covered by the next test.
     await vi.advanceTimersByTimeAsync(3_000);
     expect(reconcile).toHaveBeenCalledTimes(1);
 
     finishFirst?.(healthy());
     await flushPromises();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    // Healthy, so the next poll lands one plain interval later.
+    await vi.advanceTimersByTimeAsync(1_000);
     expect(reconcile).toHaveBeenCalledTimes(2);
 
     monitor.stop();
     await vi.advanceTimersByTimeAsync(3_000);
     expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off while Cortana stays unhealthy and recovers the cadence on health", async () => {
+    vi.useFakeTimers();
+    // A permanently-failing reconcile used to retry every 30s forever - observed
+    // at 2,891 consecutive failures in one session, whose `wsl.exe` probe churn
+    // showed up as app-wide input latency. Each failure must widen the delay.
+    const reconcile = vi
+      .fn<() => Promise<unknown>>()
+      .mockRejectedValue(new Error("reconcile_cortana: wedged"));
+    const monitor = createCortanaReconciliationMonitor({
+      reconcile,
+      onResult: vi.fn(),
+      onError: vi.fn(),
+      intervalMs: 1_000,
+    });
+
+    monitor.start();
+    await flushPromises();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    // After 1 failure the next poll is 2x the interval, so the plain interval
+    // alone must NOT produce another attempt.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+
+    // After 2 failures: 4x.
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+
+    // An explicit user retry ignores the backoff and resets it.
+    monitor.requestNow();
+    await flushPromises();
+    expect(reconcile).toHaveBeenCalledTimes(4);
+
+    // Now succeed: the cadence must return to the plain interval immediately.
+    reconcile.mockResolvedValue(healthy());
+    await vi.advanceTimersByTimeAsync(2_000);
+    const afterRecovery = reconcile.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile.mock.calls.length).toBeGreaterThan(afterRecovery);
+
+    monitor.stop();
+  });
+
+  it("treats a persistent DEGRADED result as unhealthy for backoff purposes", async () => {
+    vi.useFakeTimers();
+    // A degraded result is a successful round-trip that still means Cortana is
+    // down, and the retry costs exactly the same WSL probe tree as a thrown
+    // failure - so it must back off too, not poll hot forever.
+    const degraded = {
+      operationId: "op",
+      action: "degraded" as const,
+      healthy: false,
+      terminalId: null,
+      identityId: null,
+      generation: 0,
+      degradedReason: "prepared cleanup pending",
+    };
+    const reconcile = vi
+      .fn<() => Promise<unknown>>()
+      .mockResolvedValue(degraded);
+    const monitor = createCortanaReconciliationMonitor({
+      reconcile,
+      onResult: vi.fn(),
+      onError: vi.fn(),
+      intervalMs: 1_000,
+    });
+
+    monitor.start();
+    await flushPromises();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+
+    monitor.stop();
   });
 
   it("reacts to terminal exit and collapses liveness signals into one trailing run", async () => {
