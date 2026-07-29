@@ -338,9 +338,28 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
 }
 
 #[tauri::command]
-pub fn spawn_terminal(
+pub async fn spawn_terminal(
     app: tauri::AppHandle,
     admission_context: tauri::State<'_, std::sync::Arc<crate::control::ControlContext>>,
+    opts: SpawnOptions,
+) -> Result<TerminalInfo, String> {
+    // Session admission, durable identity writes, and tmux creation all perform
+    // bounded blocking work. A synchronous Tauri command runs on the window
+    // thread, so a slow WSL/tmux bridge froze the entire app until creation
+    // finished. Move the complete transaction to the blocking pool so its
+    // admission guard and rollback behavior remain unchanged while the Windows
+    // message pump stays responsive.
+    let admission_context = admission_context.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        spawn_terminal_blocking(app, &admission_context, opts)
+    })
+    .await
+    .map_err(|error| format!("spawn_terminal task failed: {error}"))?
+}
+
+fn spawn_terminal_blocking(
+    app: tauri::AppHandle,
+    admission_context: &crate::control::ControlContext,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
     let provider_intent = opts
@@ -352,7 +371,7 @@ pub fn spawn_terminal(
         return Err("providerIntent must be 'codex' or 'claude'".into());
     }
     run_authorized_ui_spawn(
-        &admission_context,
+        admission_context,
         &opts,
         usize::from(provider_intent.is_some()),
         |worktree_admission| {

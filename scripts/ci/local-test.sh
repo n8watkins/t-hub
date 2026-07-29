@@ -9,10 +9,10 @@ usage() {
   cat <<'EOF'
 Usage: scripts/ci/local-test.sh <profile> [--plan]
 
-fast            Rust libraries, CLI tests, frontend tests, and typecheck.
+fast            Rust libraries, CLI tests, frontend tests, lint, and typecheck.
 standard        All Rust targets except slow process modules, plus the fast lanes.
 backend         The standard Rust lane and CLI tests.
-frontend        Typecheck, Vitest, and the production frontend bundle.
+frontend        Typecheck, lint, Vitest, and the production frontend bundle.
 browser         The production frontend bundle and Playwright browser tests.
 process         Real control and tmux process lifecycle tests.
 contracts       Portable repository, voice-gate, and skill contracts.
@@ -80,6 +80,13 @@ frontend_tests() {
   cd "$ROOT" && "${PNPM[@]}" --filter t-hub-desktop test
 }
 
+# The JavaScript/TypeScript counterpart to the Rust clippy gate. Fails on
+# ESLint ERRORS only: warnings (react-hooks/exhaustive-deps and the fast-refresh
+# backlog) are reported but do not gate, so `--max-warnings` stays unset.
+frontend_lint() {
+  cd "$ROOT" && "${PNPM[@]}" --filter t-hub-desktop lint
+}
+
 frontend_browser() {
   cd "$ROOT" && "${PNPM[@]}" --filter t-hub-desktop test:browser
 }
@@ -127,6 +134,7 @@ print_plan() {
 rust: cargo test --workspace --lib -- --skip control::tests --skip tmux::tests
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
+frontend-lint: pnpm --filter t-hub-desktop lint
 frontend-unit: pnpm --filter t-hub-desktop test
 EOF
       ;;
@@ -147,6 +155,7 @@ EOF
     frontend)
       cat <<'EOF'
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
+frontend-lint: pnpm --filter t-hub-desktop lint
 frontend-unit: pnpm --filter t-hub-desktop test
 frontend-bundle: pnpm --filter t-hub-desktop build:bundle
 EOF
@@ -176,6 +185,7 @@ EOF
 rust: apps/desktop/scripts/workspace_gate.sh full
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
+frontend-lint: pnpm --filter t-hub-desktop lint
 frontend-unit: pnpm --filter t-hub-desktop test
 frontend-product: pnpm --filter t-hub-desktop build:bundle, then test:browser
 contracts: version, voice gate, performance, test profile, workflow pinning, and handoff skill
@@ -210,6 +220,7 @@ case "$PROFILE" in
     start_lane rust rust_fast
     start_lane cli cli_tests
     start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-lint frontend_lint
     start_lane frontend-unit frontend_tests
     ;;
   standard)
@@ -224,6 +235,7 @@ case "$PROFILE" in
     ;;
   frontend)
     start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-lint frontend_lint
     start_lane frontend-unit frontend_tests
     start_lane frontend-bundle frontend_bundle
     ;;
@@ -243,6 +255,7 @@ case "$PROFILE" in
     start_lane rust rust_full
     start_lane cli cli_tests
     start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-lint frontend_lint
     start_lane frontend-unit frontend_tests
     start_lane frontend-product frontend_product
     start_lane contracts portable_contracts

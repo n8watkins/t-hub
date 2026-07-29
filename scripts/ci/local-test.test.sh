@@ -9,8 +9,16 @@ fast_plan="$(bash "$SCRIPT" fast --plan)"
 grep -Fq -- "--skip control::tests" <<<"$fast_plan"
 grep -Fq -- "--skip tmux::tests" <<<"$fast_plan"
 grep -Fq -- "--lib" <<<"$fast_plan"
+grep -Fq "frontend-lint" <<<"$fast_plan"
 if grep -Fq "frontend-product" <<<"$fast_plan"; then
   echo "fast plan must not run browser tests" >&2
+  exit 1
+fi
+# The lint lane reports warnings without gating on them. Pinning `--max-warnings`
+# to 0 would turn the react-hooks/exhaustive-deps backlog into a merge blocker,
+# so the contract asserts the flag stays absent until that backlog is cleared.
+if grep -Fq -- "--max-warnings" <<<"$fast_plan"; then
+  echo "lint lane must not gate on warnings yet" >&2
   exit 1
 fi
 
@@ -26,6 +34,7 @@ fi
 
 frontend_plan="$(bash "$SCRIPT" frontend --plan)"
 grep -Fq "frontend-typecheck" <<<"$frontend_plan"
+grep -Fq "frontend-lint" <<<"$frontend_plan"
 grep -Fq "frontend-unit" <<<"$frontend_plan"
 grep -Fq "frontend-bundle" <<<"$frontend_plan"
 if grep -Fq "cargo " <<<"$frontend_plan"; then
@@ -52,6 +61,7 @@ grep -Fq "Codex installation" <<<"$host_contracts_plan"
 
 full_plan="$(bash "$SCRIPT" full --plan)"
 grep -Fq "workspace_gate.sh full" <<<"$full_plan"
+grep -Fq "frontend-lint" <<<"$full_plan"
 grep -Fq "frontend-product" <<<"$full_plan"
 grep -Fq "build:bundle" <<<"$full_plan"
 grep -Fq "voice gate" <<<"$full_plan"
@@ -67,6 +77,8 @@ if bash "$SCRIPT" obsolete --plan >/dev/null 2>&1; then
 fi
 
 grep -Fq "bash apps/desktop/scripts/announce_gate.test.sh" "$WORKFLOW"
+# The server-side gate must run ESLint, mirroring the local frontend-lint lane.
+grep -Fq "pnpm --filter t-hub-desktop lint" "$WORKFLOW"
 grep -Fq "bash scripts/captain/handoff-skill.test.sh" "$WORKFLOW"
 grep -Fq "@openai/codex@0.145.0" "$WORKFLOW"
 grep -Fq "@anthropic-ai/claude-code@2.1.220" "$WORKFLOW"

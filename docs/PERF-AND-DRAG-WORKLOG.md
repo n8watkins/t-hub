@@ -35,10 +35,13 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
 - ✅ **Option B + A1 diagnostic prep SHIPPED (v0.3.23, `714f0e2`)** — focus de-storm
   (gitInfo in-flight dedup, RecentList `sameRecent`); hangwatch rewritten to the
   gap-between-runs metric so it reliably catches ≥200ms stalls.
-- ✅ **A1 repro COMPLETE → emit-coalesce FIX DROPPED (on evidence).** The diag named ONE
-  main-thread stall (~327ms) with `emitsDuringBlock=0` → terminal-output emit marshaling
-  RULED OUT. The real residual was the broadcast `onRefresh` fitting ~16 pooled terminals,
-  fixed structurally in v0.3.24 (below) — NOT the `window_interacting`/coalesce-widen rework.
+- ✅ **Sustained terminal-output event floods bounded in v0.3.140.**
+  The earlier A1 sample ruled out output marshaling for one isolated ~327ms stall, but it did not cover a sustained firehose.
+  Remote PTY readers now share a process-wide 100ms output-event schedule, naturally backpressuring continuous output before it can starve the Windows host event loop.
+  Live Windows verification showed that the earlier 20ms schedule still allowed two 50-event-per-second stalls during a multi-terminal attach.
+  A second Windows verification showed that even serialized 10-event-per-second output could starve the window while six parked terminals remained attached.
+  Parked terminals now keep their xterm renderer warm but detach the PTY output stream after a two-second switch grace, then reattach from authoritative tmux state when foregrounded.
+  The first event after an idle period is still emitted immediately.
 - ✅ **v0.3.24 canvas stale-frame heal SHIPPED (`cc604bd`)** — `forceFullRedraw` = throttled
   `clearTextureAtlas` + refresh at 6 geometry-heal points + foreground-only broadcast (also
   killed the ~327ms pooled-fit storm). Freeze + Alt-Tab ghost watchdog-CONFIRMED gone
@@ -247,18 +250,12 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       NOT run its JS on the main thread — the main-thread cost is the per-emit tao
       user-event DISPATCH + marshaling the payload string across the WebView2 IPC
       boundary, not executing the JS. This weakens "JS storm" theories.
-    - 🎯 **HISTORICAL SUSPECT (plausible-contributor, medium): emit-dispatch VOLUME.** Each
-      `app.emit` from a reader thread posts its OWN tao user-event (unbounded mpsc,
-      with no backpressure in the audited release path). Current source retains
-      per-terminal coalescing and adds one process-wide terminal-output reservation
-      every 20 ms, which backpressures reader sockets under multi-terminal load.
-      Control events are serialized
-      TWICE (`control_client.rs:245`); a forwarder RECONNECT can flush a backlog as a
-      tight emit burst. A transient alignment of bursts (multi-terminal token streams +
-      TUI repaint + control stream + reconnect) can saturate the main-thread user-event
-      queue and starve the message pump → ghosting. SPORADIC because it needs a burst
-      alignment, not steady state. **Magnitude unconfirmed** (since ExecuteScript is
-      async) → do NOT commit to the emit-multiplexing rework blind.
+    - ✅ **RESOLVED FOR TERMINAL OUTPUT (v0.3.140): emit-dispatch VOLUME.**
+      Each `app.emit` from a reader thread posts its own tao user-event through an unbounded queue with no release-path backpressure.
+      Per-terminal coalescing alone still allowed a continuous multi-terminal firehose to saturate the Windows host event loop.
+      Remote PTY readers now reserve process-wide output-event slots 100ms apart, which bounds sustained dispatch volume while preserving immediate output after idle.
+      Background terminals stop contributing to that volume after their two-second warm-switch grace because their PTY streams are detached without killing tmux.
+      Control-event serialization and reconnect behavior remain separate from this terminal-output limit.
   - **SHIPPED (v0.3.15): hang detector** (`lib/hangDetector.ts`, mounted from
     `main.tsx`) — a 500ms heartbeat (logs `blockedMs` when a tick is late ≥500ms,
     `ghostRisk` at ≥5s) + `PerformanceObserver(['longtask','event'])` (≥200ms, with
@@ -277,24 +274,11 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       window past its reset and polls only while a Codex tile is open
       (`useHasCodexSession`). Verified against the live rollout (session 0% left /
       weekly 70% left) and user-confirmed.
-- [x] **Drag/maximize lags when a FOCUSED Claude session is actively working** —
-      **emit-marshaling RULED OUT; the emit-coalesce fix was DROPPED; this residual is no
-      longer reproducing.** The A1 diag (v0.3.23 hangwatch gap-metric) named ONE main-thread
-      stall (~327ms) with `emitsDuringBlock=0` — which refutes the terminal-output
-      emit-marshaling hypothesis below (a marshaling-bound block would carry many emits).
-      The real residual was the broadcast `onRefresh` fitting ~16 pooled terminals, fixed
-      structurally in **v0.3.24** (foreground-only broadcast). The freeze is now
-      **watchdog-confirmed gone** (0 `"src":"rust-main"` blocks in ~51min on v0.3.24).
-      <br>**Original (now-superseded) hypothesis, kept for history:** ROOT CAUSE (subagent,
-      evidence-based — corrected a still-earlier statusline spawn-storm guess): the
-      statusline is throttled to `refreshInterval:5` ≈ 0.2/sec/session (verified against the
-      live 19 MB journal, peak 5/sec) — NOT the cause. The supposed cause was **terminal
-      output `app.emit(terminal://output)` marshaling onto the Windows MAIN/UI thread**
-      (`remote_pty.rs:329`): a freshly-sent prompt triggers an output burst → ~125 emits/sec
-      per streaming terminal *even after* the 8ms/256KB coalesce + frontend rAF batch, and
-      during a drag the OS modal move/size loop owns that same main thread. The proposed FIX
-      (`AtomicBool window_interacting` from window move/resize → widen the coalesce window
-      8ms→~100ms + raise `MAX_BATCH_BYTES`) was **DROPPED** once the diag showed `emits=0`.
+- [x] **Drag/maximize lags when a focused Claude session is actively working.**
+      The v0.3.23 A1 sample attributed one isolated ~327ms stall to the broadcast `onRefresh` fitting about 16 pooled terminals, which v0.3.24 fixed with a foreground-only broadcast.
+      That sample did not exercise the later sustained-output freeze.
+      In v0.3.140, continuous `terminal://output` dispatch reserves slots on a process-wide 100ms schedule, including across multiple streaming terminals.
+      Normal interactive output remains immediate after idle because the first available slot has no fixed delay.
 - [ ] *Secondary (separate builds/scope):* statusline self-throttle in `t-hub-agent`
       (skip the journal append+fsync + the per-render `tmux display` spawn if <~2s
       since last) → shrinks the 19 MB journal — **t-hub-agent builds separately**.

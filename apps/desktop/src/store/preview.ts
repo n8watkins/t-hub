@@ -119,7 +119,6 @@ export async function popOutPreview(url: string, title?: string): Promise<string
       resolve(label);
     });
     win.once("tauri://error", (e) => {
-      // eslint-disable-next-line no-console
       console.error("popOutPreview: failed to create preview window", e);
       usePreviewWindows.getState().untrack(label);
       resolve(null);

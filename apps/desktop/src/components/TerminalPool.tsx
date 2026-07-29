@@ -901,8 +901,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
               Fast tab moves and reorders keep the same xterm and parent. A terminal
               parked past the warm grace period goes cold and disposes here; its
               next hot render subscribes before attaching and restores from tmux.
-              Foreground controls whether warm output uses foreground rAF flushing
-              or the background throttled path.
+              Foreground controls whether the PTY output stream stays attached;
+              warm renderers park that stream after a short switch grace.
 
               Per-tile fault isolation: the boundary contains any render/commit
               throw to THIS tile, so one bad/dead/weird session can never blank the

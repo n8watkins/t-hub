@@ -129,6 +129,12 @@ export function FilePanel({
   // tree never depends on it either way. (`reload`/`closeSearch` are defined
   // below, after `refreshGit`, to avoid a TDZ on it.)
   const [reloadKey, setReloadKey] = useState(0);
+  // DEAD CODE, staged for removal. The collapsible search box now lives in
+  // FileTree.tsx, which owns its own `SearchBar`. This panel still keeps the
+  // state and writes to it, but nothing here READS `searchOpen` and the local
+  // `closeSearch`/`SearchBar` below are unreferenced. Deleting the cluster is a
+  // behavior-free cleanup, kept out of the lint-introduction change on purpose.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [searchOpen, setSearchOpen] = useState(false);
 
   // --- "Show ignored" toggle (persisted locally) -------------------------
@@ -181,6 +187,8 @@ export function FilePanel({
     refreshGit();
   }, [root, refreshGit]);
   // Closing the search box clears the query so we fall back to the tree cleanly.
+  // DEAD CODE, staged for removal - see the `searchOpen` note above.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const closeSearch = useCallback(() => {
     setSearchOpen(false);
     setQuery("");
@@ -942,6 +950,8 @@ function GitBar({
  * just close it and keep clicking folders. The closed row is `shrink-0` so it
  * never steals height from the tree below it.
  */
+// DEAD CODE, staged for removal - superseded by FileTree.tsx's own SearchBar.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function SearchBar({
   open,
   query,

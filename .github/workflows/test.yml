@@ -165,6 +165,14 @@ jobs:
       - name: tsc --noEmit
         run: pnpm --filter t-hub-desktop typecheck
 
+      # `eslint .` - the JS/TS counterpart to the Rust job's clippy gate, and
+      # the same command the local `frontend-lint` lane runs. Deliberately NOT
+      # `--max-warnings 0`: the step fails on ESLint ERRORS, while
+      # react-hooks/exhaustive-deps and the fast-refresh findings stay warnings
+      # so their existing backlog does not block unrelated pull requests.
+      - name: eslint
+        run: pnpm --filter t-hub-desktop lint
+
       # `vitest run` — the same command `pnpm --filter t-hub-desktop test` runs.
       - name: vitest run
         run: pnpm --filter t-hub-desktop test

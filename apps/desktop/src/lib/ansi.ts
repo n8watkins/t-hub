@@ -12,8 +12,6 @@
 //          (params 0x30–0x3F, intermediates 0x20–0x2F, final byte 0x40–0x7E)
 //   - OSC  e.g. \x1b]0;window-title\x07  (terminated by BEL or ST `\x1b\`)
 //   - two-char escapes  e.g. \x1bM (reverse index), \x1bD
-//
-// eslint-disable-next-line no-control-regex
 const ANSI_RE =
   // eslint-disable-next-line no-control-regex
   /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g;
