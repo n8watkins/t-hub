@@ -756,7 +756,7 @@ struct RegistryInner {
     seq: u64,
 }
 
-/// The CORE's authoritative workspace-tab registry.
+/// The CORE's authoritative live workspace projection.
 ///
 /// Ownership model (headless-org): the SERVER owns the tab/tile organization -
 /// every organization-tier command applies to this registry first (and errors on
@@ -2497,15 +2497,16 @@ pub struct ControlContext {
     provider_live_sessions: ProviderLiveSessionsFn,
     /// Authoritative tmux enumeration, injectable only for deterministic tests.
     live_sessions: LiveSessionsFn,
-    /// The CORE's addressable tab registry (TASK C / #22). Read by `list_tabs`,
-    /// updated optimistically by `new_tab` / `move_tile` / named placement, and
-    /// replaced wholesale by the frontend's `report_workspace_tabs` up-sync. Shared
-    /// (`Arc`) with the Tauri command that receives those reports; own empty one in
-    /// headless tests.
+    /// The CORE's addressable live tab projection (TASK C / #22). Read by
+    /// `list_tabs`, updated optimistically by `new_tab` / `move_tile` / named
+    /// placement, and updated by the frontend's `report_workspace_tabs` up-sync
+    /// after startup liveness reconciliation. Shared (`Arc`) with the Tauri
+    /// command that receives those reports; own empty one in headless tests.
     tabs: Arc<TabRegistry>,
-    /// The CORE's authoritative captains registry (captain-chat phase 2). Read by
-    /// `list_captains`, mutated by `claim_captain`/`release_captain` and the
-    /// `spawnedBy` crew plumbing; persistent across restarts (unlike `tabs`).
+    /// The CORE's authoritative captains and Fleet Workspace registry
+    /// (captain-chat phase 2). Read by `list_captains`, mutated by
+    /// `claim_captain`/`release_captain` and the `spawnedBy` crew plumbing, and
+    /// persisted across restarts. `tabs` is its process-local live projection.
     /// Own empty in-memory one in headless tests.
     captains: Arc<CaptainsRegistry>,
     /// Serializes modern Crew admission from its authoritative snapshot through

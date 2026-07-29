@@ -1068,6 +1068,7 @@ function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
+  let retryTimer: number | undefined;
   const startupLocal = workspaceRegistrySnapshot();
   const acknowledgedStartup = loadAcknowledgedWorkspaceSnapshot();
   const startupDeltas: StartupWorkspaceDelta[] = [
@@ -1083,6 +1084,10 @@ function startTabReporter(): void {
       pending = true;
       return;
     }
+    if (retryTimer !== undefined) {
+      pending = true;
+      return;
+    }
     if (inFlight) {
       pending = true;
       return;
@@ -1091,6 +1096,7 @@ function startTabReporter(): void {
     pending = false;
     const { tabs, activeTabId } = useWorkspace.getState();
     const payload = tabReports(tabs);
+    let failed = false;
     void import("./client")
       .then(async (m) => {
         const res: TabReportResult | void = await m.reportWorkspaceTabs(
@@ -1144,10 +1150,19 @@ function startTabReporter(): void {
       })
       .catch((error) => {
         // Keep the local layout usable, but make a real Tauri failure visible.
+        failed = true;
+        pending = true;
         surfaceLayoutSyncFailure(error);
       })
       .finally(() => {
         inFlight = false;
+        if (failed) {
+          retryTimer = window.setTimeout(() => {
+            retryTimer = undefined;
+            report();
+          }, STARTUP_RECONCILIATION_RETRY_MS);
+          return;
+        }
         if (pending) {
           pending = false;
           report();
