@@ -46,7 +46,7 @@ import { useFileOpen } from "../store/fileOpen";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
 import { useActivity } from "../store/activity";
-import { tlog } from "../lib/diag";
+import { dmark, tlog } from "../lib/diag";
 import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
 import { registerTerminalTail, unregisterTerminalTail } from "../lib/terminalTail";
 import type { ITheme, ILink } from "@xterm/xterm";
@@ -907,6 +907,17 @@ export function TerminalView({
             let reconnecting = false;
             let needsReattach = false;
             let initialAttachSettled = false;
+            // TRUE when the pending reattach exists because WE parked this tile
+            // (it left the foreground and `scheduleBackgroundDetach` detached its
+            // PTY), as opposed to an attach we LOST. The two look identical from
+            // `needsReattach` alone, but they deserve opposite handling: an
+            // expected unpark is routine and must be silent and immediate, while a
+            // real drop is a fault that warrants the banner, liveness
+            // verification, and backoff. Without this distinction every ordinary
+            // workspace switch paid the fault ceremony - a 250ms floor before the
+            // attach even started, plus "[session detached - reconnecting...]"
+            // printed into every tile on the tab you switched back to.
+            let parkedByUs = false;
 
             const clearBackgroundDetach = (): void => {
               if (!backgroundDetachTimer) return;
@@ -935,6 +946,8 @@ export function TerminalView({
                 }
                 ptyAttachedRef.current = false;
                 needsReattach = true;
+                // Deliberate park, not a fault: the unpark takes the fast path.
+                parkedByUs = true;
                 void beginTerminalDetach(terminalId, () =>
                   closeTerminal(terminalId),
                 )
@@ -987,10 +1000,24 @@ export function TerminalView({
               if (disposed || reconnecting || !initialAttachSettled) return;
               reconnecting = true;
               needsReattach = false;
-              writes.write("\r\n[session detached - reconnecting...]\r\n");
+              // Phase marker: pairs with the `switch:unparked` below to give the
+              // real wall-clock cost of bringing one tile back, split by path.
+              const reattachStartedAt =
+                typeof performance !== "undefined" ? performance.now() : 0;
+              // Consume the park marker: an EXPECTED unpark skips the whole fault
+              // ceremony (no banner, no initial backoff, no liveness pre-probe)
+              // because we detached this tile ourselves seconds ago and
+              // `attachTerminal` re-verifies liveness server-side anyway. If that
+              // optimistic attach FAILS we can no longer assume the session is
+              // alive, so the catch below downgrades to the full recovery path.
+              let fast = parkedByUs;
+              parkedByUs = false;
+              if (!fast) {
+                writes.write("\r\n[session detached - reconnecting...]\r\n");
+              }
               let delay = RECONNECT_INITIAL_MS;
               for (;;) {
-                await reconnectSleep(delay);
+                if (!fast) await reconnectSleep(delay);
                 if (disposed) return;
                 // Tile removed from the workspace while we waited → deliberate
                 // close/kill in flight; stand down.
@@ -1002,6 +1029,12 @@ export function TerminalView({
                 if (!shouldKeepOutputAttached()) {
                   reconnecting = false;
                   needsReattach = true;
+                  // Went background again mid-reattach. Hand the park marker back
+                  // so the NEXT unpark is still eligible for the fast path - this
+                  // is a re-park of a deliberate park, not a newly-discovered
+                  // fault. (Rapid tab-flipping hits this repeatedly; without it
+                  // the second switch back would print the banner.)
+                  parkedByUs = fast;
                   return;
                 }
                 await waitForTerminalDetach(terminalId);
@@ -1013,9 +1046,22 @@ export function TerminalView({
                 if (!shouldKeepOutputAttached()) {
                   reconnecting = false;
                   needsReattach = true;
+                  // Went background again mid-reattach. Hand the park marker back
+                  // so the NEXT unpark is still eligible for the fast path - this
+                  // is a re-park of a deliberate park, not a newly-discovered
+                  // fault. (Rapid tab-flipping hits this repeatedly; without it
+                  // the second switch back would print the banner.)
+                  parkedByUs = fast;
                   return;
                 }
-                if (!(await sessionAlive())) {
+                // The liveness pre-probe is a per-tile `list_terminals` walk. On
+                // the fast path we skip it: we parked this tile ourselves seconds
+                // ago, and `attach_terminal` performs its own authoritative
+                // `session_liveness` check server-side - a genuinely dead session
+                // makes the attach below throw, which downgrades us to the slow
+                // path where this probe DOES run before declaring the tile exited.
+                // So nothing is declared dead on weaker evidence than before.
+                if (!fast && !(await sessionAlive())) {
                   if (!disposed) declareExited();
                   reconnecting = false;
                   return;
@@ -1058,9 +1104,19 @@ export function TerminalView({
                     liveBuffer.length = 0;
                   }
                   reconnecting = false;
+                  dmark("switch:unparked", {
+                    id: terminalId,
+                    fast,
+                    ms:
+                      typeof performance !== "undefined"
+                        ? Math.round(performance.now() - reattachStartedAt)
+                        : -1,
+                  });
                   tlog(
                     "attach",
-                    `reattached ${terminalId} after attach loss`,
+                    fast
+                      ? `unparked ${terminalId} (fast path, no backoff/banner)`
+                      : `reattached ${terminalId} after attach loss`,
                   );
                   return;
                 } catch (err) {
@@ -1073,7 +1129,20 @@ export function TerminalView({
                     "attach",
                     `reattach ${terminalId} failed (${String(err)}); retrying in ${delay}ms`,
                   );
-                  delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+                  if (fast) {
+                    // The optimistic unpark failed, so the "we just parked it, it
+                    // must still be there" assumption is void. DOWNGRADE to the
+                    // full recovery path for every subsequent iteration: surface
+                    // the banner now (the user is looking at this tile and it is
+                    // no longer a silent routine switch) and let the loop resume
+                    // sleeping + verifying liveness. Keep `delay` at the base value
+                    // so the first real retry waits RECONNECT_INITIAL_MS rather
+                    // than double it.
+                    fast = false;
+                    writes.write("\r\n[session detached - reconnecting...]\r\n");
+                  } else {
+                    delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+                  }
                 }
               }
             };

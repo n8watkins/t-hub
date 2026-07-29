@@ -36,7 +36,7 @@ vi.mock("../lib/dropPaste", () => ({
   formatPathsForInsert: (paths: string[]) => paths.join(" "),
   installFileDropOnce: vi.fn(),
 }));
-vi.mock("../lib/diag", () => ({ tlog: vi.fn() }));
+vi.mock("../lib/diag", () => ({ tlog: vi.fn(), dmark: vi.fn() }));
 vi.mock("@tauri-apps/plugin-shell", () => ({ open: vi.fn(async () => {}) }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -193,15 +193,27 @@ describe("TerminalView background PTY lifecycle", () => {
     });
     expect(ipc.listTerminals).not.toHaveBeenCalled();
 
+    // UNPARK IS A FAST PATH, not attach-loss recovery. We parked this tile
+    // ourselves, so returning to it must not pay the fault ceremony: no
+    // RECONNECT_INITIAL_MS backoff before the attach, and no per-tile
+    // `list_terminals` liveness pre-probe (`attach_terminal` verifies liveness
+    // server-side, and a genuinely dead session makes it throw, which downgrades
+    // to the slow path where the probe does run before declaring the tile dead).
+    //
+    // Note the timers are NOT advanced here - only microtasks are drained. That
+    // is the assertion: the attach lands without any timer at all. Before this,
+    // every workspace switch waited 250ms per tile and printed
+    // "[session detached - reconnecting...]" into each returning pane.
     view.rerender(
       <TerminalView terminalId="term" visible foreground />,
     );
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+      await Promise.resolve();
       await Promise.resolve();
     });
     expect(ipc.attachTerminal).toHaveBeenCalledTimes(2);
-    expect(ipc.listTerminals).toHaveBeenCalled();
+    expect(ipc.listTerminals).not.toHaveBeenCalled();
     const foregroundResources = getTerminalResourceSnapshot();
     expect(foregroundResources).toMatchObject({
       xterms: 1,
@@ -229,5 +241,61 @@ describe("TerminalView background PTY lifecycle", () => {
         }),
       );
     }
+  });
+
+  // The fast unpark is only safe because a FAILED optimistic attach gives up its
+  // assumptions. Once the attach throws we no longer know the session is alive,
+  // so the loop must downgrade to the full recovery path - back off, verify
+  // liveness, and only then declare anything - rather than spinning attaches
+  // against a session that may be gone.
+  it("downgrades a failed fast unpark to backoff + liveness verification", async () => {
+    const view = render(
+      <TerminalView terminalId="term" visible foreground />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(ipc.attachTerminal).toHaveBeenCalledTimes(1);
+
+    // Park it.
+    view.rerender(
+      <TerminalView terminalId="term" visible foreground={false} />,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+      await Promise.resolve();
+    });
+    expect(ipc.closeTerminal).toHaveBeenCalledTimes(1);
+    expect(ipc.listTerminals).not.toHaveBeenCalled();
+
+    // The unpark attach fails once, then succeeds.
+    ipc.attachTerminal.mockRejectedValueOnce(new Error("attach refused"));
+
+    view.rerender(
+      <TerminalView terminalId="term" visible foreground />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // The fast attempt ran immediately (no timer) and failed. Crucially it has
+    // NOT yet retried: the downgrade re-introduces the backoff, so nothing more
+    // happens until the timer advances.
+    expect(ipc.attachTerminal).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // Slow path now: liveness verified before the retry, and the retry landed.
+    expect(ipc.listTerminals).toHaveBeenCalled();
+    expect(ipc.attachTerminal).toHaveBeenCalledTimes(3);
+    expect(getTerminalResourceSnapshot()).toMatchObject({
+      xterms: 1,
+      ptys: 1,
+    });
   });
 });

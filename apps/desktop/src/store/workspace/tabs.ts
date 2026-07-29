@@ -5,6 +5,7 @@
 // `get().moveTileToCaptainsTab`, `get().setFocus`), and the store closure's
 // `persist()` / `activeTab()` helpers are reached via `deps`.
 import { useTheme } from "../theme";
+import { dmark } from "../../lib/diag";
 import {
   CAPTAINS_TAB_ID,
   DEFAULT_TAB_NAME,
@@ -250,6 +251,9 @@ export const createTabsSlice = (
       if (id === activeTabId) return;
       const tab = tabs.find((t) => t.id === id);
       if (!tab) return;
+      // Phase marker: the t0 every `switch:unparked` is measured against, plus
+      // the tile count so a slow switch can be read as per-tile or fixed cost.
+      dmark("switch:begin", { tabId: id, tiles: tab.order.length });
       set({ activeTabId: id, focusedId: tab.order[0] ?? null });
       persist();
     },

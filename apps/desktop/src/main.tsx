@@ -1,5 +1,6 @@
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { dmark } from "./lib/diag";
 import "./index.css";
 // Side-effect import: mounts session-event notification sounds/desktop toasts
 // once at startup (idempotent). See src/lib/notifyMount.ts.
@@ -48,6 +49,14 @@ import "./lib/rulesMount";
 // Note: React.StrictMode is intentionally omitted. Its double-invoke of effects
 // in development breaks xterm.js terminals (double `open()` / disposed addons).
 
+// Boot phase markers (always on, see lib/diag dmark). `boot:entry` lands after
+// every side-effect module above has run, so its timestamp IS the cost of the
+// entry chunk parse + those mounts. `boot:first-paint` is the first frame after
+// React commits. Together with `boot:reconcile-*` and `boot:inventory` they say
+// which third of startup - JS parse, React mount, or the backend reconciliation
+// waterfall - actually owns the time, rather than us guessing.
+dmark("boot:entry");
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <App />,
 );
+requestAnimationFrame(() => dmark("boot:first-paint"));
