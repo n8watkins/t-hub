@@ -123,19 +123,10 @@ export function FilePanel({
   // `reloadKey` is bumped by the header's Reload control; it's threaded into the
   // tree's React `key` so the WHOLE tree remounts and re-lists every open dir
   // from scratch (answers the user's "should I reload it?" — yes, here's the
-  // button). `searchOpen` keeps the fuzzy-search box SECONDARY: collapsed by
-  // default so browsing is the primary, bulletproof path and the search box can
-  // never sit between the user and the tree. Search is index-only/lazy, so the
-  // tree never depends on it either way. (`reload`/`closeSearch` are defined
-  // below, after `refreshGit`, to avoid a TDZ on it.)
+  // button). The collapsible fuzzy-search box lives in FileTree.tsx, which owns
+  // its own `SearchBar`; this panel only supplies the query state it reads.
+  // (`reload` is defined below, after `refreshGit`, to avoid a TDZ on it.)
   const [reloadKey, setReloadKey] = useState(0);
-  // DEAD CODE, staged for removal. The collapsible search box now lives in
-  // FileTree.tsx, which owns its own `SearchBar`. This panel still keeps the
-  // state and writes to it, but nothing here READS `searchOpen` and the local
-  // `closeSearch`/`SearchBar` below are unreferenced. Deleting the cluster is a
-  // behavior-free cleanup, kept out of the lint-introduction change on purpose.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [searchOpen, setSearchOpen] = useState(false);
 
   // --- "Show ignored" toggle (persisted locally) -------------------------
   // OFF (default): the backend's directory-only gitignore rule — ignored DIRS
@@ -186,14 +177,6 @@ export function FilePanel({
     setReloadKey((k) => k + 1);
     refreshGit();
   }, [root, refreshGit]);
-  // Closing the search box clears the query so we fall back to the tree cleanly.
-  // DEAD CODE, staged for removal - see the `searchOpen` note above.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const closeSearch = useCallback(() => {
-    setSearchOpen(false);
-    setQuery("");
-  }, []);
-
   // --- Reset navigation when the root changes. ---------------------------
   // NOTE: we deliberately do NOT index the whole project on mount anymore. The
   // file TREE is lazy (shallow `listDir` per folder, ~0.1s each), so browsing is
@@ -209,7 +192,6 @@ export function FilePanel({
     setIndexState({ status: "idle" });
     setHits([]);
     setQuery("");
-    setSearchOpen(false);
     setReader({ status: "empty" });
     setActivePath(null);
   }, [root, readerOnly, compact]);
@@ -936,96 +918,6 @@ function GitBar({
           {wtResult.message}
         </div>
       )}
-    </div>
-  );
-}
-
-// --- Search bar (secondary, collapsible) -----------------------------------
-
-/**
- * The fuzzy-search affordance, deliberately SECONDARY to browsing. Collapsed it
- * is a slim "Search files…" button; opening it reveals the input (auto-focused)
- * with a × to close. Browsing the tree is the primary path and never depends on
- * this — search is a lazy, index-only overlay — so a confused user can always
- * just close it and keep clicking folders. The closed row is `shrink-0` so it
- * never steals height from the tree below it.
- */
-// DEAD CODE, staged for removal - superseded by FileTree.tsx's own SearchBar.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function SearchBar({
-  open,
-  query,
-  onQuery,
-  onOpen,
-  onClose,
-  compact,
-}: {
-  open: boolean;
-  query: string;
-  onQuery: (q: string) => void;
-  onOpen: () => void;
-  onClose: () => void;
-  /** Tighter copy/padding for the narrow stacked layout. */
-  compact?: boolean;
-}) {
-  if (!open) {
-    return (
-      <div className="shrink-0 border-b p-2" style={{ borderColor: "var(--th-border)" }}>
-        <button
-          type="button"
-          onClick={onOpen}
-          className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm transition-colors hover:bg-neutral-700/20"
-          style={{
-            borderRadius: "var(--th-radius)",
-            border: "1px solid var(--th-border)",
-            background: "transparent",
-            color: "var(--th-fg-muted)",
-          }}
-          title="Fuzzy-search files (browsing the tree works without this)"
-        >
-          <span aria-hidden>⌕</span>
-          <span>Search files…</span>
-        </button>
-      </div>
-    );
-  }
-  return (
-    <div className="shrink-0 border-b p-2" style={{ borderColor: "var(--th-border)" }}>
-      <div className="flex items-center gap-1.5">
-        <input
-          value={query}
-          onChange={(e) => onQuery(e.target.value)}
-          placeholder={compact ? "Search files…" : "Fuzzy search files…"}
-          spellCheck={false}
-          autoCorrect="off"
-          autoCapitalize="off"
-          autoFocus
-          className="min-w-0 flex-1 px-2.5 py-1.5 text-sm focus:outline-none"
-          style={{
-            borderRadius: "var(--th-radius)",
-            border: "1px solid var(--th-border)",
-            background: "var(--th-tile-bg)",
-            color: "var(--th-fg)",
-          }}
-          onKeyDown={(e) => {
-            // Escape closes search and drops back to the tree.
-            if (e.key === "Escape") {
-              e.preventDefault();
-              onClose();
-            }
-          }}
-        />
-        <button
-          type="button"
-          onClick={onClose}
-          className="shrink-0 rounded px-1.5 py-1 leading-none transition-colors hover:bg-neutral-700/30"
-          style={{ color: "var(--th-fg-muted)" }}
-          title="Close search (back to browsing)"
-          aria-label="Close search"
-        >
-          ×
-        </button>
-      </div>
     </div>
   );
 }

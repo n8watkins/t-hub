@@ -24,7 +24,6 @@
 // (SIDEBAR_RAIL_WIDTH, SidebarMode, the Sidebar props) App/Titlebar compile
 // against. Telemetry is still read for the bottom WSL/host-metrics strip.
 import { useAgentTelemetry } from "../store/telemetry";
-import { useSettings } from "../store/settings";
 import {
   useWorkspace,
   CAPTAINS_TAB_ID,
@@ -677,32 +676,6 @@ function SidebarRail({
 // Titlebar.tsx) and are intentionally NOT duplicated here.
 // ===========================================================================
 
-/**
- * The full-mode sidebar header: a 32px row matching the titlebar height. The
- * left holds the brand (a window-drag handle); the right holds the collapse
- * button (cycles full -> rail -> hidden, the Ctrl/Cmd+B action) plus a small
- * secondary settings gear. The empty middle is also a drag handle so the window
- * can still be moved by grabbing the header.
- */
-// DEAD CODE, staged for removal: nothing renders SidebarHeader any more - the
-// full-mode header is assembled inline. Kept out of the lint-introduction
-// change so the deletion can be reviewed on its own.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function SidebarHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
-  const toggleSettings = useSettings((s) => s.toggleSettings);
-  return (
-    <div
-      className="flex h-8 shrink-0 items-stretch border-b"
-      style={{ borderColor: "var(--th-border)" }}
-    >
-      <SidebarBrand />
-      {/* Draggable filler so the header itself moves the window. */}
-      <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
-      {onToggleSidebar && <CollapseButton onClick={onToggleSidebar} />}
-      <SidebarSettingsButton onClick={toggleSettings} />
-    </div>
-  );
-}
 
 /**
  * The rail-mode header: the brand mark over the collapse button, stacked
@@ -740,80 +713,8 @@ function SidebarRailHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }
   );
 }
 
-/** "T-Hub" wordmark with a small accent glyph; a window-drag handle. */
-function SidebarBrand() {
-  return (
-    <div
-      data-tauri-drag-region
-      className="flex shrink-0 select-none items-center gap-1.5 pl-2.5 pr-2"
-    >
-      <span
-        className="inline-block h-2.5 w-2.5 rounded-[2px]"
-        style={{ backgroundColor: "var(--th-accent)" }}
-        aria-hidden
-      />
-      <span
-        className="text-xs font-semibold tracking-tight"
-        style={{ color: "var(--th-fg)" }}
-      >
-        T-Hub
-      </span>
-    </div>
-  );
-}
-
-/** Collapse button — cycles the sidebar (full -> rail -> hidden). */
-function CollapseButton({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label="Collapse sidebar"
-      title="Collapse sidebar (Ctrl/Cmd+B)"
-      className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
-    >
-      <SidebarToggleIcon />
-    </button>
-  );
-}
-
-/** Settings gear — opens the settings/theme surface (also Ctrl/Cmd+,). */
-function SidebarSettingsButton({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      aria-label="Settings"
-      title="Settings (Ctrl/Cmd+,)"
-      onClick={onClick}
-      className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
-    >
-      <GearIcon />
-    </button>
-  );
-}
 
 // --- Shared chrome icons (sized to sit in the 32px header) -----------------
-
-/** Settings gear. */
-function GearIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="pointer-events-none"
-      aria-hidden
-    >
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
 
 /** Sidebar collapse/expand glyph (a panel with a divider). */
 function SidebarToggleIcon() {
