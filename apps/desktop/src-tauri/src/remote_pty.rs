@@ -526,6 +526,9 @@ impl RemotePty {
 
     /// Send keystrokes to the remote PTY: `{"write":"<b64>"}`.
     pub fn write(&mut self, data: &[u8]) -> Result<(), String> {
+        // The user is typing into this terminal, so its echo gets latency
+        // privilege for a short window (see INTERACTIVE_ECHO_WINDOW).
+        note_terminal_input(&self.id);
         let mut frame = serde_json::to_vec(&json!({ "write": STANDARD.encode(data) }))
             .map_err(|e| format!("remote_pty: serialize write frame failed: {e}"))?;
         frame.push(b'\n');
@@ -641,7 +644,12 @@ static OUTPUT_DISPATCHER: std::sync::LazyLock<SyncSender<QueuedReaderEvent>> =
                         // reservation lock, then emit. The dispatcher is the only
                         // caller, so one serialized reservation paces every terminal.
                         event @ ReaderEvent::Output(_) => {
-                            throttle_output_emit();
+                            // Echo for a terminal being typed into bypasses the
+                            // shared 100ms schedule; everything else stays paced,
+                            // so the aggregate bound on background output holds.
+                            if !is_interactive(&id) {
+                                throttle_output_emit();
+                            }
                             generation
                                 .dispatch_if_authoritative(|| emit_reader_event(&app, &id, event));
                         }
@@ -742,6 +750,53 @@ fn reserve_output_emit_delay(now: Instant, next_slot: &mut Instant, period: Dura
     let slot = (*next_slot).max(now);
     *next_slot = slot + period;
     slot.saturating_duration_since(now)
+}
+
+/// How long a terminal stays LATENCY-PRIVILEGED after receiving input.
+///
+/// THE TYPING-LATENCY FIX. The process-wide slot above bounds total emit volume
+/// to ~10 events/sec across the WHOLE app, which is what stops a background
+/// firehose starving the Windows host loop. But a keystroke's ECHO is itself an
+/// output event, so it had to queue behind every other terminal's output: with a
+/// busy agent running anywhere in the fleet, typing echo inherited hundreds of
+/// milliseconds of queueing. Measured on 0.3.150 as a `keydown` blocked 208ms,
+/// and reported as "there is a delay when I type". The original comment's claim
+/// that "the first event after an idle period remains immediate, so normal typing
+/// does not inherit a fixed delay" holds only when the rest of the fleet is idle -
+/// which, in a tool for supervising many agents, is the uncommon case.
+///
+/// So a terminal that just received input skips the shared reservation for a short
+/// window. That is safe against what the throttle exists to prevent, because the
+/// exemption is bounded three ways: only terminals the user is actively typing
+/// into qualify, the window is short, and interactive echo is inherently
+/// low-volume (a few small events per keystroke) - unlike the multi-terminal
+/// attach floods that motivated the throttle. Everything else stays on the shared
+/// schedule, so the aggregate bound still holds for background output.
+const INTERACTIVE_ECHO_WINDOW: Duration = Duration::from_millis(600);
+
+/// Terminals that recently received input, with the instant their privilege ends.
+/// Pruned opportunistically on write, so it stays the size of the set of
+/// terminals actually being typed into.
+static INTERACTIVE_UNTIL: std::sync::LazyLock<StdMutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Mark `id` as being actively typed into. Called from the write path, which is
+/// exactly the keystroke path.
+fn note_terminal_input(id: &str) {
+    let deadline = Instant::now() + INTERACTIVE_ECHO_WINDOW;
+    let mut map = INTERACTIVE_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.retain(|_, until| *until > Instant::now());
+    map.insert(id.to_string(), deadline);
+}
+
+/// Whether `id`'s output should bypass the shared emit schedule right now.
+fn is_interactive(id: &str) -> bool {
+    let map = INTERACTIVE_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(id).is_some_and(|until| *until > Instant::now())
 }
 
 fn throttle_output_emit() {
@@ -1185,6 +1240,61 @@ mod tests {
             ),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn typed_terminal_echo_bypasses_the_shared_emit_schedule() {
+        // THE TYPING-LATENCY CONTRACT. The shared 100ms slot bounds total emit
+        // volume, but a keystroke's echo is itself an output event, so it used to
+        // queue behind every other terminal's output - measured in the field as a
+        // `keydown` blocked 208ms while an agent was producing output elsewhere.
+        //
+        // A terminal that just received input must therefore be exempt, and a
+        // terminal that has NOT received input must stay paced (or the exemption
+        // would defeat the starvation protection it is carved out of).
+        let quiet = "quiet000";
+        let typed = "typed000";
+
+        assert!(
+            !is_interactive(typed),
+            "a terminal with no input must not be privileged"
+        );
+
+        note_terminal_input(typed);
+        assert!(
+            is_interactive(typed),
+            "a terminal just written to must be privileged"
+        );
+        assert!(
+            !is_interactive(quiet),
+            "privilege must be PER TERMINAL - one terminal being typed into must \
+             not exempt the whole fleet, or background floods ride along"
+        );
+
+        // The window must actually expire, so a terminal left alone returns to the
+        // shared schedule rather than keeping privilege forever.
+        {
+            let mut map = INTERACTIVE_UNTIL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.insert(typed.to_string(), Instant::now() - Duration::from_millis(1));
+        }
+        assert!(
+            !is_interactive(typed),
+            "privilege must lapse once the echo window passes"
+        );
+
+        // And the lapsed entry must not accumulate: a later write prunes it.
+        note_terminal_input("other000");
+        {
+            let map = INTERACTIVE_UNTIL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                !map.contains_key(typed),
+                "expired entries must be pruned, not retained per terminal forever"
+            );
+        }
     }
 
     #[test]
