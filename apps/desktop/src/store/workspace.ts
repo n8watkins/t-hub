@@ -35,12 +35,10 @@ import { useActivity } from "./activity";
 import { onControlEvent } from "../ipc/controlClient";
 import {
   CAPTAINS_TAB_ID,
-  CAPTAINS_TAB_NAME,
   DEFAULT_TAB_NAME,
   PERSIST_KEY,
   adoptOrphans,
   cwdBasename,
-  deriveLabel,
   loadPersisted,
   mergeLabels,
   newTabId,

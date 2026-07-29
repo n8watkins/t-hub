@@ -198,7 +198,6 @@ function CaptainPanel({ captainId }: { captainId: string }) {
       s.setGeometry(clamped);
     }
     // Run once per mount (per overlay open): the store then drives geometry.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // NOTE: Esc handling deliberately does NOT live here. Canvas owns the one

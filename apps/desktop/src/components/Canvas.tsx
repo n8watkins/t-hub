@@ -748,7 +748,7 @@ function TabGrid({
         if (el) el.style.flexGrow = String(rowCols[c]);
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Refs only, so there is nothing reactive to depend on.
   }, []);
 
   const onPointerMove = useCallback((e: PointerEvent) => {

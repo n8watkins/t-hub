@@ -112,7 +112,6 @@ export function mountHangDetector(): void {
             );
           } else if (e.entryType === "event") {
             // A slow input handler (typing into a busy terminal, a tab switch).
-            const ev = e as PerformanceEntry & { processingEnd?: number };
             if (dur < LONGTASK_LOG_MS) continue;
             ship(
               JSON.stringify({

@@ -106,8 +106,7 @@ export function beginTerminalDetach(
   detach: () => Promise<void>,
 ): Promise<void> {
   const previous = pendingDetaches.get(terminalId) ?? Promise.resolve();
-  let current: Promise<void>;
-  current = previous
+  const current: Promise<void> = previous
     .catch(() => undefined)
     .then(detach)
     .finally(() => {

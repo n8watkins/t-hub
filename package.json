@@ -17,6 +17,8 @@
     "test:host-contracts": "bash scripts/ci/local-test.sh host-contracts",
     "test:full": "bash scripts/ci/local-test.sh full",
     "typecheck": "pnpm --filter t-hub-desktop typecheck",
+    "lint": "pnpm --filter t-hub-desktop lint",
+    "lint:fix": "pnpm --filter t-hub-desktop lint:fix",
     "tauri": "pnpm --filter t-hub-desktop tauri"
   }
 }

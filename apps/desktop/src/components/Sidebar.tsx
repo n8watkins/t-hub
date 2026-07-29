@@ -52,7 +52,6 @@ import { CodexIcon } from "./CodexIcon";
 import { ChevronIcon } from "./SidebarChrome";
 import { usePersistedToggle } from "../hooks/usePersistedToggle";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
-import type { TerminalId } from "../ipc/types";
 
 // --- Sidebar header chrome -------------------------------------------------
 // The window controls (minimize / maximize-restore / close) and the PRIMARY
@@ -685,6 +684,10 @@ function SidebarRail({
  * secondary settings gear. The empty middle is also a drag handle so the window
  * can still be moved by grabbing the header.
  */
+// DEAD CODE, staged for removal: nothing renders SidebarHeader any more - the
+// full-mode header is assembled inline. Kept out of the lint-introduction
+// change so the deletion can be reviewed on its own.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function SidebarHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
   const toggleSettings = useSettings((s) => s.toggleSettings);
   return (

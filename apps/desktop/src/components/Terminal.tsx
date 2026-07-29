@@ -1106,7 +1106,7 @@ export function TerminalView({
               document.removeEventListener("visibilitychange", onVisibilityChanged);
             });
 
-            const offExit = await onExit(terminalId, (e) => {
+            const offExit = await onExit(terminalId, () => {
               if (disposed) return;
               // VERIFY BEFORE EXIT: an exit event alone doesn't prove the
               // process died — the server-side attach client also exits on a
