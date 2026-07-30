@@ -486,7 +486,8 @@ fn schema_claim_captain() -> Value {
         "type": "object",
         "properties": {
             "captainSessionId": { "type": "string", "description": "The captain's own session/terminal id (the tmux target is th_<id>)." },
-            "shipSlug":         { "type": "string", "description": "Optional ship name (slugified server-side; defaults to ship-<captainSessionId>). One captain per ship: a slug held by another captain is refused." },
+            "role":             { "type": "string", "enum": ["captain", "cortana"], "description": "Fleet role to claim; defaults to captain. 'cortana' is how the agent running in the orchestrator shell takes the singleton crown - nothing claims it on your behalf. It is refused unless the caller IS the terminal the durable Cortana record names, so an ordinary captain cannot request it." },
+            "shipSlug":         { "type": "string", "description": "Optional ship name (slugified server-side; defaults to ship-<captainSessionId>). One captain per ship: a slug held by another captain is refused. Ignored for role 'cortana', which always uses the reserved Cortana slug." },
             "provider":         { "type": "string", "enum": ["codex", "claude"], "description": "Harness that owns providerSessionId. Legacy callers default to Claude." },
             "providerSessionId": { "type": "string", "description": "Optional provider-native conversation id, such as CODEX_THREAD_ID or a Claude session UUID." },
             "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional existing Work Workspace ids this Captain owns. No placement, cwd, or active-tab inference occurs when omitted." }
@@ -1480,7 +1481,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "claim_captain",
             tier: Tier::Organization,
-            summary: "Claim captaincy of a ship in the server captains registry (one captain per ship; a captain self-registers with its own session id instead of hand-editing ship files).",
+            summary: "Claim captaincy of a ship in the server captains registry (one captain per ship; a captain self-registers with its own session id instead of hand-editing ship files). Pass role='cortana' from inside the orchestrator shell to claim the Cortana singleton.",
             input_schema: schema_claim_captain,
         },
         ToolDef {
@@ -1952,6 +1953,15 @@ mod tests {
         }
         let claim_schema = (find("claim_captain").unwrap().input_schema)();
         assert_eq!(claim_schema["required"], json!(["captainSessionId"]));
+        // The Cortana crown has to be REQUESTABLE. Nothing claims the singleton on
+        // an agent's behalf any more, and with `additionalProperties: false` an
+        // absent `role` made the ACL that permits a self-claim unreachable through
+        // MCP entirely - the permission existed with no path to it.
+        assert_eq!(
+            claim_schema["properties"]["role"]["enum"],
+            json!(["captain", "cortana"])
+        );
+        assert_eq!(claim_schema["additionalProperties"], json!(false));
         let rename_schema = (find("rename_captain").unwrap().input_schema)();
         assert_eq!(rename_schema["required"], json!(["displayName"]));
         assert_eq!(rename_schema["properties"]["displayName"]["maxLength"], 120);
