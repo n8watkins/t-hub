@@ -255,6 +255,38 @@ fn the_reserved_workspace_accepts_the_recorded_singleton_without_a_claim() {
     );
 }
 
+/// Any harness started in the orchestrator shell must learn how to take the
+/// Cortana role without being handed a skill, so T-Hub seeds the instructions in
+/// the home it creates: `AGENTS.md` for Codex, `CLAUDE.md` for Claude.
+///
+/// And it must never clobber an edited file - a doctrine update reaching existing
+/// installs is worth less than silently discarding the user's own changes.
+#[test]
+fn the_orchestrator_home_is_seeded_with_agent_instructions() {
+    let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+    let fixture = CortanaFixture::new("cortana-seed");
+    fixture.reconcile("cortana-seed-1").unwrap();
+
+    let agents = fixture.home.join("AGENTS.md");
+    let claude = fixture.home.join("CLAUDE.md");
+    let agents_body = std::fs::read_to_string(&agents).expect("AGENTS.md seeded");
+    assert!(
+        agents_body.contains("\"role\": \"cortana\""),
+        "the claim call must be spelled out: {agents_body}"
+    );
+    assert!(agents_body.contains("tmux display-message"));
+    let claude_body = std::fs::read_to_string(&claude).expect("CLAUDE.md seeded");
+    assert!(
+        claude_body.contains("AGENTS.md"),
+        "CLAUDE.md points at AGENTS.md rather than copying it: {claude_body}"
+    );
+
+    // An edited file survives the next reconcile untouched.
+    std::fs::write(&agents, "# mine\n").unwrap();
+    fixture.reconcile("cortana-seed-2").unwrap();
+    assert_eq!(std::fs::read_to_string(&agents).unwrap(), "# mine\n");
+}
+
 /// An `Unknown` liveness probe is a degraded control plane, not an absent
 /// session. Treating it as absent is precisely how a second shell gets created
 /// for a session that is in fact alive, so it must fail RETRYABLE instead.
