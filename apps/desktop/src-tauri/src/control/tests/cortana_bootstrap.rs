@@ -228,6 +228,19 @@ fn the_reserved_workspace_accepts_the_recorded_singleton_without_a_claim() {
     validate_workspace_report(&reported, &fixture.ctx.captains)
         .expect("the recorded singleton belongs in the reserved workspace");
 
+    // ...and the singleton is refused a WORK workspace, exactly as a claimed
+    // supervisor is. Without this the tile drifts out of the reserved workspace:
+    // the UI seeded the adopted shell into the user's own work tab and, once the
+    // Captain arm above started accepting, the server kept that placement.
+    let drifted = vec![TabRecord {
+        id: "work-tab".into(),
+        name: "thub".into(),
+        tile_ids: vec![terminal_id.clone()],
+    }];
+    let error = validate_workspace_report(&drifted, &fixture.ctx.captains)
+        .expect_err("the singleton belongs in the reserved workspace");
+    assert!(error.contains("belongs to Captain Workspace"), "{error}");
+
     // A terminal the durable record does NOT name is still refused there.
     let foreign = vec![TabRecord {
         id: CAPTAIN_WORKSPACE_ID.into(),
