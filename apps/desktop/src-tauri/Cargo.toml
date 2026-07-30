@@ -21,7 +21,7 @@ anyhow = "1"
 
 [package]
 name = "t-hub"
-version = "0.3.152"
+version = "0.3.153"
 description = "T-Hub - terminal-first command center for supervising Codex and Claude coding-agent sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"

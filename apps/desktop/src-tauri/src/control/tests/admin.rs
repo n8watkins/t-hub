@@ -405,14 +405,7 @@ fn fleet_admin_maintains_captains_without_crossing_into_crew_or_general_authorit
         .begin_cortana_recovery("fleet-admin-test")
         .unwrap();
     ctx.captains
-        .commit_cortana_runtime(
-            "fleet-admin-test",
-            &cortana_identity.id,
-            1,
-            &cortana_session,
-            "codex",
-            None,
-        )
+        .commit_cortana_shell("fleet-admin-test", &cortana_identity.id, &cortana_session)
         .unwrap();
     let fleet_admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
     ctx.identity

@@ -10,8 +10,6 @@ mod captains;
 mod commission;
 mod comms;
 mod cortana_bootstrap;
-mod cortana_launch;
-mod cortana_quarantine;
 mod events;
 mod file_commands;
 mod fleet;
@@ -37,11 +35,6 @@ mod worktrees;
 
 use std::sync::{mpsc, Mutex as StdMutex};
 use std::thread;
-
-// Real tmux fixture progress can be delayed substantially by the parallel
-// workspace suite, while thirty seconds remains a bounded failure signal.
-#[cfg(unix)]
-const TEST_ASYNC_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build a ControlContext backed by a real (empty) Supervisor + StatusBridge,
 /// with a fixed token, for dispatch tests.
@@ -545,9 +538,6 @@ const SCHEMA_17_REGISTRY_FIXTURE: &str = include_str!("../../fixtures/captains-s
 const SCHEMA_18_REGISTRY_FIXTURE: &str = include_str!("../../fixtures/captains-schema-18.json");
 const PACKAGED_SCHEMA_25_LEGACY_ORPHAN_FIXTURE: &str =
     include_str!("../../fixtures/captains-schema-25-packaged-legacy-orphan.json");
-const PACKAGED_SCHEMA_25_OBSERVED_LAUNCH_FIXTURE: &str =
-    include_str!("../../fixtures/captains-schema-25-packaged-observed-launch.json");
-
 /// A crew ref's tile ids, for concise assertions.
 fn crew_tiles(rec: &FleetIdentity) -> Vec<String> {
     rec.crew.iter().map(|c| c.terminal_id.clone()).collect()
@@ -798,7 +788,7 @@ fn mint_current_cortana_session(
     let operation_id = format!("test-cortana-{tile}");
     registry.begin_cortana_recovery(&operation_id).unwrap();
     registry
-        .commit_cortana_runtime(&operation_id, &identity.id, 1, tile, "codex", None)
+        .commit_cortana_shell(&operation_id, &identity.id, tile)
         .unwrap();
     identity.secret
 }

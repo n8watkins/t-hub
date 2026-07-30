@@ -510,7 +510,7 @@ pub(super) fn evaluate_spawn_capacity(
                 message: format!("spawn refused: {message}"),
             }
         })?;
-    let mut capacity = runtime_capacity_from_evidence(
+    let capacity = runtime_capacity_from_evidence(
         ctx,
         &snapshot,
         &live,
@@ -520,84 +520,10 @@ pub(super) fn evaluate_spawn_capacity(
         code: "refused-provider",
         message: format!("spawn refused: {message}"),
     })?;
-    let actual_live_sessions = capacity.live_sessions;
-    let configured_recovery_exclusions = if matches!(purpose, SpawnPurpose::Cortana)
-        && actual_live_sessions >= ctx.governor.max_sessions()
-        && matches!(
-            snapshot.cortana.recovery,
-            crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined { .. }
-        ) {
-        let mut exclusions = 0usize;
-        for quarantine in &snapshot.cortana.quarantine_ledger {
-            let target = tmux_target(&quarantine.terminal_id);
-            if live.tmux_sessions.iter().any(|session| session == &target) {
-                let observed = tmux::observe_session_effect_identity(&target)
-                    .map(durable_cortana_effect_identity)
-                    .map_err(|error| crate::governor::Refusal {
-                        code: "refused-evidence",
-                        message: format!(
-                            "spawn refused: quarantined Cortana '{}' process evidence is unavailable: {error}",
-                            quarantine.terminal_id
-                        ),
-                    })?;
-                if observed != quarantine.tmux
-                    || !ctx.identity.is_revoked(&quarantine.identity_id)
-                    || tmux::harness_liveness(&target, &quarantine.harness)
-                        != tmux::SessionLiveness::Alive
-                {
-                    return Err(crate::governor::Refusal {
-                        code: "refused-evidence",
-                        message: format!(
-                            "spawn refused: quarantined Cortana '{}' no longer matches its exact revoked process evidence",
-                            quarantine.terminal_id
-                        ),
-                    });
-                }
-                exclusions = exclusions.saturating_add(1);
-            } else if tmux::session_liveness(&target) != tmux::SessionLiveness::Gone {
-                return Err(crate::governor::Refusal {
-                    code: "refused-evidence",
-                    message: format!(
-                        "spawn refused: quarantined Cortana '{}' has uncertain liveness",
-                        quarantine.terminal_id
-                    ),
-                });
-            }
-        }
-        exclusions
-    } else {
-        0
-    };
-    if configured_recovery_exclusions > 0 {
-        if actual_live_sessions.saturating_add(1) > crate::governor::HARD_SESSION_CEILING {
-            return Err(crate::governor::Refusal {
-                code: "refused-ceiling",
-                message: "spawn refused: Cortana recovery would exceed the hard session ceiling"
-                    .into(),
-            });
-        }
-        if !capacity.machine_healthy
-            || actual_live_sessions.saturating_add(1) > capacity.machine_session_capacity
-        {
-            return Err(crate::governor::Refusal {
-                code: "refused-machine",
-                message: "spawn refused: Cortana recovery exceeds healthy machine capacity".into(),
-            });
-        }
-        if requested_provider_lanes
-            > capacity
-                .provider_session_capacity
-                .saturating_sub(capacity.provider_live_sessions)
-        {
-            return Err(crate::governor::Refusal {
-                code: "refused-provider",
-                message: "spawn refused: Cortana recovery exceeds provider capacity".into(),
-            });
-        }
-        capacity.live_sessions = capacity
-            .live_sessions
-            .saturating_sub(configured_recovery_exclusions);
-    }
+    // The Cortana singleton used to be able to spawn OVER the session ceiling by
+    // excluding runtimes it had quarantined from the live count. Quarantine is gone
+    // with the discovery machinery, and a Cortana shell is now an ordinary spawn
+    // against ordinary capacity.
     let configured_live_sessions = capacity.live_sessions;
     let request = crate::governor::DispatchPreflight {
         requested_lanes: vec![crate::governor::LaneClaim {
@@ -1478,47 +1404,4 @@ pub(super) fn spawn_tmux_terminal_with_id(
         ));
     }
     Ok((id.to_string(), tmux_session))
-}
-
-pub(super) fn spawn_managed_tmux_terminal_with_id(
-    id: &str,
-    cwd: &str,
-    command: Option<&str>,
-    env: &[(String, String)],
-    launch: &tmux::ManagedRuntimeLaunchSpec,
-) -> Result<(String, String, tmux::ManagedRuntimeOwnerToken), tmux::TmuxError> {
-    let tmux_session = format!("th_{id}");
-    let mut session_env = env.to_vec();
-    if !session_env
-        .iter()
-        .any(|(key, _)| key == PROVIDER_SESSION_ENV)
-    {
-        session_env.push((PROVIDER_SESSION_ENV.into(), "none".into()));
-    }
-    let owner = tmux::new_prepared_managed_session_with_env(
-        &tmux_session,
-        cwd,
-        command,
-        &session_env,
-        launch,
-    )?;
-    if !tmux::has_session(&tmux_session) {
-        tmux::retire_managed_runtime(&tmux_session, &owner).map_err(|cleanup| {
-            let mut error = cleanup;
-            error.message = format!(
-                "managed tmux session '{tmux_session}' was unobservable and exact owner cleanup failed: {}",
-                error.message
-            );
-            error
-        })?;
-        return Err(tmux::TmuxError {
-            op: "new-managed-session",
-            code: None,
-            io_kind: None,
-            message: format!(
-                "managed tmux session '{tmux_session}' did not materialize after ownership verification"
-            ),
-        });
-    }
-    Ok((id.to_string(), tmux_session, owner))
 }

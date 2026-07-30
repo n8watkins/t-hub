@@ -66,14 +66,13 @@ describe("parseCortanaReconcileResult", () => {
     expect(
       parseCortanaReconcileResult({
         operationId: CORTANA_RECONCILE_OPERATION_ID,
-        action: "recover",
+        action: "adopt",
         healthy: true,
         terminalId: "c0ffee01",
         identityId: "identity-cortana",
-        generation: 2,
         degradedReason: null,
       }),
-    ).toMatchObject({ healthy: true, generation: 2 });
+    ).toMatchObject({ healthy: true, action: "adopt", terminalId: "c0ffee01" });
   });
 
   it("preserves an explicit degraded reason", () => {
@@ -84,32 +83,40 @@ describe("parseCortanaReconcileResult", () => {
         healthy: false,
         terminalId: null,
         identityId: "identity-cortana",
-        generation: 4,
-        degradedReason: "duplicate authoritative generation",
+        degradedReason: "the orchestrator home is unavailable",
       }).degradedReason,
-    ).toBe("duplicate authoritative generation");
+    ).toBe("the orchestrator home is unavailable");
   });
 
   it("rejects false health and malformed evidence", () => {
     expect(() =>
       parseCortanaReconcileResult({
         operationId: CORTANA_RECONCILE_OPERATION_ID,
-        action: "keep",
+        action: "adopt",
         healthy: true,
         terminalId: null,
         identityId: "identity-cortana",
-        generation: 1,
         degradedReason: null,
       }),
     ).toThrow("claimed health");
     expect(() =>
       parseCortanaReconcileResult({
         operationId: CORTANA_RECONCILE_OPERATION_ID,
-        action: "keep",
+        action: "adopt",
         healthy: true,
         terminalId: "   ",
         identityId: "identity-cortana",
-        generation: 1,
+        degradedReason: null,
+      }),
+    ).toThrow("malformed identity");
+    expect(() =>
+      parseCortanaReconcileResult({
+        operationId: CORTANA_RECONCILE_OPERATION_ID,
+        // A retired action from the discovery-era contract.
+        action: "keep",
+        healthy: true,
+        terminalId: "c0ffee01",
+        identityId: "identity-cortana",
         degradedReason: null,
       }),
     ).toThrow("malformed identity");
@@ -123,11 +130,10 @@ describe("createCortanaReconciliationMonitor", () => {
 
   const healthy = (terminalId = "c0ffee01") => ({
     operationId: CORTANA_RECONCILE_OPERATION_ID,
-    action: "keep",
+    action: "adopt",
     healthy: true,
     terminalId,
     identityId: "identity-cortana",
-    generation: 3,
     degradedReason: null,
   });
 
@@ -231,8 +237,7 @@ describe("createCortanaReconciliationMonitor", () => {
       healthy: false,
       terminalId: null,
       identityId: null,
-      generation: 0,
-      degradedReason: "prepared cleanup pending",
+      degradedReason: "the orchestrator home is unavailable",
     };
     const reconcile = vi
       .fn<() => Promise<unknown>>()

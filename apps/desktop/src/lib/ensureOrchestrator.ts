@@ -23,9 +23,10 @@ export const ORCHESTRATOR_DISPLAY_NAME = "Cortana";
 export const CORTANA_RECONCILE_OPERATION_ID = "t-hub.desktop.cortana.startup.v1";
 
 /**
- * Backend reconciliation is cheap bounded control-plane work. This interval is
- * frequent enough to recover a dead harness without asking the model for status
- * and slow enough to avoid turning supervision into a polling workload.
+ * Backend reconciliation is cheap bounded control-plane work: one tmux liveness
+ * probe, plus one batched environment refresh when the shell is reattached. This
+ * interval is frequent enough to recreate a closed shell promptly and slow enough
+ * to avoid turning supervision into a polling workload.
  */
 export const CORTANA_RECONCILE_INTERVAL_MS = 30_000;
 
@@ -49,11 +50,12 @@ export const CORTANA_RECONCILE_MAX_BACKOFF_MS = 300_000;
 
 export interface CortanaReconcileResult {
   operationId: string;
-  action: "keep" | "adopt" | "recover" | "create" | "degraded";
+  /** `adopt` reattached the recorded shell, `create` made the one shell. A
+   *  `degraded` result reports an unhealthy singleton without throwing. */
+  action: "adopt" | "create" | "degraded";
   healthy: boolean;
   terminalId: string | null;
   identityId: string | null;
-  generation: number;
   degradedReason: string | null;
 }
 
@@ -67,22 +69,22 @@ export function parseCortanaReconcileResult(value: unknown): CortanaReconcileRes
     throw new Error("Cortana reconciliation returned no result.");
   }
   const result = value as Record<string, unknown>;
-  const actions = new Set(["keep", "adopt", "recover", "create", "degraded"]);
+  // `keep` and `recover` are gone with the generation ladder: the singleton is
+  // either reattached (`adopt`) or created. `generation` is no longer maintained,
+  // so requiring a positive one would reject every healthy result.
+  const actions = new Set(["adopt", "create", "degraded"]);
   if (
     !isNonEmptyString(result.operationId) ||
     !actions.has(String(result.action)) ||
     typeof result.healthy !== "boolean" ||
     (result.terminalId !== null && !isNonEmptyString(result.terminalId)) ||
     (result.identityId !== null && !isNonEmptyString(result.identityId)) ||
-    typeof result.generation !== "number" ||
-    !Number.isSafeInteger(result.generation) ||
-    result.generation < 0 ||
     (result.degradedReason !== null && typeof result.degradedReason !== "string")
   ) {
     throw new Error("Cortana reconciliation returned malformed identity or recovery evidence.");
   }
   const parsed = result as unknown as CortanaReconcileResult;
-  if (parsed.healthy && (!parsed.terminalId || !parsed.identityId || parsed.generation < 1)) {
+  if (parsed.healthy && (!parsed.terminalId || !parsed.identityId)) {
     throw new Error("Cortana reconciliation claimed health without a durable live identity.");
   }
   if (!parsed.healthy && parsed.action !== "degraded") {
