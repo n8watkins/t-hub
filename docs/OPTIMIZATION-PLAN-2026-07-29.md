@@ -128,7 +128,12 @@ Only blocks at or above roughly 200 ms are recorded, so this UNDERSTATES typical
 
 No investigation required. Do this first.
 
-1. Delete the six branches that are safe to remove. Three have content provably on `main`: `perf/lazy-settings-panel`, `refactor/split-control-tests`, `fix/terminal-stability`. Three are exact duplicates of a sibling, so delete one of each pair: `review/control-continuity-remediation-903435e`, `integrate/terminal-stability-a155`, `integrate/package56-preflight-a155`.
+1. DONE 2026-07-30 for four of the six, and the other two were assessed WRONG here.
+   Deleted after verifying the content is on `main` by finding the actual code, not by ancestry (`git cherry` and `--merged` are both useless on this repo - every commit bumps the version, and everything lands squashed):
+   `perf/lazy-settings-panel` (lazy/Suspense settings panel, `dmark`, `switch:unparked` all present), `refactor/split-control-tests` (its whole diff reverse-applies to main; the origin copy was deleted too), `fix/terminal-stability` (`RemotePty::is_alive` plus its two callers, `TERMINAL_COLD_AFTER_MS = 300_000`, the Canvas poll split, the prune deferral), and `review/control-continuity-remediation-903435e` (identical tree to `crew/control-continuity-remediation`).
+   The remaining two are NOT "exact duplicates of a sibling".
+   `integrate/terminal-stability-a155` differs from `-29bc` in 7 files and `integrate/package56-preflight-a155` differs from `-29bc` in 9, because the `-29bc` side predates the Powder removal and still carries `powder.rs` (5,644 lines) plus a much older `control.rs`.
+   They are the same work on very different bases, so the question is whether either integration branch is still wanted at all, not which twin to drop. Left in place pending that decision.
 2. Make `save_shared_layout` use `spawn_blocking`. It is at `apps/desktop/src-tauri/src/theme.rs:170`, an `async fn` doing a blocking `std::fs::write`, and it fires on every tab switch. This is the same fix PERF-AUDIT Tier 1 applied to other commands.
 3. Make `tlog` lazy at the pool sync call sites, `apps/desktop/src/components/TerminalPool.tsx` around lines 591, 614, and 652. The debug gate is checked INSIDE `tlog`, so the caller still builds a template string with several `Math.round` calls per terminal per sync even when diagnostics are off. Pass a thunk, or export a `diagEnabled()` check to guard the call site.
 
@@ -259,3 +264,5 @@ Append an entry per landed change. Keep it short and factual, and include the me
   `switch:unparked` now carries the split the phase needs before choosing a fix - `attachMs` (control round trip carrying the seed), `drainMs` (write-queue wait), `resetMs` (`term.reset()`), `replayMs` + `replayBytes` (seed enqueue, not paint).
   Neither code change is separately measurable, per the phase's own definition of done; the marker split is what the next Windows install should be read for.
   Green: `workspace_gate.sh full`, clippy `-D warnings`, fmt, typecheck, 636 vitest, 7 Playwright.
+- 2026-07-30: Phase 0 branch prune, four of six deleted (see the corrected step 1 above).
+  The plan's claim that three branches were exact duplicates of a sibling held for one of them and was wrong for the other two, which is why the prune was verified branch by branch rather than executed as written.
