@@ -2,7 +2,7 @@
 
 Created: 2026-07-29.
 Last updated: 2026-07-29.
-Status: Phase 0 not started. Phases 1-4 not started.
+Status: Phases 0, 1, 2 and 4 not started. Phase 3 is SUPERSEDED by `docs/CORTANA-SIMPLIFICATION-PLAN.md`.
 
 This document is the working plan for the remaining performance and correctness work found during the 2026-07-29 optimization review.
 It is written to be picked up with NO prior conversation context.
@@ -175,6 +175,11 @@ An earlier attempt to simplify it would have broken those tests and re-opened th
 Definition of done: `boot:first-paint` and `boot:reconcile-authoritative` improve against the section 3 baselines.
 
 ### Phase 3: Cortana exit 91
+
+SUPERSEDED on 2026-07-29 by `docs/CORTANA-SIMPLIFICATION-PLAN.md`.
+That plan removes the discovery and attestation mechanism rather than debugging why it disagrees with itself, so steps 1 through 3 below are no longer the work.
+The reasoning is that the machinery exists to discover runtimes in Cortana's home and cryptographically vet whether each is legitimately ours, and T-Hub does not need that: it can trust only the terminal id it wrote down itself.
+The rest of this section is kept as the record of what the failure looked like.
 
 Independent of every other phase and shares no files, so it can run in parallel with Phase 1.
 
