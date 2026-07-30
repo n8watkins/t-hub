@@ -242,7 +242,7 @@ Keep these in mind; each one cost real time.
 - The app installs PER USER at `%LOCALAPPDATA%\T-Hub`, not into `Program Files`.
 - The local Windows build needs two uncommitted edits to `tauri.conf.json`: `"targets": ["nsis"]` and `"createUpdaterArtifacts": false`. An rsync from the repo overwrites them, so re-apply after syncing.
 - `control::tests` requires a live tmux and is slow. It is covered by the `process` lane, not the `fast` lane. Run it directly for changes to `control.rs` or `tmux.rs`.
-- Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach.
+- Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach. It happened a SECOND time when `diagEnabled` was added, so those three mocks now spread the real module (`...(await importOriginal())`) instead of enumerating exports; keep them that way.
 - Do not arm an open-ended `until` wait on a condition you have reason to believe will not occur. Two such waits ran for 5 hours 41 minutes and 3 hours 37 minutes during this session before being noticed, each burning a sleep-polling shell. One waited for Cortana to become healthy, which is the very thing Phase 3 exists to fix. The other waited for hang-attribution lines that the session's own fixes had made impossible to produce. Both conditions were unreachable at the moment the wait was armed. Use a bounded wait with a timeout so an unreachable condition fails loudly instead of spinning silently, and prefer a single check plus a decision over an indefinite poll when the thing being waited on is itself under investigation.
 
 ---
@@ -253,3 +253,9 @@ Append an entry per landed change. Keep it short and factual, and include the me
 
 - 2026-07-29: Plan created. Phases 0 through 4 defined. Nothing started.
 - 2026-07-29: Added the unreachable-wait trap to section 7 after two background waits were found spinning for 5h41m and 3h37m on conditions that could not become true. No code change.
+- 2026-07-30: Phase 0 code changes plus the Phase 1 step-1 measurement, on `perf/phase0-and-switch-timing`.
+  `save_shared_layout` moved to `spawn_blocking` (an `async fn` doing blocking `std::fs::write` on every tab switch), with its synchronous half now unit-tested.
+  The four pool-sync `tlog` sites are guarded by an exported `diagEnabled()`, and `rectStr` is only built when diagnostics are on: it cost several `Math.round` calls per terminal per sync with diagnostics off.
+  `switch:unparked` now carries the split the phase needs before choosing a fix - `attachMs` (control round trip carrying the seed), `drainMs` (write-queue wait), `resetMs` (`term.reset()`), `replayMs` + `replayBytes` (seed enqueue, not paint).
+  Neither code change is separately measurable, per the phase's own definition of done; the marker split is what the next Windows install should be read for.
+  Green: `workspace_gate.sh full`, clippy `-D warnings`, fmt, typecheck, 636 vitest, 7 Playwright.

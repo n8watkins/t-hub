@@ -36,7 +36,14 @@ vi.mock("../lib/dropPaste", () => ({
   formatPathsForInsert: (paths: string[]) => paths.join(" "),
   installFileDropOnce: vi.fn(),
 }));
-vi.mock("../lib/diag", () => ({ tlog: vi.fn(), dmark: vi.fn() }));
+vi.mock("../lib/diag", async (importOriginal) => ({
+  // Spread the REAL module rather than enumerating exports: this mock has been
+  // broken twice by a NEW diag export (`dmark`, then `diagEnabled`), because a
+  // missing key makes any call throw from inside a component render.
+  ...(await importOriginal<typeof import("../lib/diag")>()),
+  tlog: vi.fn(),
+  dmark: vi.fn(),
+}));
 vi.mock("@tauri-apps/plugin-shell", () => ({ open: vi.fn(async () => {}) }));
 
 vi.mock("@xterm/xterm", () => ({

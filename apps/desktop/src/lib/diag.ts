@@ -23,7 +23,7 @@ import { invoke } from "@tauri-apps/api/core";
  * for non-DOM contexts. Flip at runtime from devtools via `setDiagEnabled(true)`.
  * Default OFF.
  */
-let diagEnabled = ((): boolean => {
+let diagOn = ((): boolean => {
   try {
     if (typeof window !== "undefined" && (window as { __T_HUB_DEBUG__?: unknown }).__T_HUB_DEBUG__) {
       return true;
@@ -41,8 +41,22 @@ let diagEnabled = ((): boolean => {
  * Toggle the `tlog` DEBUG gate at runtime (e.g. from devtools) WITHOUT a rebuild.
  * Persists to `localStorage` (best-effort) so the choice survives a reload.
  */
+/**
+ * Whether `tlog` would emit.
+ *
+ * `tlog` gates internally, so a caller never has to check this - EXCEPT where
+ * building the arguments is itself expensive. The pool sync loop is the case
+ * that matters: it composes a template string with several `Math.round` calls
+ * per terminal per sync, and that work happened on every sync even with
+ * diagnostics off. Guard those call sites with `if (diagEnabled())`; do not
+ * sprinkle it anywhere else, because the gate inside `tlog` is already free.
+ */
+export function diagEnabled(): boolean {
+  return diagOn;
+}
+
 export function setDiagEnabled(on: boolean): void {
-  diagEnabled = on;
+  diagOn = on;
   try {
     if (typeof localStorage !== "undefined") {
       if (on) localStorage.setItem("t-hub.debug", "1");
@@ -101,7 +115,7 @@ function compact(arg: unknown): unknown {
 export function tlog(tag: string, ...args: unknown[]): void {
   // Gate FIRST: when DEBUG is off this is a near-total no-op — no message build,
   // no console.log, no invoke. Cheap module-level boolean; flip via setDiagEnabled.
-  if (!diagEnabled) return;
+  if (!diagOn) return;
   // Console first so a devtools session still sees everything live.
   console.log(`[${tag}]`, ...args);
   try {
@@ -115,7 +129,7 @@ export function tlog(tag: string, ...args: unknown[]): void {
 /**
  * PHASE MARKER - an always-on, un-gated timing sample.
  *
- * Deliberately NOT behind `diagEnabled` like [`tlog`]. The whole point is to get
+ * Deliberately NOT behind the debug gate like [`tlog`]. The whole point is to get
  * numbers off a NORMAL run on the user's machine without asking them to flip a
  * debug flag first, so the markers have to fire by default. That is only safe
  * because they are RARE by construction: a boot emits under a dozen and a

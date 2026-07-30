@@ -41,7 +41,7 @@ import type { TerminalId } from "../ipc/types";
 // orchestrator can read from a RELEASE build (no devtools). Importing this here
 // also self-installs the console/window diag hooks once at app startup (the pool
 // mounts with the canvas) — see src/lib/diag.ts.
-import { tlog } from "../lib/diag";
+import { diagEnabled, tlog } from "../lib/diag";
 import {
   removeTerminalResources,
   updateTerminalResources,
@@ -571,9 +571,12 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         const rect = slot?.getBoundingClientRect();
         const rectOk =
           !!rect && rect.width > 0 && rect.height > 0 && !baseDegenerate;
-        const rectStr = rect
-          ? `${Math.round(rect.width)}x${Math.round(rect.height)}`
-          : "none";
+        // Diagnostics only, so it is built ONLY when diagnostics are on: this
+        // runs per terminal per sync, and the sync loop is on the switch path.
+        const rectStr =
+          diagEnabled() && rect
+            ? `${Math.round(rect.width)}x${Math.round(rect.height)}`
+            : "none";
 
         // ===== ELIGIBLE INVARIANT: show, never park for a transient rect. =====
         if (show) {
@@ -588,14 +591,19 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
               height: rect.height,
             });
             const transform = `translate(${offsetX}px, ${offsetY}px)`;
-            tlog(
-              "pool",
-              `sync(${trigger}) SHOW ${id} (eligible): rect ${rectStr} @ (${Math.round(
-                offsetX,
-              )},${Math.round(offsetY)}) base ${Math.round(
-                base.width,
-              )}x${Math.round(base.height)} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
-            );
+            // Guarded: `tlog` gates internally, but composing this message costs
+            // four `Math.round` calls and a template build PER TERMINAL PER SYNC,
+            // and that ran even with diagnostics off.
+            if (diagEnabled()) {
+              tlog(
+                "pool",
+                `sync(${trigger}) SHOW ${id} (eligible): rect ${rectStr} @ (${Math.round(
+                  offsetX,
+                )},${Math.round(offsetY)}) base ${Math.round(
+                  base.width,
+                )}x${Math.round(base.height)} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
+              );
+            }
             applyVisible(wrap, transform, rect.width, rect.height, id);
             // A real measure landed -> layout has settled for this id; reset the
             // deferred retry budget so future transient reflows get a fresh chain.
@@ -611,16 +619,18 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           // position. Per the invariant we do NOT park an eligible terminal.
           const lastGood = lastGoodRectRef.current.get(id);
           if (lastGood) {
-            tlog(
-              "pool",
-              `sync(${trigger}) HOLD ${id} (eligible): degenerate rect=${rectStr} ` +
-                `baseDegenerate=${baseDegenerate}; pinning to last-good ` +
-                `${Math.round(lastGood.width)}x${Math.round(
-                  lastGood.height,
-                )} @ (${Math.round(lastGood.offsetX)},${Math.round(
-                  lastGood.offsetY,
-                )}) activeTab=${activeTabId}; scheduling re-sync`,
-            );
+            if (diagEnabled()) {
+              tlog(
+                "pool",
+                `sync(${trigger}) HOLD ${id} (eligible): degenerate rect=${rectStr} ` +
+                  `baseDegenerate=${baseDegenerate}; pinning to last-good ` +
+                  `${Math.round(lastGood.width)}x${Math.round(
+                    lastGood.height,
+                  )} @ (${Math.round(lastGood.offsetX)},${Math.round(
+                    lastGood.offsetY,
+                  )}) activeTab=${activeTabId}; scheduling re-sync`,
+              );
+            }
             const transform = `translate(${lastGood.offsetX}px, ${lastGood.offsetY}px)`;
             applyVisible(wrap, transform, lastGood.width, lastGood.height, id);
             needDeferred = true;
@@ -632,11 +642,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           // has no geometry to place — leave whatever transform it has and let
           // the deferred re-sync land a real position next frame. We deliberately
           // do NOT park it offscreen, since an eligible terminal must never blank.
-          tlog(
-            "pool",
-            `sync(${trigger}) WAIT ${id} (eligible): no rect (${rectStr}) and no ` +
-              `last-good yet; keeping visible, scheduling re-sync activeTab=${activeTabId}`,
-          );
+          if (diagEnabled()) {
+            tlog(
+              "pool",
+              `sync(${trigger}) WAIT ${id} (eligible): no rect (${rectStr}) and no ` +
+                `last-good yet; keeping visible, scheduling re-sync activeTab=${activeTabId}`,
+            );
+          }
           wrap.style.visibility = "visible";
           wrap.style.pointerEvents = "";
           needDeferred = true;
@@ -649,11 +661,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         // but invisible + inert, parked offscreen so it never overlaps the active
         // grid (or the in-tile surface). Park at the last known size so a hidden
         // terminal's xterm isn't forced to 0x0 (which would refit to 0 cols).
-        tlog(
-          "pool",
-          `sync(${trigger}) PARK ${id} (not-eligible): rect=${rectStr} ` +
-            `expanded=${expandedMap[id] ?? false} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
-        );
+        if (diagEnabled()) {
+          tlog(
+            "pool",
+            `sync(${trigger}) PARK ${id} (not-eligible): rect=${rectStr} ` +
+              `expanded=${expandedMap[id] ?? false} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
+          );
+        }
         wrap.style.visibility = "hidden";
         wrap.style.pointerEvents = "none";
         if (rect && rect.width > 0 && rect.height > 0) {
