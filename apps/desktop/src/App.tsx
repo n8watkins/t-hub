@@ -266,6 +266,15 @@ export default function App() {
         // Recovered: forget any dismissal so a LATER failure with the same text
         // is surfaced again rather than silently swallowed.
         setDismissedCortanaError(null);
+        // DESIGNATE it. `orchestratorId` is what puts Cortana in the sidebar
+        // Agents row (via `agentOrder`) and gives it the "Cortana" display name,
+        // and it used to be set ONLY from a captain claim with role `cortana`.
+        // Nothing auto-starts an agent in the shell any more, so that claim does
+        // not exist until the user starts one - and until then the singleton was
+        // running, adopted and healthy but absent from the sidebar entirely.
+        // This reconcile result IS the authoritative statement of which terminal
+        // is Cortana, so it is the right thing to designate from.
+        useCaptain.getState().setOrchestratorId(result.terminalId);
         const workspace = useWorkspace.getState();
         if (workspace.terminals[result.terminalId]) {
           workspace.moveTileToCaptainsTab(result.terminalId);

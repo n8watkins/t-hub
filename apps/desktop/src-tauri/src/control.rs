@@ -1906,6 +1906,13 @@ fn validate_workspace_occupant_records(
         (WorkspaceKind::Work, Some(ShipMembership::Supervisor { .. })) => Err(format!(
             "Workspace placement denied: Captain terminal '{terminal_id}' belongs to Captain Workspace"
         )),
+        // The other half of the singleton rule above. A claimed supervisor is
+        // refused a Work Workspace; the recorded Cortana must be too, or it drifts
+        // out of the reserved workspace and the reserved-workspace guarantee holds
+        // only until something reports otherwise.
+        (WorkspaceKind::Work, _) if cortana_terminal_id == Some(terminal_id) => Err(format!(
+            "Workspace placement denied: Cortana terminal '{terminal_id}' belongs to Captain Workspace"
+        )),
         (WorkspaceKind::Work, Some(ShipMembership::Crew { ship_slug })) => {
             if captains.iter().any(|captain| {
                 captain.ship_slug == ship_slug

@@ -166,3 +166,44 @@ describe("adopt-harden: debris never reaches the canvas once the server is autho
     expect(state.activeTabId).not.toBe(CAPTAINS_TAB_ID);
   });
 });
+
+// The Cortana shell is not ordinary debris and not an ordinary session: on a
+// registry-less boot it must seed into the RESERVED workspace, not the active
+// work tab. Observed live on 0.3.156: the adopted orchestrator shell landed in
+// the user's own "thub" work tab, because nothing auto-starts an agent in it any
+// more, so it holds no Fleet claim and looks like any other unplaced session.
+// Its durable cwd is what identifies it - the same signal `resolveOrchestrator`
+// uses.
+describe("orchestrator seeding", () => {
+  function orchestratorTerm(id: string): TerminalInfo {
+    return {
+      id,
+      tmuxSession: `th_${id}`,
+      cwd: "/home/natkins/.t-hub/orchestrator",
+      title: id,
+      state: "live",
+    };
+  }
+
+  it("seeds the orchestrator shell into the reserved workspace, not the active work tab", () => {
+    seed([{ id: "work", name: "thub", order: [] }], "work", false);
+    useWorkspace.getState().setTerminals([orchestratorTerm("000ebc93"), term("plain001")]);
+
+    const tabs = useWorkspace.getState().tabs;
+    const reserved = tabs.find((t) => t.id === CAPTAINS_TAB_ID);
+    const work = tabs.find((t) => t.id === "work");
+    expect(reserved?.order).toContain("000ebc93");
+    expect(work?.order).not.toContain("000ebc93");
+    // An ordinary session still takes the legacy append into the work tab.
+    expect(work?.order).toContain("plain001");
+  });
+
+  it("leaves placement to the server once the registry is authoritative", () => {
+    seed([{ id: "work", name: "thub", order: [] }], "work", true);
+    useWorkspace.getState().setTerminals([orchestratorTerm("000ebc93")]);
+
+    const tabs = useWorkspace.getState().tabs;
+    expect(tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).not.toContain("000ebc93");
+    expect(tabs.find((t) => t.id === "work")?.order).not.toContain("000ebc93");
+  });
+});
