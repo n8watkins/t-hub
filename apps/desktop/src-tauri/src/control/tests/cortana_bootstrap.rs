@@ -193,6 +193,55 @@ fn creating_the_shell_forwards_a_spawn_the_ui_can_render() {
     );
 }
 
+/// The reserved workspace must ACCEPT the recorded singleton before any agent
+/// has claimed it.
+///
+/// This is what a 0.3.154 restart actually did: the reconcile adopted the shell
+/// and placed its tile in Captain Workspace, and then every layout report the UI
+/// sent back was refused with "terminal '...' is not a durable Cortana or Captain
+/// identity" - four times in five seconds - because the occupant check only
+/// recognized an ACTIVE Fleet claim, and nothing auto-starts an agent to make one.
+#[test]
+fn the_reserved_workspace_accepts_the_recorded_singleton_without_a_claim() {
+    let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+    let fixture = CortanaFixture::new("cortana-placement");
+    let created = fixture.reconcile("cortana-placement-1").unwrap();
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    assert_eq!(
+        fixture
+            .ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .filter(|captain| captain.role == FleetRole::Cortana)
+            .count(),
+        0,
+        "the shell must have NO Fleet claim - that is the whole point"
+    );
+
+    let reported = vec![TabRecord {
+        id: CAPTAIN_WORKSPACE_ID.into(),
+        name: CAPTAIN_WORKSPACE_NAME.into(),
+        tile_ids: vec![terminal_id.clone()],
+    }];
+    validate_workspace_report(&reported, &fixture.ctx.captains)
+        .expect("the recorded singleton belongs in the reserved workspace");
+
+    // A terminal the durable record does NOT name is still refused there.
+    let foreign = vec![TabRecord {
+        id: CAPTAIN_WORKSPACE_ID.into(),
+        name: CAPTAIN_WORKSPACE_NAME.into(),
+        tile_ids: vec!["deadbeef".into()],
+    }];
+    let error = validate_workspace_report(&foreign, &fixture.ctx.captains)
+        .expect_err("a foreign tile must stay out of the reserved workspace");
+    assert!(
+        error.contains("not a durable Cortana or Captain identity"),
+        "{error}"
+    );
+}
+
 /// An `Unknown` liveness probe is a degraded control plane, not an absent
 /// session. Treating it as absent is precisely how a second shell gets created
 /// for a session that is in fact alive, so it must fail RETRYABLE instead.
