@@ -239,11 +239,26 @@ fn create_shell(
         }
     };
     let _ = captains_sync_apply(ctx);
-    let _ = organization_sync_apply(
+    // Tell the UI to MATERIALIZE the tile, not merely to move it.
+    //
+    // The webview seeds its terminal map from `list_terminals` exactly ONCE, at
+    // Canvas mount; the 15s poll after that calls `updateTerminalsMeta`, which
+    // refreshes cwd/title/state for terminals it already knows and never adds new
+    // ones. The singleton is created a moment AFTER that mount, so a `move_tile`
+    // for a tile the UI has no terminal record for is a no-op and Cortana stays
+    // invisible until the next reload. Forward the same shape the crew spawn path
+    // forwards, which is what makes the tile appear immediately.
+    let forward = with_sync(
         ctx,
-        "move_tile",
-        json!({"terminalId": terminal_id, "tabId": CAPTAIN_WORKSPACE_ID}),
+        json!({
+            "id": terminal_id,
+            "tmuxSession": tmux_session,
+            "cwd": home,
+            "name": "Cortana",
+            "tabId": CAPTAIN_WORKSPACE_ID,
+        }),
     );
+    let _ = forward_apply(ctx, "spawn_terminal", &forward);
     Ok(response(
         operation_id,
         crate::cortana_reconcile::CortanaReconcileAction::Create,

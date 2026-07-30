@@ -14,6 +14,7 @@ use super::*;
 struct CortanaFixture {
     ctx: ControlContext,
     home: std::path::PathBuf,
+    sink: Arc<RecordingSink>,
 }
 
 impl CortanaFixture {
@@ -23,7 +24,7 @@ impl CortanaFixture {
         });
         let mut ctx = test_ctx(name)
             .with_live_sessions(|| Ok(Vec::new()))
-            .with_apply_sink(sink);
+            .with_apply_sink(Arc::clone(&sink) as Arc<dyn ApplySink>);
         ctx.addr = "127.0.0.1:4242".into();
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
@@ -35,7 +36,12 @@ impl CortanaFixture {
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
-        Self { ctx, home }
+        Self { ctx, home, sink }
+    }
+
+    /// Every `(command, args)` the UI was asked to apply.
+    fn applied(&self) -> Vec<(String, Value)> {
+        self.sink.calls.lock().unwrap().clone()
     }
 
     fn reconcile(&self, operation_id: &str) -> Result<Value, String> {
@@ -135,6 +141,56 @@ fn reconcile_cortana_creates_one_shell_then_reattaches_to_it() {
     assert_eq!(steady["action"], "adopt");
     assert_eq!(steady["terminalId"], replacement);
     assert_eq!(fixture.live_cortana_sessions().len(), 1);
+}
+
+/// Creating the shell must MATERIALIZE its tile in the UI, not just move it.
+///
+/// The webview seeds its terminal map from `list_terminals` once at Canvas mount
+/// and never adds terminals afterwards - the 15s poll only refreshes metadata for
+/// ones it already has. The singleton is created just after that mount, so a
+/// `move_tile` for a terminal the UI has no record of is a no-op: Cortana existed
+/// in tmux and in the authoritative registry but was invisible until a reload,
+/// which is exactly what happened on the 0.3.154 install.
+#[test]
+fn creating_the_shell_forwards_a_spawn_the_ui_can_render() {
+    let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+    let fixture = CortanaFixture::new("cortana-tile-forward");
+    let created = fixture.reconcile("cortana-tile-1").unwrap();
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+    let spawns = fixture
+        .applied()
+        .into_iter()
+        .filter(|(command, _)| command == "spawn_terminal")
+        .collect::<Vec<_>>();
+    assert_eq!(spawns.len(), 1, "exactly one spawn forward: {spawns:?}");
+    let (_, args) = &spawns[0];
+    assert_eq!(args["id"], terminal_id);
+    assert_eq!(args["tabId"], CAPTAIN_WORKSPACE_ID);
+    assert_eq!(args["name"], "Cortana");
+    assert_eq!(args["tmuxSession"], tmux_target(&terminal_id));
+    assert_eq!(
+        args["cwd"].as_str().unwrap(),
+        fixture.home.to_string_lossy(),
+        "the tile must report the orchestrator home"
+    );
+    // The forward carries the tab registry snapshot, so the UI places the tile in
+    // the same transaction rather than needing a follow-up sync.
+    assert_eq!(args["sync"]["tabs"][0]["tileIds"][0], terminal_id, "{args}");
+
+    // Reattaching does NOT forward another spawn: the surviving session is
+    // already in the mount-time inventory, and a second spawn for a tile the UI
+    // holds would be a duplicate rather than a repair.
+    let adopted = fixture.reconcile("cortana-tile-1").unwrap();
+    assert_eq!(adopted["action"], "adopt");
+    assert_eq!(
+        fixture
+            .applied()
+            .into_iter()
+            .filter(|(command, _)| command == "spawn_terminal")
+            .count(),
+        1
+    );
 }
 
 /// An `Unknown` liveness probe is a degraded control plane, not an absent
