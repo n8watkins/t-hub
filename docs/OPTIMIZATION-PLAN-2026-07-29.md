@@ -253,3 +253,9 @@ Append an entry per landed change. Keep it short and factual, and include the me
 
 - 2026-07-29: Plan created. Phases 0 through 4 defined. Nothing started.
 - 2026-07-29: Added the unreachable-wait trap to section 7 after two background waits were found spinning for 5h41m and 3h37m on conditions that could not become true. No code change.
+- 2026-07-29: Cortana was rebuilt as a reattach-or-create shell singleton on `refactor/cortana-singleton` (0.3.153), superseding Phase 3.
+  Baseline: 3,194 `Cortana recovery failed` lines in the live diag log, a durable record at generation 16 with 15 revoked identities, a `managedLaunch` stuck in `prepared` that nothing could ever retire, and one orphaned `t-hub-*.scope` still running.
+  The exit-91 root cause was deliberately not established: the mechanism that fails exists to discover and vet runtimes T-Hub did not launch, and it is not needed, so it was removed instead of debugged.
+  Net -7,600 lines, with the compiler confirming no non-Cortana caller depended on the tmux managed-runtime cluster.
+  Green: 811 fast-lane, 405 `control::tests`, 30 `tmux::tests`, 636 vitest, clippy and typecheck clean; the new tests pass in parallel and serially.
+  NOT yet verified in a Windows build, which is the only measurement that decides whether Cortana is actually up.

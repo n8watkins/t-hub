@@ -1,11 +1,30 @@
 # Simplify Cortana to a reattach-or-create shell singleton
 
 Created: 2026-07-29.
-Status: item 1 (the Windows empty-cwd spawn fix) landed in PR #92. The Cortana simplification itself is in progress.
+Status: item 1 (the Windows empty-cwd spawn fix) landed in PR #92.
+The Cortana simplification is BUILT and green on `refactor/cortana-singleton`, and is not yet verified in a Windows build.
 
 This is the approved implementation plan.
 It supersedes Phase 3 of `docs/OPTIMIZATION-PLAN-2026-07-29.md`, which said to root-cause `observe-managed-runtime-owner exit 91`.
 The decision recorded here is to remove the mechanism instead of debugging it.
+
+## What the implementation changed relative to this plan
+
+Three things came out differently, and each is a correction to the plan rather than a deviation from its intent.
+
+1. `cortana_reconcile.rs` is NOT deleted; it is reduced to the persisted data model (244 lines, no logic, no tests).
+Deleting it outright would have taken the dormant field types with it, and the plan itself requires those fields to stay parseable.
+
+2. The Fleet claim is no longer published by T-Hub.
+`claim_captain` requires a LIVE harness in the terminal, and the singleton starts a plain shell, so there is nothing to claim at create time.
+The agent the user starts is what claims, which means `enforce_attach_authority` had to change: the RECORDED singleton may now assign the Cortana role to its own terminal.
+Without that the role was unreachable, because only an already-authoritative Cortana could assign it.
+This was not anticipated in the plan and is the one genuine authority change in the work.
+
+3. The two-pass lock dance is gone rather than preserved.
+Reconcile now takes dispatch admission, then the identity transaction, then provisioning, for its whole run - the same single order `commission_captain` uses.
+The old inspect-under-provisioning-then-re-enter pass existed to keep a 30-second poll off the admission lock; the reconcile is now short enough that it is not worth the complexity.
+`concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order` was rewritten to prove the surviving property (the two interleave without wedging) instead of the retired mechanism.
 
 ## Context
 
