@@ -424,9 +424,9 @@ pub(super) enum LeaseAuthority {
         project_id: String,
         generation: ScopedAuthorityGeneration,
     },
-    Cortana {
-        generation: u64,
-    },
+    /// The Cortana singleton. No payload: there is exactly one, and the durable
+    /// generation ladder it used to carry was retired with the discovery machinery.
+    Cortana,
     DelegatedAdmin {
         grant_id: String,
         grant_generation: u64,
@@ -537,19 +537,6 @@ impl CaptainControlLeases {
             .iter()
             .find(|(candidate, _)| ct_token_eq(candidate, secret))
             .map(|(_, lease)| lease.clone())
-    }
-
-    pub(super) fn revoke_identity(&self, identity_id: &str) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(secret) = state.by_identity.remove(identity_id) {
-            state.by_secret.remove(&secret);
-        }
-        state
-            .by_secret
-            .retain(|_, lease| lease.identity_id != identity_id);
     }
 
     #[cfg(test)]

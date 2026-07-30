@@ -78,11 +78,12 @@ async function installTauriMock(page: Page): Promise<void> {
             const request = args.args as Record<string, unknown> | undefined;
             return {
               operationId: String(request?.operationId ?? "browser-fixture"),
-              action: "keep",
+              // The singleton reattaches or creates; `keep` and `generation` were
+              // retired with the discovery-era contract.
+              action: "adopt",
               healthy: true,
               terminalId: "browser-cortana",
               identityId: "browser-cortana-identity",
-              generation: 1,
               degradedReason: null,
             };
           }

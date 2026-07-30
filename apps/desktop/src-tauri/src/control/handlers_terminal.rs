@@ -617,23 +617,11 @@ pub(super) fn close_terminal_with_policy(
     // but-slow session's re-probe is also `Unknown` - indistinguishable from dead - so
     // force reaps it too; force is a deliberate reap-during-wedge override, not a
     // never-touch-a-live-session guarantee. See `plan_close`.
-    let durable_cortana = ctx.captains.cortana_identity();
-    let teardown = if durable_cortana.terminal_id.as_deref() == Some(tile_id) {
-        durable_cortana
-            .owner
-            .as_ref()
-            .ok_or_else(|| {
-                "close_terminal: managed Cortana has no durable owner token and was preserved"
-                    .to_string()
-            })
-            .and_then(|owner| {
-                tmux::retire_managed_runtime(&target, &tmux_cortana_owner(owner))
-                    .map_err(String::from)
-            })
-    } else {
-        tmux::kill_session_tree(&target).map_err(String::from)
-    };
-    if let Err(error) = teardown {
+    // Cortana closes exactly like any other terminal now. It used to be torn down
+    // through its managed systemd scope, which meant a Cortana whose durable owner
+    // token was missing could not be closed at all ("was preserved"). The next
+    // reconcile simply recreates the shell.
+    if let Err(error) = tmux::kill_session_tree(&target).map_err(String::from) {
         return Err(retryable_error(format!(
             "failed to close terminal '{session_id}': {error}; durable close recovery remains prepared"
         )));

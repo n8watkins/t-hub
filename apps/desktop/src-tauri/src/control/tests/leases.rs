@@ -184,9 +184,7 @@ fn captain_control_lease_capacity_evicts_oldest_identity_binding() {
         let (secret, _) = leases.issue(CaptainControlLease {
             identity_id: format!("identity-{index}"),
             terminal_id: format!("terminal-{index}"),
-            authority: LeaseAuthority::Cortana {
-                generation: index as u64,
-            },
+            authority: LeaseAuthority::Cortana,
             expires_at: base + Duration::from_millis(index as u64),
             expires_at_epoch_ms: 10_000 + index as u64,
         });
@@ -198,9 +196,7 @@ fn captain_control_lease_capacity_evicts_oldest_identity_binding() {
     let (newest_secret, _) = leases.issue(CaptainControlLease {
         identity_id: "identity-newest".into(),
         terminal_id: "terminal-newest".into(),
-        authority: LeaseAuthority::Cortana {
-            generation: MAX_CAPTAIN_CONTROL_LEASES as u64,
-        },
+        authority: LeaseAuthority::Cortana,
         expires_at: base + Duration::from_secs(1),
         expires_at_epoch_ms: 20_000,
     });
