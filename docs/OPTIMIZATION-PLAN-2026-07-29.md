@@ -255,6 +255,12 @@ Append an entry per landed change. Keep it short and factual, and include the me
 
 - 2026-07-29: Plan created. Phases 0 through 4 defined. Nothing started.
 - 2026-07-29: Added the unreachable-wait trap to section 7 after two background waits were found spinning for 5h41m and 3h37m on conditions that could not become true. No code change.
+- 2026-07-29: Fixed a Windows-only defect where adding a terminal with no explicit cwd failed every time.
+  Baseline: three `spawn_terminal: could not resolve worktree activity: could not resolve WSL path ''` lines in the live diag log, and three new tests that reproduce that exact string against the pre-fix code.
+  `commands::resolve_cwd` returned an empty string on Windows by design, and the worktree admission gate cannot canonicalize `''`.
+  `resolve_spawn_cwd` now resolves the real WSL home through `files::user_home_path` (the same resolver `orchestrator_home` uses), the control-socket handler shares it instead of mirroring only its `$HOME` arm, and `WorktreeCoordinator::admit_activity` accepts an empty candidate as an explicitly unscoped admission for the degraded case.
+  Unscoped is the conservative direction, not a hole: `path_within` answers `true` for an unresolvable candidate, so such an admission is refused while any retirement is active and blocks a new one from starting.
+  Not a phase in this plan; it is item 1 of the Cortana simplification plan, landed separately as agreed.
 - 2026-07-29: Cortana was rebuilt as a reattach-or-create shell singleton on `refactor/cortana-singleton` (0.3.153), superseding Phase 3.
   Baseline: 3,194 `Cortana recovery failed` lines in the live diag log, a durable record at generation 16 with 15 revoked identities, a `managedLaunch` stuck in `prepared` that nothing could ever retire, and one orphaned `t-hub-*.scope` still running.
   The exit-91 root cause was deliberately not established: the mechanism that fails exists to discover and vet runtimes T-Hub did not launch, and it is not needed, so it was removed instead of debugged.

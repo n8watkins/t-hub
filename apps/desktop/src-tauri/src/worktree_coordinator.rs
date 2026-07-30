@@ -2244,16 +2244,33 @@ impl WorktreeCoordinator {
             .map(RetirementReservation::from)
     }
 
+    /// Admit activity that is about to run in `candidate_path`, refusing it while
+    /// that directory is reserved for Cargo cleanup and carrying the containment
+    /// evidence for every other in-flight retirement.
+    ///
+    /// An EMPTY `candidate_path` means the caller cannot name the directory: the
+    /// spawn path hands tmux an empty `-c` when the WSL home probe fails, so the
+    /// pane inherits wsl.exe's working directory and no path exists to gate on.
+    /// Refusing it is not an option - that made every default Windows spawn fail
+    /// with "could not resolve WSL path ''" - so admit it UNSCOPED instead. This is
+    /// still the conservative direction, not a hole: `path_within` answers `true`
+    /// for an unresolvable candidate, so an unscoped admission is treated as
+    /// possibly inside EVERY active retirement (refused while one is running) and
+    /// blocks a new retirement from starting underneath it.
     pub fn admit_activity(
         self: &Arc<Self>,
         candidate_path: &str,
         operation: &str,
     ) -> Result<WorktreeAdmissionGuard, String> {
-        let candidate_path = crate::files::canonical_posix_path_allow_missing(candidate_path)
-            .map(|path| normalize_path(&path))
-            .map_err(|error| {
-                format!("{operation}: could not resolve worktree activity: {error}")
-            })?;
+        let candidate_path = if candidate_path.trim().is_empty() {
+            String::new()
+        } else {
+            crate::files::canonical_posix_path_allow_missing(candidate_path)
+                .map(|path| normalize_path(&path))
+                .map_err(|error| {
+                    format!("{operation}: could not resolve worktree activity: {error}")
+                })?
+        };
         let boundary = self.boundary_for(&candidate_path);
         let records = {
             let _publication = self
@@ -5701,6 +5718,65 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("activity being admitted"));
         drop(matching);
+    }
+
+    /// Windows regression: a spawn with no explicit cwd hands the gate an empty
+    /// candidate, which cannot be canonicalized. It used to fail the whole spawn
+    /// with "could not resolve WSL path ''".
+    #[test]
+    fn admission_admits_an_unnameable_directory_when_no_cleanup_is_running() {
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        for candidate in ["", "   "] {
+            let guard = coordinator
+                .admit_activity(candidate, "spawn_terminal")
+                .unwrap();
+            assert_eq!(guard.canonical_path(), "");
+            let (command, env) = guard
+                .contain_process(Some("exec ${SHELL:-/bin/sh} -l"), Vec::new())
+                .unwrap();
+            assert_eq!(command.as_deref(), Some("exec ${SHELL:-/bin/sh} -l"));
+            assert!(env.is_empty());
+        }
+    }
+
+    /// The unscoped admission is conservative, not a hole: an unnameable candidate
+    /// counts as possibly inside every active retirement.
+    #[test]
+    fn admission_refuses_an_unnameable_directory_while_a_cleanup_is_running() {
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let record = coordinator
+            .begin_retirement_if_idle("/repo/worktrees/first", "/requests/first.json", |_| {
+                Ok(Vec::new())
+            })
+            .unwrap();
+
+        let Err(error) = coordinator.admit_activity("", "spawn_terminal") else {
+            panic!("an unnameable candidate must be refused while a cleanup is running");
+        };
+        assert!(error.contains("reserved for Cargo cleanup"), "{error}");
+        assert!(error.contains(&record.operation_id), "{error}");
+    }
+
+    /// ...and it blocks a cleanup from starting underneath it, exactly as a named
+    /// admission inside that worktree would.
+    #[test]
+    fn an_unnameable_admission_blocks_a_new_cleanup_from_starting() {
+        let coordinator = Arc::new(WorktreeCoordinator::ephemeral());
+        let unnameable = coordinator.admit_activity("", "spawn_terminal").unwrap();
+
+        let error = coordinator
+            .begin_retirement_if_idle("/repo/worktrees/first", "/requests/first.json", |_| {
+                Ok(Vec::new())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("activity being admitted"));
+
+        drop(unnameable);
+        coordinator
+            .begin_retirement_if_idle("/repo/worktrees/first", "/requests/first.json", |_| {
+                Ok(Vec::new())
+            })
+            .unwrap();
     }
 
     #[cfg(unix)]

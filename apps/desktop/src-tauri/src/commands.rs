@@ -61,7 +61,7 @@ pub struct TerminalInfo {
     pub id: String,
     pub tmux_session: String,
     /// The tile's working directory. At SPAWN time this is the dir the pane was
-    /// rooted at (`resolve_cwd`); on every `list_terminals` reconcile it is
+    /// rooted at (`resolve_spawn_cwd`); on every `list_terminals` reconcile it is
     /// REPLACED by the pane's *live* current path (`#{pane_current_path}` from
     /// `tmux::pane_info`), so it tracks the user `cd`-ing around. There is a
     /// single `cwd` field — the spawn value is just its initial seed, and the
@@ -231,28 +231,54 @@ fn stale_session_ids<S: std::hash::BuildHasher>(
 
 /// Resolve the working directory for a new terminal.
 ///
-/// Honors an explicit `cwd`; otherwise falls back to `$HOME` (Unix / WSL) or, as
-/// a last resort, the process working directory. This is the path tmux's
-/// `new-session -c` roots the pane at; on Windows it is a WSL-side path because
-/// the attach client runs inside the distro.
-fn resolve_cwd(opts: &SpawnOptions) -> String {
-    if let Some(cwd) = opts.cwd.as_ref().filter(|c| !c.trim().is_empty()) {
-        return cwd.clone();
+/// Honors an explicit `cwd`; otherwise falls back to the user's home directory.
+/// This is the path tmux's `new-session -c` roots the pane at, so it must always
+/// be a WSL-SIDE path: the pane runs inside the distro, and a host `C:\...`
+/// directory would be meaningless as `-c`. `files::user_home_path` is what makes
+/// this correct on Windows - it asks the configured distro for `$HOME` instead of
+/// reading the app process's (Windows) environment.
+///
+/// This used to return an EMPTY string on Windows and let the pane inherit
+/// wsl.exe's working directory. That was harmless until the worktree admission
+/// gate started resolving the same value: an empty candidate cannot be
+/// canonicalized, so every Windows spawn WITHOUT an explicit cwd failed with
+/// "spawn_terminal: could not resolve worktree activity: could not resolve WSL
+/// path ''".
+///
+/// Shared with the control socket's `spawn_terminal` so both entry points default
+/// identically.
+pub(crate) fn resolve_spawn_cwd(explicit: Option<&str>) -> String {
+    resolve_spawn_cwd_with(explicit, || crate::files::user_home_path().ok())
+}
+
+/// `resolve_spawn_cwd` with the home lookup injected, so the fallback ladder is
+/// testable off Windows (there `files::user_home_path` shells out to `wsl.exe`).
+fn resolve_spawn_cwd_with(
+    explicit: Option<&str>,
+    user_home: impl FnOnce() -> Option<String>,
+) -> String {
+    if let Some(cwd) = explicit.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        return cwd.to_string();
     }
-    // On Windows the tmux pane runs inside WSL, so a Windows path would be
-    // meaningless as `-c`; default to empty and let the pane inherit wsl.exe's
-    // working directory. On Unix, prefer $HOME, then the process cwd.
+    if let Some(home) = user_home()
+        .map(|home| home.trim().to_string())
+        .filter(|home| !home.is_empty())
+    {
+        return home;
+    }
+    // Degraded: the home probe failed. On Windows that is a bounded `wsl.exe`
+    // round trip which can time out, and there is no usable host fallback, so
+    // hand back an empty cwd and let the pane inherit wsl.exe's working directory
+    // as it always did. `WorktreeCoordinator::admit_activity` accepts an empty
+    // candidate as UNSCOPED rather than refusing the spawn.
     #[cfg(windows)]
     {
         String::new()
     }
     #[cfg(unix)]
     {
-        if let Some(home) = std::env::var_os("HOME") {
-            return home.to_string_lossy().to_string();
-        }
         std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|_| "/".to_string())
     }
 }
@@ -294,14 +320,17 @@ fn run_authorized_ui_spawn<T>(
     admission_context: &crate::control::ControlContext,
     opts: &SpawnOptions,
     provider_lanes: usize,
-    spawn: impl FnOnce(&crate::worktree_coordinator::WorktreeAdmissionGuard) -> Result<T, String>,
+    spawn: impl FnOnce(&crate::worktree_coordinator::WorktreeAdmissionGuard, &str) -> Result<T, String>,
 ) -> Result<T, String> {
     let args = serde_json::to_value(opts)
         .map_err(|error| format!("spawn_terminal: audit arguments are invalid: {error}"))?;
-    let cwd = resolve_cwd(opts);
+    // Resolve ONCE and hand the result to the spawn closure. The gate and tmux's
+    // `-c` must agree on the directory, and on Windows each resolution is a
+    // `wsl.exe` round trip.
+    let cwd = resolve_spawn_cwd(opts.cwd.as_deref());
     let _worktree_admission = admission_context.admit_worktree_activity(&cwd, "spawn_terminal")?;
     let _admission = admission_context.authorize_ui_spawn(provider_lanes, &args)?;
-    spawn(&_worktree_admission)
+    spawn(&_worktree_admission, &cwd)
 }
 
 /// The `resolve_pane_command` core over bare parts, shared with the control
@@ -374,7 +403,7 @@ fn spawn_terminal_blocking(
         admission_context,
         &opts,
         usize::from(provider_intent.is_some()),
-        |worktree_admission| {
+        |worktree_admission, cwd| {
             // The terminal id IS the tmux session's own suffix, so the id is stable and
             // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
             // after a reload (which strips `th_` off the session name), and the
@@ -385,7 +414,6 @@ fn spawn_terminal_blocking(
             let suffix = uuid::Uuid::new_v4().simple().to_string();
             let id = suffix[..8].to_string();
             let tmux_session = format!("th_{id}");
-            let cwd = resolve_cwd(&opts);
             let title = resolve_title(&opts);
 
             // Create the detached tmux session that backs this terminal. With
@@ -406,7 +434,7 @@ fn spawn_terminal_blocking(
             let (command, elevation) =
                 worktree_admission.contain_process(command.as_deref(), elevation)?;
             if let Err(error) =
-                tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
+                tmux::new_session_with_env(&tmux_session, cwd, command.as_deref(), &elevation)
             {
                 let mut rollback_error = None;
                 if let (Some(store), Some(identity)) = (
@@ -459,7 +487,7 @@ fn spawn_terminal_blocking(
             Ok(TerminalInfo {
                 id,
                 tmux_session,
-                cwd,
+                cwd: cwd.to_string(),
                 title,
                 state: TerminalState::Live,
             })
@@ -1137,6 +1165,42 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashSet;
 
+    #[test]
+    fn spawn_cwd_prefers_an_explicit_directory() {
+        assert_eq!(
+            resolve_spawn_cwd_with(Some("/repo/worktree"), || Some("/home/user".into())),
+            "/repo/worktree"
+        );
+    }
+
+    /// Windows regression: with no usable cwd this returned an empty string, and
+    /// the worktree admission gate cannot canonicalize `''`, so every default
+    /// Windows spawn failed. The home must be resolved, not left blank.
+    #[test]
+    fn spawn_cwd_falls_back_to_the_user_home_when_no_directory_is_given() {
+        for explicit in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_spawn_cwd_with(explicit, || Some("/home/user".into())),
+                "/home/user",
+                "explicit={explicit:?}"
+            );
+        }
+    }
+
+    /// A failed home probe must not fail the spawn. Windows degrades to tmux's
+    /// inherited directory (empty `-c`), which the gate admits as unscoped.
+    #[test]
+    fn spawn_cwd_degrades_when_the_home_probe_fails() {
+        let resolved = resolve_spawn_cwd_with(None, || None);
+        #[cfg(windows)]
+        assert_eq!(resolved, "");
+        #[cfg(unix)]
+        assert!(
+            resolved.starts_with('/'),
+            "unix keeps a real last resort: {resolved}"
+        );
+    }
+
     fn live(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
@@ -1203,7 +1267,7 @@ mod tests {
             capability: None,
         };
 
-        let result = run_authorized_ui_spawn(&context, &opts, 0, |_| {
+        let result = run_authorized_ui_spawn(&context, &opts, 0, |_, _| {
             effects_ran.set(true);
             identities.mint_for(crate::identity::Role::Crew, None)?;
             tmux::new_session_with_env(&tmux_session, "/tmp", None, &[])

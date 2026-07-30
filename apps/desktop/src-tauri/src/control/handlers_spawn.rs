@@ -1155,11 +1155,14 @@ pub(super) fn spawn_terminal_with_private_pane_command_and_id(
     // Spawn the tmux session SERVER-side (same id minting + pane wrap as the Tauri
     // `commands::spawn_terminal`) so the real id is known synchronously, the tile
     // can be placed in the registry atomically, and a hidden/suspended webview
-    // cannot lose the spawn. Mirror `commands::resolve_cwd`'s unix arm ($HOME
-    // fallback).
-    let cwd_effective = cwd
-        .clone()
-        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+    // cannot lose the spawn.
+    //
+    // Share `commands::resolve_spawn_cwd` rather than mirroring it. The local copy
+    // read `$HOME` directly, which mirrored only the UNIX arm: on Windows `HOME` is
+    // typically unset, so this yielded an empty cwd and the worktree gate below
+    // rejected it. It also passed a caller-sent `Some("")` straight through, which
+    // the shared resolver filters.
+    let cwd_effective = crate::commands::resolve_spawn_cwd(cwd.as_deref());
     let tmux_cwd = files::posix_form(&cwd_effective);
     let worktree_admission = ctx.admit_worktree_activity(&tmux_cwd, "spawn_terminal")?;
     let public_pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
