@@ -242,6 +242,8 @@ Keep these in mind; each one cost real time.
 - The app installs PER USER at `%LOCALAPPDATA%\T-Hub`, not into `Program Files`.
 - The local Windows build needs two uncommitted edits to `tauri.conf.json`: `"targets": ["nsis"]` and `"createUpdaterArtifacts": false`. An rsync from the repo overwrites them, so re-apply after syncing.
 - `control::tests` requires a live tmux and is slow. It is covered by the `process` lane, not the `fast` lane. Run it directly for changes to `control.rs` or `tmux.rs`.
+- `cargo test --workspace --lib` is NOT the gate. The `--lib` flag skips every integration-test target, which is where `mcp_e2e` lives - the suite that gates Cortana and captain authority end to end. Two green `--lib` runs still went red on CI for that reason. Run `apps/desktop/scripts/workspace_gate.sh full`, which is exactly what CI runs, plus `pnpm test:browser` when any frontend contract changes.
+- `pnpm test:browser` starts its own vite server on port 4180. A failed local run reporting `ERR_CONNECTION_REFUSED` is a dead server, not a test failure; re-run the whole `pnpm test:browser` command rather than a single Playwright case, and read the CI log for the real assertion.
 - Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach.
 - Do not arm an open-ended `until` wait on a condition you have reason to believe will not occur. Two such waits ran for 5 hours 41 minutes and 3 hours 37 minutes during this session before being noticed, each burning a sleep-polling shell. One waited for Cortana to become healthy, which is the very thing Phase 3 exists to fix. The other waited for hang-attribution lines that the session's own fixes had made impossible to produce. Both conditions were unreachable at the moment the wait was armed. Use a bounded wait with a timeout so an unreachable condition fails loudly instead of spinning silently, and prefer a single check plus a decision over an indefinite poll when the thing being waited on is itself under investigation.
 
@@ -258,4 +260,8 @@ Append an entry per landed change. Keep it short and factual, and include the me
   The exit-91 root cause was deliberately not established: the mechanism that fails exists to discover and vet runtimes T-Hub did not launch, and it is not needed, so it was removed instead of debugged.
   Net -7,600 lines, with the compiler confirming no non-Cortana caller depended on the tmux managed-runtime cluster.
   Green: 811 fast-lane, 405 `control::tests`, 30 `tmux::tests`, 636 vitest, clippy and typecheck clean; the new tests pass in parallel and serially.
+  CORRECTION (0.3.154): that verification was incomplete and CI caught two suites it missed, both of them asserting the retired contract.
+  `cargo test --workspace --lib` skips every integration-test target, so `mcp_e2e` (which gates Cortana authority end to end) and the Playwright browser suite were never run.
+  Use `apps/desktop/scripts/workspace_gate.sh full` - the script CI itself runs - not a narrower `--lib` invocation.
+  The `mcp_e2e` update is a genuine widening and is recorded in the plan doc: authority now rests on the durable record plus a live terminal, with no evidence required about the process running inside it.
   NOT yet verified in a Windows build, which is the only measurement that decides whether Cortana is actually up.
