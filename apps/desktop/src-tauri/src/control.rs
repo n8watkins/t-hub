@@ -1847,11 +1847,18 @@ fn validate_workspace_occupant(
     kind: WorkspaceKind,
 ) -> Result<(), String> {
     let snapshot = captains.snapshot();
-    validate_workspace_occupant_records(&snapshot.captains, terminal_id, workspace_id, kind)
+    validate_workspace_occupant_records(
+        &snapshot.captains,
+        snapshot.cortana.terminal_id.as_deref(),
+        terminal_id,
+        workspace_id,
+        kind,
+    )
 }
 
 fn validate_workspace_occupant_records(
     captains: &[CaptainRecord],
+    cortana_terminal_id: Option<&str>,
     terminal_id: &str,
     workspace_id: &str,
     kind: WorkspaceKind,
@@ -1885,6 +1892,14 @@ fn validate_workspace_occupant_records(
     });
     match (kind, membership) {
         (WorkspaceKind::Captain, Some(ShipMembership::Supervisor { .. })) => Ok(()),
+        // The RECORDED Cortana singleton belongs in the reserved workspace even
+        // before an agent claims it. T-Hub created that shell and `cortana.
+        // terminal_id` names it, which is precisely the "durable Cortana identity"
+        // this arm refuses without. Nothing auto-starts an agent any more, so the
+        // Fleet claim arrives later - and until it did, every layout report from
+        // the UI was denied and the tile the reconcile had just placed bounced
+        // straight back out.
+        (WorkspaceKind::Captain, _) if cortana_terminal_id == Some(terminal_id) => Ok(()),
         (WorkspaceKind::Captain, _) => Err(format!(
             "Workspace placement denied: terminal '{terminal_id}' is not a durable Cortana or Captain identity"
         )),
@@ -1915,12 +1930,17 @@ pub fn validate_workspace_report(
     captains: &CaptainsRegistry,
 ) -> Result<(), String> {
     let snapshot = captains.snapshot();
-    validate_workspace_report_records(tabs, &snapshot.captains)
+    validate_workspace_report_records(
+        tabs,
+        &snapshot.captains,
+        snapshot.cortana.terminal_id.as_deref(),
+    )
 }
 
 fn validate_workspace_report_records(
     tabs: &[TabRecord],
     captains: &[CaptainRecord],
+    cortana_terminal_id: Option<&str>,
 ) -> Result<(), String> {
     let mut placed = std::collections::HashSet::new();
     for tab in tabs {
@@ -1930,7 +1950,13 @@ fn validate_workspace_report_records(
                     "Workspace report assigns terminal '{terminal_id}' more than once"
                 ));
             }
-            validate_workspace_occupant_records(captains, terminal_id, &tab.id, tab.kind())?;
+            validate_workspace_occupant_records(
+                captains,
+                cortana_terminal_id,
+                terminal_id,
+                &tab.id,
+                tab.kind(),
+            )?;
         }
     }
     Ok(())
@@ -1999,6 +2025,7 @@ fn reconcile_supervisor_workspace_candidates(
 
 fn startup_supervisor_reconciliation_required(
     captains: &[CaptainRecord],
+    cortana_terminal_id: Option<&str>,
     current_tabs: &[TabRecord],
     reported_tabs: &[TabRecord],
 ) -> Result<bool, String> {
@@ -2032,7 +2059,7 @@ fn startup_supervisor_reconciliation_required(
         }
         let current = placements(current_tabs, terminal_id);
         if reported != current {
-            validate_workspace_report_records(reported_tabs, captains)?;
+            validate_workspace_report_records(reported_tabs, captains, cortana_terminal_id)?;
             return Err(format!(
                 "Workspace report attempted to redesignate Captain terminal '{terminal_id}' outside startup reconciliation"
             ));
@@ -2216,19 +2243,31 @@ pub fn apply_workspace_report(
             "Workspace report attempted to reinsert retired terminal '{retired}'"
         ));
     }
+    // The recorded singleton is a legitimate reserved-workspace occupant even
+    // with no Fleet claim yet (see `validate_workspace_occupant_records`).
+    let cortana_terminal_id = current_captains.cortana.terminal_id.clone();
     let previous_captains = current_captains.clone();
     let mut candidate_captains = current_captains.clone();
     let supervisor_reconciled =
         startup_supervisor_reconciliation_required(
             &candidate_captains.captains,
+            cortana_terminal_id.as_deref(),
             &current_tabs.tabs,
             &tabs,
         )? && reconcile_supervisor_workspace_candidates(&candidate_captains.captains, &mut tabs)?;
-    validate_workspace_report_records(&tabs, &current_captains.captains)?;
+    validate_workspace_report_records(
+        &tabs,
+        &current_captains.captains,
+        cortana_terminal_id.as_deref(),
+    )?;
     let crew_reconciled =
         reconcile_crew_workspace_candidates(&mut candidate_captains.captains, &mut tabs)?;
     let reconciled = supervisor_reconciled || crew_reconciled;
-    validate_workspace_report_records(&tabs, &candidate_captains.captains)?;
+    validate_workspace_report_records(
+        &tabs,
+        &candidate_captains.captains,
+        cortana_terminal_id.as_deref(),
+    )?;
     let removed_tab_ids = current_tabs
         .tabs
         .iter()
