@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
 import { useCaptain, agentOrder } from "./store/captain";
+import { dmark } from "./lib/diag";
 import {
   createCortanaReconciliationMonitor,
+  resolveOrchestrator,
   type CortanaReconciliationMonitor,
 } from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
@@ -236,6 +238,7 @@ export default function App() {
   useEffect(() => {
     if (SATELLITE) return;
     let authoritativeTerminalId: string | null = null;
+    let cortanaFirstHealthyMarked = false;
     const monitor = createCortanaReconciliationMonitor({
       reconcile: () => {
         const operationId = cortanaRecoveryOperation.currentId();
@@ -246,6 +249,21 @@ export default function App() {
       },
       onResult: (result) => {
         cortanaRecoveryOperation.authoritativeResult();
+        // ONE marker per app run: how long the singleton actually took to reach a
+        // healthy reconcile. Observed at 64s on 0.3.157 with no error logged and
+        // the layout authoritative at 2.4s, so the cause is not understood - and
+        // guessing at a fix without measuring is what this plan's discipline
+        // exists to prevent. Rare by construction: first healthy result only.
+        if (!cortanaFirstHealthyMarked && result.healthy) {
+          cortanaFirstHealthyMarked = true;
+          dmark("cortana:first-healthy", {
+            action: result.action,
+            ms:
+              typeof performance !== "undefined"
+                ? Math.round(performance.now())
+                : -1,
+          });
+        }
         if (!result.healthy) {
           authoritativeTerminalId = null;
           setCortanaRecoveryError(
@@ -266,6 +284,15 @@ export default function App() {
         // Recovered: forget any dismissal so a LATER failure with the same text
         // is surfaced again rather than silently swallowed.
         setDismissedCortanaError(null);
+        // DESIGNATE it. `orchestratorId` is what puts Cortana in the sidebar
+        // Agents row (via `agentOrder`) and gives it the "Cortana" display name,
+        // and it used to be set ONLY from a captain claim with role `cortana`.
+        // Nothing auto-starts an agent in the shell any more, so that claim does
+        // not exist until the user starts one - and until then the singleton was
+        // running, adopted and healthy but absent from the sidebar entirely.
+        // This reconcile result IS the authoritative statement of which terminal
+        // is Cortana, so it is the right thing to designate from.
+        useCaptain.getState().setOrchestratorId(result.terminalId);
         const workspace = useWorkspace.getState();
         if (workspace.terminals[result.terminalId]) {
           workspace.moveTileToCaptainsTab(result.terminalId);
@@ -290,6 +317,19 @@ export default function App() {
       monitor.observeTerminals(state.terminals);
       if (authoritativeTerminalId && state.terminals[authoritativeTerminalId]) {
         state.moveTileToCaptainsTab(authoritativeTerminalId);
+      }
+      // Designate from the LIVE inventory as soon as the orchestrator shell is
+      // known, instead of waiting for a reconcile result. The shell is in the
+      // mount-time `list_terminals` seed within a couple of seconds; the first
+      // reconcile result was observed 64 seconds after launch, and until it
+      // arrived the sidebar had no Cortana at all. `resolveOrchestrator` is the
+      // pure helper written for exactly this and never wired up: it keeps a live
+      // designation, else adopts a live terminal whose cwd is the orchestrator
+      // home, else changes nothing. The server claim still wins when it lands.
+      const captain = useCaptain.getState();
+      if (!captain.orchestratorId) {
+        const resolved = resolveOrchestrator(captain.orchestratorId, state.terminals);
+        if (resolved) captain.setOrchestratorId(resolved);
       }
     });
     return () => {

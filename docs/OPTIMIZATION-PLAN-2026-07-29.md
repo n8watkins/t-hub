@@ -247,6 +247,9 @@ Keep these in mind; each one cost real time.
 - The app installs PER USER at `%LOCALAPPDATA%\T-Hub`, not into `Program Files`.
 - The local Windows build needs two uncommitted edits to `tauri.conf.json`: `"targets": ["nsis"]` and `"createUpdaterArtifacts": false`. An rsync from the repo overwrites them, so re-apply after syncing.
 - `control::tests` requires a live tmux and is slow. It is covered by the `process` lane, not the `fast` lane. Run it directly for changes to `control.rs` or `tmux.rs`.
+- `cargo test --workspace --lib` is NOT the gate. The `--lib` flag skips every integration-test target, which is where `mcp_e2e` lives - the suite that gates Cortana and captain authority end to end. Two green `--lib` runs still went red on CI for that reason. Run `apps/desktop/scripts/workspace_gate.sh full`, which is exactly what CI runs, plus `pnpm test:browser` when any frontend contract changes.
+- `pnpm test:browser` starts its own vite server on port 4180. A failed local run reporting `ERR_CONNECTION_REFUSED` is a dead server, not a test failure; re-run the whole `pnpm test:browser` command rather than a single Playwright case, and read the CI log for the real assertion.
+- Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach.
 - Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach. It happened a SECOND time when `diagEnabled` was added, so those three mocks now spread the real module (`...(await importOriginal())`) instead of enumerating exports; keep them that way.
 - Do not arm an open-ended `until` wait on a condition you have reason to believe will not occur. Two such waits ran for 5 hours 41 minutes and 3 hours 37 minutes during this session before being noticed, each burning a sleep-polling shell. One waited for Cortana to become healthy, which is the very thing Phase 3 exists to fix. The other waited for hang-attribution lines that the session's own fixes had made impossible to produce. Both conditions were unreachable at the moment the wait was armed. Use a bounded wait with a timeout so an unreachable condition fails loudly instead of spinning silently, and prefer a single check plus a decision over an indefinite poll when the thing being waited on is itself under investigation.
 
@@ -258,6 +261,22 @@ Append an entry per landed change. Keep it short and factual, and include the me
 
 - 2026-07-29: Plan created. Phases 0 through 4 defined. Nothing started.
 - 2026-07-29: Added the unreachable-wait trap to section 7 after two background waits were found spinning for 5h41m and 3h37m on conditions that could not become true. No code change.
+- 2026-07-29: Fixed a Windows-only defect where adding a terminal with no explicit cwd failed every time.
+  Baseline: three `spawn_terminal: could not resolve worktree activity: could not resolve WSL path ''` lines in the live diag log, and three new tests that reproduce that exact string against the pre-fix code.
+  `commands::resolve_cwd` returned an empty string on Windows by design, and the worktree admission gate cannot canonicalize `''`.
+  `resolve_spawn_cwd` now resolves the real WSL home through `files::user_home_path` (the same resolver `orchestrator_home` uses), the control-socket handler shares it instead of mirroring only its `$HOME` arm, and `WorktreeCoordinator::admit_activity` accepts an empty candidate as an explicitly unscoped admission for the degraded case.
+  Unscoped is the conservative direction, not a hole: `path_within` answers `true` for an unresolvable candidate, so such an admission is refused while any retirement is active and blocks a new one from starting.
+  Not a phase in this plan; it is item 1 of the Cortana simplification plan, landed separately as agreed.
+- 2026-07-29: Cortana was rebuilt as a reattach-or-create shell singleton on `refactor/cortana-singleton` (0.3.153), superseding Phase 3.
+  Baseline: 3,194 `Cortana recovery failed` lines in the live diag log, a durable record at generation 16 with 15 revoked identities, a `managedLaunch` stuck in `prepared` that nothing could ever retire, and one orphaned `t-hub-*.scope` still running.
+  The exit-91 root cause was deliberately not established: the mechanism that fails exists to discover and vet runtimes T-Hub did not launch, and it is not needed, so it was removed instead of debugged.
+  Net -7,600 lines, with the compiler confirming no non-Cortana caller depended on the tmux managed-runtime cluster.
+  Green: 811 fast-lane, 405 `control::tests`, 30 `tmux::tests`, 636 vitest, clippy and typecheck clean; the new tests pass in parallel and serially.
+  CORRECTION (0.3.154): that verification was incomplete and CI caught two suites it missed, both of them asserting the retired contract.
+  `cargo test --workspace --lib` skips every integration-test target, so `mcp_e2e` (which gates Cortana authority end to end) and the Playwright browser suite were never run.
+  Use `apps/desktop/scripts/workspace_gate.sh full` - the script CI itself runs - not a narrower `--lib` invocation.
+  The `mcp_e2e` update is a genuine widening and is recorded in the plan doc: authority now rests on the durable record plus a live terminal, with no evidence required about the process running inside it.
+  NOT yet verified in a Windows build, which is the only measurement that decides whether Cortana is actually up.
 - 2026-07-30: Phase 0 code changes plus the Phase 1 step-1 measurement, on `perf/phase0-and-switch-timing`.
   `save_shared_layout` moved to `spawn_blocking` (an `async fn` doing blocking `std::fs::write` on every tab switch), with its synchronous half now unit-tested.
   The four pool-sync `tlog` sites are guarded by an exported `diagEnabled()`, and `rectStr` is only built when diagnostics are on: it cost several `Math.round` calls per terminal per sync with diagnostics off.

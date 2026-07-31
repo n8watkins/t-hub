@@ -2513,12 +2513,23 @@ fn captain_control_continuity_process_merge_gate() {
         sessions["cortana"].as_str(),
     );
     initialize_mcp(&cortana, 210);
+    // CONTRACT CHANGE (Cortana singleton). This fixture is the durable record of a
+    // Cortana with a live terminal and an active Fleet claim, but no attested
+    // managed process. It used to be REFUSED, because authority additionally
+    // required revalidating a harness attestation against the live runtime.
+    //
+    // That attestation is gone: Cortana's authority is now the durable record (this
+    // identity, this terminal) plus its published Fleet claim, and the mutation path
+    // still independently requires the terminal to be live
+    // (`exact_live_identity_terminal`). So this record IS the singleton and its
+    // mutation is admitted. The trade is recorded in
+    // `docs/CORTANA-SIMPLIFICATION-PLAN.md`: a same-user process occupying that
+    // exact tmux session is no longer distinguished by cryptographic evidence.
     let cortana_mutation = call_tool(&cortana, 211, "new_tab", json!({"name": "Cortana scoped"}));
     assert_eq!(
-        cortana_mutation["result"]["isError"], true,
+        cortana_mutation["result"]["isError"], false,
         "{cortana_mutation}"
     );
-    assert!(tool_error_text(&cortana_mutation).contains("no active scoped mutation authority"));
     let fleet_appointment = call_tool(
         &cortana,
         212,
@@ -2530,7 +2541,7 @@ fn captain_control_continuity_process_merge_gate() {
         }),
     );
     assert_eq!(
-        fleet_appointment["result"]["isError"], true,
+        fleet_appointment["result"]["isError"], false,
         "{fleet_appointment}"
     );
 
@@ -2571,6 +2582,11 @@ fn captain_control_continuity_process_merge_gate() {
         sessions["fleetAdmin"].as_str(),
     );
     initialize_mcp(&fleet_admin, 230);
+    // The fleet admin now holds a REAL grant, because Cortana could appoint it (see
+    // the contract-change note above). That makes these two cases exercise the
+    // delegated-admin matrix itself rather than the absence of any grant: the
+    // permitted operation is admitted within its fleet scope, and an operation the
+    // grant does not permit is refused.
     let fleet_allowed = call_tool(
         &fleet_admin,
         231,
@@ -2580,7 +2596,14 @@ fn captain_control_continuity_process_merge_gate() {
             "target": {"kind": "fleet"}
         }),
     );
-    assert!(tool_error_text(&fleet_allowed).contains("no active scoped mutation authority"));
+    assert_eq!(fleet_allowed["result"]["isError"], false, "{fleet_allowed}");
+    let fleet_data = tool_structured(&fleet_allowed);
+    assert_eq!(fleet_data["delegatedAdmin"]["delegatedRole"], "fleetAdmin");
+    assert_eq!(
+        fleet_data["delegatedAdmin"]["delegatingSupervisorRole"],
+        "cortana"
+    );
+    assert_eq!(fleet_data["delegatedAdmin"]["scope"]["kind"], "fleet");
     let fleet_wrong_operation = call_tool(
         &fleet_admin,
         232,
@@ -2590,7 +2613,14 @@ fn captain_control_continuity_process_merge_gate() {
             "target": {"kind": "session", "sessionId": CONTINUITY_CREW}
         }),
     );
-    assert!(tool_error_text(&fleet_wrong_operation).contains("no active scoped mutation authority"));
+    assert_eq!(
+        fleet_wrong_operation["result"]["isError"], true,
+        "{fleet_wrong_operation}"
+    );
+    assert!(
+        tool_error_text(&fleet_wrong_operation).contains("is not present in the grant"),
+        "{fleet_wrong_operation}"
+    );
 
     let mut crew = McpProc::spawn(
         &bin,

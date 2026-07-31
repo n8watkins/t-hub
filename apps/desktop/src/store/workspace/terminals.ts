@@ -5,7 +5,9 @@
 // only mechanical change is that the store closure's `persist()` / `activeTab()`
 // helpers are now reached through `deps`.
 import type { TerminalInfo, TerminalId } from "../../ipc/types";
+import { isOrchestratorCwd } from "../../lib/ensureOrchestrator";
 import {
+  CAPTAINS_TAB_ID,
   DEFAULT_TAB_NAME,
   newTabId,
   workspaceKind,
@@ -93,7 +95,35 @@ export const createTerminalsSlice = (
           : [...recoveredFromCaptain, ...list.map((t) => t.id)].filter(
               (id, index, all) => !placed.has(id) && all.indexOf(id) === index,
             );
-      if (appended.length > 0) {
+      // The Cortana shell is NOT an ordinary session: it belongs in the reserved
+      // Captain Workspace, and appending it to a work tab is a placement the
+      // server will not keep. It reaches this path because nothing auto-starts an
+      // agent in it any more, so it holds no Fleet claim and is absent from
+      // `agentPresentationIds()` - the durable orchestrator cwd is what identifies
+      // it here, the same signal `resolveOrchestrator` uses. Observed live: the
+      // adopted shell landed in the user's own "thub" work tab.
+      const orchestratorIds = appended.filter((id) =>
+        isOrchestratorCwd(terminals[id]?.cwd),
+      );
+      const workAppended = appended.filter((id) => !orchestratorIds.includes(id));
+      if (orchestratorIds.length > 0) {
+        let captainIdx = nextTabs.findIndex(
+          (t) => workspaceKind(t) === "captain",
+        );
+        if (captainIdx < 0) {
+          nextTabs.push({
+            id: CAPTAINS_TAB_ID,
+            name: "Captain Workspace",
+            order: [],
+          });
+          captainIdx = nextTabs.length - 1;
+        }
+        nextTabs[captainIdx] = {
+          ...nextTabs[captainIdx],
+          order: [...nextTabs[captainIdx].order, ...orchestratorIds],
+        };
+      }
+      if (workAppended.length > 0) {
         let idx = nextTabs.findIndex(
           (t) => t.id === activeTabId && workspaceKind(t) === "work",
         );
@@ -109,7 +139,7 @@ export const createTerminalsSlice = (
         }
         nextTabs[idx] = {
           ...nextTabs[idx],
-          order: [...nextTabs[idx].order, ...appended],
+          order: [...nextTabs[idx].order, ...workAppended],
         };
         nextActiveTabId = nextTabs[idx].id;
       }

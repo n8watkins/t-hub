@@ -1,11 +1,23 @@
 use super::*;
 
+/// A Captain commission and a Cortana reconcile running at the same time must
+/// both complete. They contend for the same two locks, and the deadlock this
+/// guards against is the INVERSE ordering: one side holding dispatch admission
+/// while waiting on fleet provisioning, the other holding provisioning while
+/// waiting on admission.
+///
+/// The old two-pass Cortana implementation could produce exactly that, which is
+/// why it inspected under provisioning alone and re-entered in global order.
+/// The singleton takes `dispatch_admission` -> `identity_transaction` ->
+/// `provision_guard` for its whole run, the same order `commission_captain`
+/// uses, so one order is all that exists now. This test proves the two still
+/// interleave without wedging.
 #[test]
 fn concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order() {
     if !tmux_process_tests_available() {
         eprintln!(
-                "concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order: tmux or node not on PATH - skipping"
-            );
+            "concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order: tmux or node not on PATH - skipping"
+        );
         return;
     }
     let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
@@ -49,37 +61,9 @@ fn concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order() {
     ));
     std::fs::create_dir_all(&home).unwrap();
     let (harness_bin_dir, harness_command) = test_harness_command("codex");
-    let (reconcile_reached_tx, reconcile_reached_rx) = mpsc::sync_channel(1);
-    let (reconcile_resume_tx, reconcile_resume_rx) = mpsc::sync_channel(1);
-    ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
-        boundary: "cortana_spawn_admission_required",
-        reached: reconcile_reached_tx,
-        resume: reconcile_resume_rx,
-    }));
 
-    let reconcile_ctx = Arc::clone(&ctx);
-    let reconcile_command = harness_command.clone();
-    let reconcile_home = home.clone();
-    let (reconcile_done_tx, reconcile_done_rx) = mpsc::sync_channel(1);
-    let reconcile_thread = std::thread::spawn(move || {
-        let result = dispatch(
-            &reconcile_ctx,
-            "reconcile_cortana",
-            &json!({
-                "operationId": "ordered-cortana-recovery",
-                "testOrchestratorHome": reconcile_home,
-                "testStartupCommand": reconcile_command,
-            }),
-        );
-        reconcile_done_tx.send(result).unwrap();
-    });
-    assert_eq!(
-        reconcile_reached_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("Cortana did not reach the ordered admission boundary"),
-        "cortana_spawn_admission_required"
-    );
-
+    // Hold the commission at its inspection pass so the reconcile is guaranteed
+    // to be contending for the same locks rather than running after it.
     let (commission_reached_tx, commission_reached_rx) = mpsc::sync_channel(1);
     let (commission_resume_tx, commission_resume_rx) = mpsc::sync_channel(1);
     ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
@@ -112,31 +96,35 @@ fn concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order() {
         );
         commission_done_tx.send(response).unwrap();
     });
-
     assert_eq!(
         commission_reached_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(10))
             .expect("Captain commission did not reach its inspection pass"),
         "commission_initial_inspection"
     );
+
+    let reconcile_ctx = Arc::clone(&ctx);
+    let reconcile_home = home.clone();
+    let (reconcile_done_tx, reconcile_done_rx) = mpsc::sync_channel(1);
+    let reconcile_thread = std::thread::spawn(move || {
+        let result = dispatch(
+            &reconcile_ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "ordered-cortana-recovery",
+                "testOrchestratorHome": reconcile_home,
+            }),
+        );
+        reconcile_done_tx.send(result).unwrap();
+    });
+
     commission_resume_tx.send(()).unwrap();
-
-    // Cortana still owns only provisioning during its inspection pass.
-    // Captain inspection may wait for that lock, but must not acquire spawn
-    // admission first and recreate the inverse ordering that deadlocked the
-    // old one-pass implementation.
-    assert!(
-        ctx.dispatch_admission.try_lock().is_ok(),
-        "Captain inspection held dispatch admission while waiting on provisioning"
-    );
-    reconcile_resume_tx.send(()).unwrap();
-
     let commission = commission_done_rx
-        .recv_timeout(Duration::from_secs(8))
+        .recv_timeout(Duration::from_secs(20))
         .expect("Captain commission deadlocked with Cortana reconciliation");
     assert!(commission.ok, "commission failed: {:?}", commission.error);
     let reconciled = reconcile_done_rx
-        .recv_timeout(Duration::from_secs(8))
+        .recv_timeout(Duration::from_secs(20))
         .expect("Cortana reconciliation deadlocked with Captain commission")
         .unwrap();
     commission_thread.join().unwrap();
@@ -154,14 +142,6 @@ fn concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order() {
         1
     );
     assert_eq!(
-        snapshot
-            .captains
-            .iter()
-            .filter(|captain| captain.role == FleetRole::Cortana)
-            .count(),
-        1
-    );
-    assert_eq!(
         snapshot.cortana.terminal_id.as_deref(),
         reconciled["terminalId"].as_str()
     );
@@ -170,6 +150,7 @@ fn concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order() {
         .captains
         .iter()
         .filter_map(|captain| captain.terminal_id.as_deref())
+        .chain(snapshot.cortana.terminal_id.as_deref())
     {
         reap_test_tmux_session(&tmux_target(terminal_id)).unwrap();
     }

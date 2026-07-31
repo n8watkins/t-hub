@@ -127,7 +127,7 @@ impl CaptainsRegistry {
             }
             _ => None,
         };
-        let mut loaded = if let Some(reason) = incompatible_recovery {
+        let loaded = if let Some(reason) = incompatible_recovery {
             // A legacy or unknown recovery record can name an exact remote claim.
             // Never use an older backup, quarantine either copy, or expose a
             // partially loaded registry that could redispatch it.  Explicit safe
@@ -165,14 +165,6 @@ impl CaptainsRegistry {
                 }
             }
         };
-        if let Ok(snapshot) = &mut loaded {
-            if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION
-                && snapshot.cortana.legacy_orphan_provenance.is_none()
-            {
-                snapshot.cortana.legacy_orphan_provenance =
-                    Self::recover_schema18_cortana_provenance(&path, snapshot);
-            }
-        }
         if recovered_from_backup {
             if path.exists() {
                 let quarantine = path.with_extension(format!("json.corrupt.{}", now_ms()));
@@ -437,138 +429,12 @@ impl CaptainsRegistry {
         Ok(snapshot)
     }
 
-    pub(super) fn schema18_cortana_provenance(
-        source: &CaptainsSnapshot,
-        current: &CaptainsSnapshot,
-    ) -> Option<crate::cortana_reconcile::CortanaLegacyOrphanProvenance> {
-        if source.schema_version != 18
-            || source.seq > current.seq
-            || source.captains.iter().any(|captain| {
-                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-            })
-            || current.captains.iter().any(|captain| {
-                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-            })
-        {
-            return None;
-        }
-        let identity_id = source.cortana.identity_id.as_deref()?.trim();
-        let terminal_id = source.cortana.terminal_id.as_deref()?.trim();
-        let harness = source.cortana.harness.as_deref()?.trim();
-        let crate::cortana_reconcile::CortanaRecoveryState::Healthy { operation_id, .. } =
-            &source.cortana.recovery
-        else {
-            return None;
-        };
-        if identity_id.is_empty()
-            || harness.is_empty()
-            || operation_id.trim().is_empty()
-            || source.cortana.generation == 0
-            || exact_cortana_tmux_target(terminal_id).is_err()
-            || current.cortana.identity_id.as_deref() != Some(identity_id)
-            || current.cortana.generation != source.cortana.generation
-            || current.cortana.harness.as_deref() != Some(harness)
-            || current
-                .cortana
-                .terminal_id
-                .as_deref()
-                .is_some_and(|current_terminal| current_terminal != terminal_id)
-        {
-            return None;
-        }
-        Some(crate::cortana_reconcile::CortanaLegacyOrphanProvenance {
-            version: crate::cortana_reconcile::LEGACY_ORPHAN_PROVENANCE_VERSION,
-            source_schema_version: 18,
-            identity_id: identity_id.to_string(),
-            terminal_id: terminal_id.to_string(),
-            generation: source.cortana.generation,
-            harness: harness.to_string(),
-            healthy_operation_id: operation_id.trim().to_string(),
-        })
-    }
-
-    pub(super) fn recover_schema18_cortana_provenance(
-        path: &Path,
-        current: &CaptainsSnapshot,
-    ) -> Option<crate::cortana_reconcile::CortanaLegacyOrphanProvenance> {
-        let mut candidates = Vec::new();
-        if let Some(provenance) = Self::schema18_cortana_provenance(current, current) {
-            candidates.push(provenance);
-        }
-        let parent = path.parent()?;
-        let file_name = path.file_name()?.to_string_lossy();
-        let prefix = format!("{file_name}.migration-v");
-        let mut backups = std::fs::read_dir(parent)
-            .ok()?
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                (name.starts_with(&prefix) && name.ends_with(".bak")).then(|| entry.path())
-            })
-            .collect::<Vec<_>>();
-        backups.sort();
-        for backup in backups {
-            let Ok(source) = Self::read_snapshot(&backup) else {
-                continue;
-            };
-            if let Some(provenance) = Self::schema18_cortana_provenance(&source, current) {
-                candidates.push(provenance);
-            }
-        }
-        candidates.sort_by(|left, right| {
-            (
-                left.terminal_id.as_str(),
-                left.identity_id.as_str(),
-                left.generation,
-                left.harness.as_str(),
-                left.healthy_operation_id.as_str(),
-            )
-                .cmp(&(
-                    right.terminal_id.as_str(),
-                    right.identity_id.as_str(),
-                    right.generation,
-                    right.harness.as_str(),
-                    right.healthy_operation_id.as_str(),
-                ))
-        });
-        candidates.dedup();
-        (candidates.len() == 1).then(|| candidates.remove(0))
-    }
-
     pub(super) fn validate_snapshot(snapshot: &CaptainsSnapshot) -> Result<(), String> {
         let strict_runtime_identity =
             snapshot.schema_version >= STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION;
-        if let Some(provenance) = &snapshot.cortana.legacy_orphan_provenance {
-            let exact_binding = provenance.version
-                == crate::cortana_reconcile::LEGACY_ORPHAN_PROVENANCE_VERSION
-                && provenance.source_schema_version == 18
-                && !provenance.identity_id.trim().is_empty()
-                && !provenance.harness.trim().is_empty()
-                && !provenance.healthy_operation_id.trim().is_empty()
-                && provenance.generation > 0
-                && exact_cortana_tmux_target(&provenance.terminal_id).is_ok()
-                && snapshot.cortana.identity_id.as_deref() == Some(provenance.identity_id.as_str())
-                && snapshot.cortana.generation == provenance.generation
-                && snapshot.cortana.harness.as_deref() == Some(provenance.harness.as_str())
-                && snapshot
-                    .cortana
-                    .terminal_id
-                    .as_deref()
-                    .is_none_or(|terminal_id| terminal_id == provenance.terminal_id)
-                && !matches!(
-                    snapshot.cortana.recovery,
-                    crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. }
-                )
-                && !snapshot.captains.iter().any(|captain| {
-                    captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-                });
-            if snapshot.schema_version < 22 || !exact_binding {
-                return Err(
-                    "durable Cortana has invalid schema-v22 legacy orphan provenance".into(),
-                );
-            }
-        }
+        // `legacyOrphanProvenance` is a dormant discovery-era field: it existed to
+        // authorize replacing a schema-18 orphan, and nothing plans replacements any
+        // more. It is neither written nor read, so it is not validated.
         let mut project_ids = std::collections::HashSet::new();
         let mut roots = std::collections::HashSet::new();
         for project in &snapshot.projects {
@@ -952,143 +818,20 @@ impl CaptainsRegistry {
                     return Err(format!("durable Cortana has an empty {field}"));
                 }
             }
-            if durable.identity_id.is_some() != (durable.generation > 0) {
-                return Err(
-                    "durable Cortana identity and positive generation must be recorded together"
-                        .into(),
-                );
-            }
-            if durable
-                .owner
-                .as_ref()
-                .is_some_and(|owner| !valid_cortana_managed_owner(owner))
-                || snapshot.schema_version >= 24
-                    && matches!(
-                        durable.recovery,
-                        crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
-                    )
-                    && (durable.owner.is_none() || durable.managed_launch.is_some())
-            {
-                return Err("durable Cortana has an invalid managed owner".into());
-            }
-            if durable
-                .managed_launch
-                .as_ref()
-                .is_some_and(|launch| !valid_cortana_managed_launch(launch))
-            {
-                return Err("durable Cortana has an invalid managed launch intent".into());
-            }
-            if durable
-                .active_harness_attestation
-                .as_ref()
-                .is_some_and(|attestation| {
-                    !valid_cortana_active_harness_attestation(durable, attestation)
-                })
-            {
-                return Err("durable Cortana has an invalid active Harness attestation".into());
-            }
-            if durable
-                .active_harness_attestation_recovery
-                .as_ref()
-                .is_some_and(|recovery| {
-                    !valid_cortana_active_harness_attestation_recovery(durable, recovery)
-                })
-            {
-                return Err(
-                    "durable Cortana has an invalid active Harness attestation recovery".into(),
-                );
-            }
+            // The discovery-era fields - `owner`, `managedLaunch`, the two
+            // attestation records, the quarantine ledger, the legacy orphan
+            // provenance - are DORMANT. Nothing reads or writes them any more and
+            // the first successful reconcile clears them; they survive in the
+            // struct only so an existing captains.json still parses without a
+            // schema migration. There is therefore nothing meaningful left to
+            // validate about their contents, only the ledger's length bound, which
+            // is what keeps a hostile file from being unbounded.
+            //
+            // The old "identity and a positive generation are recorded together"
+            // invariant is gone with the generation ladder: a singleton that is
+            // reattached-or-created has an identity and no generation at all.
             if durable.quarantine_ledger.len() > MAX_CORTANA_QUARANTINE_RECORDS {
                 return Err("durable Cortana quarantine ledger exceeds its bound".into());
-            }
-            for (index, quarantine) in durable.quarantine_ledger.iter().enumerate() {
-                if quarantine.terminal_id.trim().is_empty()
-                    || quarantine.identity_id.trim().is_empty()
-                    || quarantine.generation == 0
-                    || quarantine.harness.trim().is_empty()
-                    || !quarantine.authority_revoked
-                    || quarantine.quarantined_at == 0
-                    || !valid_cortana_effect_identity(&quarantine.tmux)
-                {
-                    return Err("durable Cortana quarantine ledger has invalid evidence".into());
-                }
-                if durable.quarantine_ledger[..index].iter().any(|prior| {
-                    prior.terminal_id == quarantine.terminal_id
-                        || prior.identity_id == quarantine.identity_id
-                        || prior.tmux == quarantine.tmux
-                }) {
-                    return Err("durable Cortana quarantine ledger has conflicting evidence".into());
-                }
-            }
-            if let Some(launch) = durable.managed_launch.as_ref() {
-                let recovery_operation_id = match &durable.recovery {
-                    crate::cortana_reconcile::CortanaRecoveryState::Recovering {
-                        operation_id,
-                        ..
-                    }
-                    | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                        operation_id,
-                        ..
-                    }
-                    | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                        operation_id,
-                        ..
-                    }
-                    | crate::cortana_reconcile::CortanaRecoveryState::Degraded {
-                        operation_id,
-                        ..
-                    }
-                    | crate::cortana_reconcile::CortanaRecoveryState::Healthy {
-                        operation_id,
-                        ..
-                    } => Some(operation_id.as_str()),
-                    crate::cortana_reconcile::CortanaRecoveryState::Uninitialized => None,
-                };
-                if recovery_operation_id != Some(launch.operation_id.as_str()) {
-                    return Err(
-                        "durable Cortana managed launch and recovery operation disagree".into(),
-                    );
-                }
-                match launch.phase {
-                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared => {
-                        if durable.owner.is_some()
-                            && durable.terminal_id.as_deref() == Some(launch.terminal_id.as_str())
-                        {
-                            return Err(
-                                "prepared Cortana launch already publishes an owner binding".into(),
-                            );
-                        }
-                    }
-                    crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
-                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed => {
-                        let owner = durable
-                            .owner
-                            .as_ref()
-                            .ok_or("owner-observed Cortana launch has no durable managed owner")?;
-                        if durable.terminal_id.as_deref() != Some(launch.terminal_id.as_str())
-                            || owner.unit_name != launch.unit_name
-                            || owner.launch_nonce != launch.launch_nonce
-                        {
-                            return Err("observed Cortana launch and owner binding disagree".into());
-                        }
-                        if let Some(process) = launch.harness_process.as_ref() {
-                            if process.provider != launch.harness
-                                || process.tmux_session_id != owner.tmux.tmux_session_id
-                                || process.tmux_session_created != owner.tmux.tmux_session_created
-                                || process.tmux_window_id != owner.tmux.tmux_window_id
-                                || process.tmux_pane_id != owner.tmux.tmux_pane_id
-                                || process.pane_pid != owner.tmux.pane_pid
-                                || process.pane_start_ticks != owner.tmux.pane_start_ticks
-                                || process.cgroup_path != owner.cgroup_path
-                            {
-                                return Err(
-                                    "observed Cortana Harness process and owner disagree".into()
-                                );
-                            }
-                        }
-                    }
-                }
             }
             match &durable.recovery {
                 crate::cortana_reconcile::CortanaRecoveryState::Uninitialized => {}
@@ -1100,84 +843,15 @@ impl CaptainsRegistry {
                         return Err("durable Cortana has an invalid recovery operation".into());
                     }
                 }
+                // Retired states. A record written before the singleton
+                // simplification can still hold one, and the next reconcile takes
+                // over from it, so only the fields that are still read are checked.
                 crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
                     operation_id,
                     started_at,
-                    orphan_terminal_id,
-                    orphan_identity_id,
-                    orphan_generation,
-                    harness,
-                    effect_identity,
-                    managed_basis,
-                    replacement_identity_id,
+                    ..
                 } => {
-                    let managed_basis_valid = managed_basis.as_ref().is_none_or(|basis| {
-                        basis.version == crate::cortana_reconcile::MANAGED_QUARANTINE_BASIS_VERSION
-                            && basis.claim_ship_slug == CORTANA_SLUG
-                            && !basis.claim_assignment_id.trim().is_empty()
-                            && basis.claim_terminal_id == *orphan_terminal_id
-                            && basis.claim_harness == *harness
-                            && same_cortana_tmux_generation(&basis.owner.tmux, effect_identity)
-                            && valid_cortana_managed_owner(&basis.owner)
-                            && basis.active_harness_attestation
-                                == durable.active_harness_attestation
-                            && basis.replacement_generation == orphan_generation.saturating_add(1)
-                            && basis.prior_ledger_count == durable.quarantine_ledger.len()
-                            && basis.prior_ledger_sha256
-                                == cortana_quarantine_ledger_sha256(&durable.quarantine_ledger)
-                            && durable.owner.as_ref() == Some(&basis.owner)
-                            && snapshot
-                                .captains
-                                .iter()
-                                .filter(|captain| {
-                                    captain.role == FleetRole::Cortana
-                                        && captain.state == ClaimState::Active
-                                })
-                                .count()
-                                == 1
-                            && snapshot.captains.iter().any(|captain| {
-                                captain.role == FleetRole::Cortana
-                                    && captain.state == ClaimState::Active
-                                    && captain.ship_slug == basis.claim_ship_slug
-                                    && captain.assignment_id == basis.claim_assignment_id
-                                    && captain.terminal_id.as_deref()
-                                        == Some(basis.claim_terminal_id.as_str())
-                                    && captain.harness.as_deref()
-                                        == Some(basis.claim_harness.as_str())
-                            })
-                            && basis.workspace_ids
-                                == snapshot
-                                    .workspaces
-                                    .iter()
-                                    .filter(|workspace| {
-                                        workspace
-                                            .tile_ids
-                                            .iter()
-                                            .any(|tile| tile == &basis.claim_terminal_id)
-                                    })
-                                    .map(|workspace| workspace.id.clone())
-                                    .collect::<Vec<_>>()
-                    });
-                    if operation_id.trim().is_empty()
-                        || *started_at == 0
-                        || orphan_terminal_id.trim().is_empty()
-                        || orphan_identity_id.trim().is_empty()
-                        || *orphan_generation == 0
-                        || harness.trim().is_empty()
-                        || replacement_identity_id
-                            .as_deref()
-                            .is_some_and(|identity_id| identity_id.trim().is_empty())
-                        || durable.terminal_id.as_deref() != Some(orphan_terminal_id.as_str())
-                        || durable.identity_id.as_deref() != Some(orphan_identity_id.as_str())
-                        || durable.generation != *orphan_generation
-                        || durable.harness.as_deref() != Some(harness.as_str())
-                        || snapshot.schema_version < 23
-                        || !valid_cortana_effect_identity(effect_identity)
-                        || !managed_basis_valid
-                        || snapshot.schema_version >= 31
-                            && durable.owner.is_some()
-                            && managed_basis.is_none()
-                    {
+                    if operation_id.trim().is_empty() || *started_at == 0 {
                         return Err(
                             "durable Cortana has an invalid orphan replacement operation".into(),
                         );
@@ -1186,32 +860,9 @@ impl CaptainsRegistry {
                 crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
                     operation_id,
                     quarantined_at,
-                    legacy_terminal_id,
-                    legacy_generation,
-                    replacement_identity_id,
+                    ..
                 } => {
-                    let quarantine = durable.quarantine_ledger.iter().find(|quarantine| {
-                        quarantine.terminal_id == *legacy_terminal_id
-                            && quarantine.generation == *legacy_generation
-                            && quarantine.quarantined_at == *quarantined_at
-                    });
-                    if operation_id.trim().is_empty()
-                        || *quarantined_at == 0
-                        || legacy_terminal_id.trim().is_empty()
-                        || *legacy_generation == 0
-                        || replacement_identity_id
-                            .as_deref()
-                            .is_some_and(|identity_id| identity_id.trim().is_empty())
-                        || quarantine.is_none_or(|quarantine| {
-                            quarantine.terminal_id != *legacy_terminal_id
-                                || quarantine.generation != *legacy_generation
-                                || quarantine.identity_id.trim().is_empty()
-                                || quarantine.harness.trim().is_empty()
-                                || !quarantine.authority_revoked
-                                || quarantine.quarantined_at != *quarantined_at
-                                || !valid_cortana_effect_identity(&quarantine.tmux)
-                        })
-                    {
+                    if operation_id.trim().is_empty() || *quarantined_at == 0 {
                         return Err("durable Cortana has an invalid legacy quarantine".into());
                     }
                 }
@@ -1223,9 +874,6 @@ impl CaptainsRegistry {
                         || *verified_at == 0
                         || durable.identity_id.is_none()
                         || durable.terminal_id.is_none()
-                        || snapshot.schema_version >= 29
-                            && durable.active_harness_attestation.is_none()
-                        || durable.active_harness_attestation_recovery.is_some()
                     {
                         return Err("durable Cortana has an incomplete healthy state".into());
                     }
@@ -1401,9 +1049,10 @@ impl CaptainsRegistry {
 
     pub(super) fn provision_guard(&self) -> std::sync::MutexGuard<'_, ()> {
         // Lock order contract: callers that also need dispatch admission must
-        // acquire `ControlContext::dispatch_admission` first. Reconciliation may
-        // inspect under this lock alone, but it must release and retry in global
-        // order before creating a replacement runtime.
+        // acquire `ControlContext::dispatch_admission` FIRST. Cortana
+        // reconciliation used to inspect under this lock alone and re-enter in
+        // global order before creating a runtime; it now takes both in order for
+        // its whole (short) run, so there is only the one order left.
         self.provision.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -1508,17 +1157,12 @@ impl CaptainsRegistry {
         captains: &[FleetIdentity],
         durable: &mut crate::cortana_reconcile::CortanaDurableIdentity,
     ) {
-        if matches!(
-            durable.recovery,
-            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
-        ) && durable.active_harness_attestation.is_none()
-        {
-            durable.recovery = crate::cortana_reconcile::CortanaRecoveryState::Degraded {
-                operation_id: "startup-active-attestation-migration".into(),
-                reason: "legacy Healthy Cortana has no active Harness attestation".into(),
-                detected_at: now_ms().max(1),
-            };
-        }
+        // Back-fill only. Two startup degradations used to live here and both are
+        // now WRONG by construction:
+        //   - "Healthy but no active Harness attestation" - there are no
+        //     attestations any more, so this degraded every healthy record on load.
+        //   - "terminal_id with no Fleet claim" - a Cortana shell with no agent
+        //     running in it is the NORMAL resting state now, not a fault.
         let incumbent = captains
             .iter()
             .find(|captain| captain.role == FleetRole::Cortana);
@@ -1541,18 +1185,6 @@ impl CaptainsRegistry {
             if durable.checkpoint.is_none() {
                 durable.checkpoint = incumbent.resume_point.clone();
             }
-        } else if durable.terminal_id.is_some()
-            && durable.managed_launch.is_none()
-            && !matches!(
-                durable.recovery,
-                crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. }
-            )
-        {
-            durable.recovery = crate::cortana_reconcile::CortanaRecoveryState::Degraded {
-                operation_id: "startup-load".into(),
-                reason: "durable Cortana points to a runtime with no Fleet registry claim".into(),
-                detected_at: now_ms().max(1),
-            };
         }
     }
 
@@ -2670,6 +2302,13 @@ impl CaptainsRegistry {
         self.lock().cortana.clone()
     }
 
+    /// Take the singleton's in-flight slot for `operation_id`.
+    ///
+    /// Only another LIVE recovery under a different id is refused. Every other
+    /// state - including the retired `ReplacingOrphan` / `LegacyUnownedQuarantined`
+    /// write-ahead records that the discovery machinery used to leave behind - is
+    /// taken over, because nothing resumes those transactions any more and refusing
+    /// them would wedge every later reconcile on an existing install.
     pub(super) fn begin_cortana_recovery(
         &self,
         operation_id: &str,
@@ -2680,24 +2319,6 @@ impl CaptainsRegistry {
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
-        if let Some(launch) = current.cortana.managed_launch.as_ref() {
-            if launch.operation_id == operation_id {
-                return Ok(current.cortana.clone());
-            }
-            return Err(format!(
-                "reconcile_cortana operation '{}' owns the durable managed launch",
-                launch.operation_id
-            ));
-        }
-        if let Some(recovery) = current.cortana.active_harness_attestation_recovery.as_ref() {
-            if recovery.operation_id == operation_id {
-                return Ok(current.cortana.clone());
-            }
-            return Err(format!(
-                "reconcile_cortana operation '{}' owns the active attestation recovery",
-                recovery.operation_id
-            ));
-        }
         if let crate::cortana_reconcile::CortanaRecoveryState::Recovering {
             operation_id: active,
             ..
@@ -2710,74 +2331,11 @@ impl CaptainsRegistry {
                 "reconcile_cortana operation '{active}' is already recovering the singleton"
             ));
         }
-        if let crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-            operation_id: active,
-            ..
-        } = &current.cortana.recovery
-        {
-            if active == operation_id {
-                return Ok(current.cortana.clone());
-            }
-            return Err(format!(
-                "reconcile_cortana operation '{active}' is already replacing an exact orphan"
-            ));
-        }
-        if let crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-            operation_id: active,
-            ..
-        } = &current.cortana.recovery
-        {
-            if active == operation_id {
-                return Ok(current.cortana.clone());
-            }
-            return Err(format!(
-                "reconcile_cortana operation '{active}' is already replacing a quarantined legacy runtime"
-            ));
-        }
         let previous = current.clone();
         current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Recovering {
             operation_id: operation_id.to_string(),
             started_at: now_ms().max(1),
         };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn bind_cortana_orphan_replacement_identity(
-        &self,
-        operation_id: &str,
-        identity_id: &str,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let previous = current.clone();
-        let (active, replacement_identity_id) = match &mut current.cortana.recovery {
-            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id,
-                replacement_identity_id,
-                ..
-            }
-            | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                operation_id,
-                replacement_identity_id,
-                ..
-            } => (operation_id, replacement_identity_id),
-            _ => return Err("reconcile_cortana: durable replacement intent disappeared".into()),
-        };
-        if active != operation_id {
-            return Err("reconcile_cortana: durable orphan replacement operation changed".into());
-        }
-        if let Some(existing) = replacement_identity_id.as_deref() {
-            if existing == identity_id {
-                return Ok(current.cortana.clone());
-            }
-            return Err(
-                "reconcile_cortana: orphan replacement identity is already reserved".into(),
-            );
-        }
-        *replacement_identity_id = Some(identity_id.to_string());
         current.seq = current.seq.saturating_add(1);
         let result = current.cortana.clone();
         self.commit_mutation(current, previous)?;
@@ -2844,358 +2402,6 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
-    pub(super) fn prepare_cortana_orphan_replacement(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        identity_id: &str,
-        generation: u64,
-        harness: &str,
-        effect_identity: crate::cortana_reconcile::CortanaOrphanEffectIdentity,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if !matches!(
-            &current.cortana.recovery,
-            crate::cortana_reconcile::CortanaRecoveryState::Recovering {
-                operation_id: active,
-                ..
-            } if active == operation_id
-        ) || current.cortana.identity_id.as_deref() != Some(identity_id)
-            || current.cortana.generation != generation
-            || current.cortana.harness.as_deref() != Some(harness)
-            || !valid_cortana_effect_identity(&effect_identity)
-        {
-            return Err("test orphan replacement evidence changed before prepare".into());
-        }
-        let managed_basis = if let Some(owner) = current.cortana.owner.as_ref() {
-            if !same_cortana_tmux_generation(&owner.tmux, &effect_identity) {
-                return Err(
-                    "managed orphan replacement owner evidence changed before prepare".into(),
-                );
-            }
-            let claims = current
-                .captains
-                .iter()
-                .filter(|captain| {
-                    captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-                })
-                .collect::<Vec<_>>();
-            if claims.len() != 1
-                || claims[0].terminal_id.as_deref() != Some(terminal_id)
-                || claims[0].harness.as_deref() != Some(harness)
-            {
-                return Err("managed orphan replacement claim changed before prepare".into());
-            }
-            let claim = claims[0];
-            Some(Box::new(
-                crate::cortana_reconcile::CortanaManagedQuarantineBasis {
-                    version: crate::cortana_reconcile::MANAGED_QUARANTINE_BASIS_VERSION,
-                    claim_ship_slug: claim.ship_slug.clone(),
-                    claim_assignment_id: claim.assignment_id.clone(),
-                    claim_terminal_id: terminal_id.to_string(),
-                    claim_harness: harness.to_string(),
-                    owner: owner.clone(),
-                    active_harness_attestation: current.cortana.active_harness_attestation.clone(),
-                    replacement_generation: generation.saturating_add(1),
-                    prior_ledger_count: current.cortana.quarantine_ledger.len(),
-                    prior_ledger_sha256: cortana_quarantine_ledger_sha256(
-                        &current.cortana.quarantine_ledger,
-                    ),
-                    workspace_ids: current
-                        .workspaces
-                        .iter()
-                        .filter(|workspace| {
-                            workspace.tile_ids.iter().any(|tile| tile == terminal_id)
-                        })
-                        .map(|workspace| workspace.id.clone())
-                        .collect(),
-                },
-            ))
-        } else {
-            None
-        };
-        let previous = current.clone();
-        current.cortana.terminal_id = Some(terminal_id.to_string());
-        current.cortana.legacy_orphan_provenance = None;
-        current.cortana.recovery =
-            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id: operation_id.to_string(),
-                started_at: now_ms().max(1),
-                orphan_terminal_id: terminal_id.to_string(),
-                orphan_identity_id: identity_id.to_string(),
-                orphan_generation: generation,
-                harness: harness.to_string(),
-                effect_identity,
-                managed_basis,
-                replacement_identity_id: None,
-            };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn quarantine_legacy_cortana(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        identity_id: &str,
-        generation: u64,
-        harness: &str,
-        tmux: crate::cortana_reconcile::CortanaOrphanEffectIdentity,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        if operation_id.trim().is_empty()
-            || terminal_id.trim().is_empty()
-            || identity_id.trim().is_empty()
-            || generation == 0
-            || harness.trim().is_empty()
-            || !valid_cortana_effect_identity(&tmux)
-        {
-            return Err("cannot quarantine incomplete legacy Cortana evidence".into());
-        }
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if let crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-            operation_id: active,
-            legacy_terminal_id,
-            legacy_generation,
-            ..
-        } = &current.cortana.recovery
-        {
-            if active == operation_id
-                && legacy_terminal_id == terminal_id
-                && *legacy_generation == generation
-                && current.cortana.quarantine_ledger.iter().any(|quarantine| {
-                    quarantine.terminal_id == terminal_id
-                        && quarantine.identity_id == identity_id
-                        && quarantine.generation == generation
-                        && quarantine.harness == harness
-                        && quarantine.tmux == tmux
-                        && quarantine.authority_revoked
-                })
-            {
-                return Ok(current.cortana.clone());
-            }
-            return Err("a different legacy Cortana quarantine is already durable".into());
-        }
-        let matches_durable = current.cortana.identity_id.as_deref() == Some(identity_id)
-            && current.cortana.generation == generation
-            && current.cortana.harness.as_deref() == Some(harness);
-        let adopts_uninitialized = current.cortana.identity_id.is_none()
-            && current.cortana.generation == 0
-            && current.cortana.terminal_id.is_none()
-            && matches!(
-                current.cortana.recovery,
-                crate::cortana_reconcile::CortanaRecoveryState::Recovering { .. }
-            );
-        if !matches_durable && !adopts_uninitialized {
-            return Err("legacy Cortana identity changed before quarantine".into());
-        }
-        if current.cortana.quarantine_ledger.len() >= MAX_CORTANA_QUARANTINE_RECORDS {
-            return Err("Cortana quarantine ledger is full; no authority was changed".into());
-        }
-        if current.cortana.quarantine_ledger.iter().any(|quarantine| {
-            quarantine.terminal_id == terminal_id
-                || quarantine.identity_id == identity_id
-                || quarantine.tmux == tmux
-        }) {
-            return Err("Cortana quarantine evidence conflicts with an existing record".into());
-        }
-        let managed_basis = match &current.cortana.recovery {
-            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id: active,
-                orphan_terminal_id,
-                orphan_identity_id,
-                orphan_generation,
-                harness: prepared_harness,
-                effect_identity,
-                managed_basis,
-                ..
-            } if active == operation_id
-                && orphan_terminal_id == terminal_id
-                && orphan_identity_id == identity_id
-                && *orphan_generation == generation
-                && prepared_harness == harness
-                && *effect_identity == tmux =>
-            {
-                managed_basis.clone()
-            }
-            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. } => {
-                return Err("Cortana quarantine WAL evidence changed before commit".into());
-            }
-            _ => None,
-        };
-        if let Some(basis) = managed_basis.as_ref() {
-            if !managed_cortana_quarantine_basis_matches(
-                &current,
-                basis,
-                terminal_id,
-                identity_id,
-                generation,
-                harness,
-                &tmux,
-            ) {
-                return Err("managed Cortana quarantine basis changed before commit".into());
-            }
-        }
-        let quarantined_at = now_ms().max(1);
-        let active_cortana_claims = current
-            .captains
-            .iter()
-            .enumerate()
-            .filter(|(_, captain)| {
-                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if managed_basis.is_some() && active_cortana_claims.len() != 1
-            || managed_basis.is_none() && active_cortana_claims.len() > 1
-            || active_cortana_claims.first().is_some_and(|index| {
-                current.captains[*index].terminal_id.as_deref() != Some(terminal_id)
-            })
-        {
-            return Err("legacy Cortana quarantine Fleet claim is ambiguous".into());
-        }
-        let previous = current.clone();
-        if let Some(index) = active_cortana_claims.first().copied() {
-            let claim = &mut current.captains[index];
-            claim.state = ClaimState::Orphaned {
-                since: quarantined_at,
-            };
-            claim.terminal_id = None;
-            for crew in claim.crew.iter_mut() {
-                if matches!(crew.state, CrewState::Active) {
-                    crew.state = CrewState::Orphaned {
-                        since: quarantined_at,
-                    };
-                }
-            }
-        }
-        for workspace in &mut current.workspaces {
-            workspace.tile_ids.retain(|tile| tile != terminal_id);
-        }
-        if !current
-            .retired_fleet_tile_ids
-            .iter()
-            .any(|tile| tile == terminal_id)
-        {
-            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
-                current.retired_fleet_tile_ids.remove(0);
-            }
-            current.retired_fleet_tile_ids.push(terminal_id.to_string());
-        }
-        current.cortana.identity_id = Some(identity_id.to_string());
-        current.cortana.generation = generation;
-        current.cortana.harness = Some(harness.to_string());
-        current.cortana.owner = None;
-        current.cortana.active_harness_attestation = None;
-        current.cortana.active_harness_attestation_recovery = None;
-        current.cortana.terminal_id = None;
-        current.cortana.legacy_orphan_provenance = None;
-        current
-            .cortana
-            .quarantine_ledger
-            .push(crate::cortana_reconcile::CortanaLegacyQuarantine {
-                terminal_id: terminal_id.to_string(),
-                identity_id: identity_id.to_string(),
-                generation,
-                harness: harness.to_string(),
-                tmux,
-                authority_revoked: true,
-                quarantined_at,
-            });
-        current.cortana.recovery =
-            crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                operation_id: operation_id.to_string(),
-                quarantined_at,
-                legacy_terminal_id: terminal_id.to_string(),
-                legacy_generation: generation,
-                replacement_identity_id: None,
-            };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn validate_cortana_managed_quarantine_basis(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        identity_id: &str,
-        generation: u64,
-        harness: &str,
-        effect_identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
-        basis: &crate::cortana_reconcile::CortanaManagedQuarantineBasis,
-    ) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let current = self.lock();
-        let wal_matches = matches!(
-            &current.cortana.recovery,
-            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id: active,
-                orphan_terminal_id,
-                orphan_identity_id,
-                orphan_generation,
-                harness: prepared_harness,
-                effect_identity: prepared_effect,
-                managed_basis: Some(prepared_basis),
-                ..
-            } if active == operation_id
-                && orphan_terminal_id == terminal_id
-                && orphan_identity_id == identity_id
-                && *orphan_generation == generation
-                && prepared_harness == harness
-                && prepared_effect == effect_identity
-                && prepared_basis.as_ref() == basis
-        );
-        if wal_matches
-            && managed_cortana_quarantine_basis_matches(
-                &current,
-                basis,
-                terminal_id,
-                identity_id,
-                generation,
-                harness,
-                effect_identity,
-            )
-        {
-            Ok(())
-        } else {
-            Err("managed Cortana quarantine basis changed before authority burn".into())
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_cortana_quarantine_claim_assignment_for_test(
-        &self,
-        assignment_id: &str,
-    ) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let claim = current
-            .captains
-            .iter_mut()
-            .find(|captain| {
-                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-            })
-            .ok_or("test managed quarantine claim disappeared")?;
-        claim.assignment_id = assignment_id.to_string();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_cortana_quarantine_attestation_for_test(
-        &self,
-        attestation: Option<crate::cortana_reconcile::CortanaActiveHarnessAttestation>,
-    ) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        current.cortana.active_harness_attestation = attestation;
-        Ok(())
-    }
-
     pub(super) fn mark_cortana_degraded(
         &self,
         operation_id: &str,
@@ -3206,38 +2412,6 @@ impl CaptainsRegistry {
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
-        if let Some(launch) = current.cortana.managed_launch.as_ref() {
-            if launch.operation_id != operation_id {
-                return Err(
-                    "degraded Cortana operation does not match the durable managed launch".into(),
-                );
-            }
-            return Ok(());
-        }
-        if current
-            .cortana
-            .active_harness_attestation_recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.operation_id == operation_id)
-        {
-            return Ok(());
-        }
-        if matches!(
-            &current.cortana.recovery,
-            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id: active,
-                ..
-            }
-            | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                operation_id: active,
-                ..
-            } if active == operation_id
-        ) {
-            // The replacement record is the durable write-ahead authorization
-            // for an exact external effect. Never erase it with a presentation
-            // error; the next startup must resume the same transaction.
-            return Ok(());
-        }
         let previous = current.clone();
         current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Degraded {
             operation_id: operation_id.to_string(),
@@ -3248,729 +2422,57 @@ impl CaptainsRegistry {
         self.commit_mutation(current, previous)
     }
 
-    pub(super) fn prepare_cortana_active_attestation_recovery(
+    /// Install a durable Cortana record directly, for cases that need to start
+    /// from a record an older build wrote (a wedged managed launch, a generation
+    /// ladder, a quarantine ledger).
+    #[cfg(test)]
+    pub(crate) fn set_cortana_for_test(
         &self,
-        recovery: crate::cortana_reconcile::CortanaActiveHarnessAttestationRecovery,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        durable: crate::cortana_reconcile::CortanaDurableIdentity,
+    ) {
         let mut current = self.lock();
-        if current.cortana.active_harness_attestation_recovery.as_ref() == Some(&recovery) {
-            return Ok(current.cortana.clone());
-        }
-        if current
-            .cortana
-            .active_harness_attestation_recovery
-            .is_some()
-            || current.cortana.active_harness_attestation.is_some()
-            || current.cortana.managed_launch.is_some()
-        {
-            return Err("a different Cortana attestation transaction is already durable".into());
-        }
-        let claim_matches = current
-            .captains
-            .iter()
-            .filter(|claim| claim.role == FleetRole::Cortana && claim.state == ClaimState::Active)
-            .collect::<Vec<_>>();
-        if !matches!(
-            claim_matches.as_slice(),
-            [claim]
-                if claim.terminal_id.as_deref() == Some(recovery.terminal_id.as_str())
-                    && claim.provider.as_deref().or(claim.harness.as_deref())
-                        == Some(recovery.harness.as_str())
-        ) {
-            return Err("Cortana attestation recovery has no exact active Fleet claim".into());
-        }
-        current.cortana.active_harness_attestation_recovery = Some(recovery);
-        if !valid_cortana_active_harness_attestation_recovery(
-            &current.cortana,
-            current
-                .cortana
-                .active_harness_attestation_recovery
-                .as_ref()
-                .expect("assigned above"),
-        ) {
-            return Err("Cortana attestation recovery evidence changed before prepare".into());
-        }
-        // `previous` must describe the state before the WAL assignment.
-        let mut previous = current.clone();
-        previous.cortana.active_harness_attestation_recovery = None;
+        current.cortana = durable;
         current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
     }
 
-    pub(super) fn commit_cortana_active_attestation_recovery(
-        &self,
-        expected: &crate::cortana_reconcile::CortanaActiveHarnessAttestationRecovery,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if current.cortana.active_harness_attestation_recovery.as_ref() != Some(expected)
-            || !valid_cortana_active_harness_attestation_recovery(&current.cortana, expected)
-        {
-            return Err("Cortana attestation recovery changed before commit".into());
-        }
-        let previous = current.clone();
-        current.cortana.active_harness_attestation =
-            Some(crate::cortana_reconcile::CortanaActiveHarnessAttestation {
-                version: crate::cortana_reconcile::ACTIVE_HARNESS_ATTESTATION_VERSION,
-                expected_launch_provenance: expected.expected_launch_provenance.clone(),
-                process: expected.process.clone(),
-            });
-        current.cortana.active_harness_attestation_recovery = None;
-        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Healthy {
-            operation_id: expected.operation_id.clone(),
-            verified_at: now_ms().max(1),
-        };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn complete_cortana_keep(
-        &self,
-        operation_id: &str,
-        expected: &crate::cortana_reconcile::CortanaDurableIdentity,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if current.cortana != *expected
-            || !matches!(
-                &current.cortana.recovery,
-                crate::cortana_reconcile::CortanaRecoveryState::Recovering {
-                    operation_id: active,
-                    ..
-                } if active == operation_id
-            )
-            || current.cortana.active_harness_attestation.is_none()
-            || current
-                .cortana
-                .active_harness_attestation_recovery
-                .is_some()
-            || current.cortana.managed_launch.is_some()
-        {
-            return Err("Cortana Keep authority changed before completion".into());
-        }
-        let previous = current.clone();
-        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Healthy {
-            operation_id: operation_id.to_string(),
-            verified_at: now_ms().max(1),
-        };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn commit_cortana_runtime(
+    /// Record the singleton T-Hub just adopted or created, and mark it healthy.
+    ///
+    /// This is the ONLY write of `cortana.identity_id` / `cortana.terminal_id`
+    /// outside the pruned-identity rebind. It also CLEARS the discovery-era fields:
+    /// they are dormant, and an install carrying a wedged `managedLaunch` (the
+    /// write-ahead record of a launch that could never be retired) needs them gone
+    /// rather than merely ignored.
+    ///
+    /// `harness`, `provider_session_id`, `conversation_id` and `checkpoint` are
+    /// deliberately untouched: nothing is started in the shell here, so whatever an
+    /// agent recorded about itself earlier stays as it was.
+    pub(super) fn commit_cortana_shell(
         &self,
         operation_id: &str,
         identity_id: &str,
-        generation: u64,
         terminal_id: &str,
-        harness: &str,
-        provider_session_id: Option<&str>,
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         if operation_id.trim().is_empty()
             || identity_id.trim().is_empty()
-            || generation == 0
             || terminal_id.trim().is_empty()
-            || harness.trim().is_empty()
         {
-            return Err("cannot commit an incomplete Cortana runtime identity".into());
+            return Err("cannot commit an incomplete Cortana shell".into());
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
-        let incumbent = current
-            .captains
-            .iter()
-            .find(|captain| {
-                captain.role == FleetRole::Cortana
-                    && captain.terminal_id.as_deref() == Some(terminal_id)
-                    && captain.state == ClaimState::Active
-            })
-            .ok_or("cannot commit Cortana before its active Fleet claim is authoritative")?;
-        if incumbent
-            .provider
-            .as_deref()
-            .or(incumbent.harness.as_deref())
-            != Some(harness)
-        {
-            return Err("Cortana runtime harness does not match its Fleet claim".into());
-        }
-        if let crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-            operation_id: active_operation_id,
-            orphan_terminal_id,
-            orphan_generation,
-            harness: replacement_harness,
-            replacement_identity_id,
-            ..
-        } = &current.cortana.recovery
-        {
-            if active_operation_id != operation_id
-                || replacement_identity_id.as_deref() != Some(identity_id)
-                || generation != orphan_generation.saturating_add(1)
-                || terminal_id == orphan_terminal_id
-                || harness != replacement_harness
-            {
-                return Err(
-                    "cannot commit Cortana runtime outside its durable orphan replacement intent"
-                        .into(),
-                );
-            }
-        }
-        if let crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-            operation_id: active_operation_id,
-            legacy_terminal_id,
-            legacy_generation,
-            replacement_identity_id,
-            ..
-        } = &current.cortana.recovery
-        {
-            if active_operation_id != operation_id
-                || replacement_identity_id.as_deref() != Some(identity_id)
-                || generation != legacy_generation.saturating_add(1)
-                || terminal_id == legacy_terminal_id
-            {
-                return Err(
-                    "cannot commit Cortana runtime outside its durable legacy quarantine".into(),
-                );
-            }
-        }
-        #[cfg(test)]
-        if current.cortana.owner.is_none() {
-            current.cortana.owner = Some(synthetic_cortana_managed_owner());
-        }
-        if current.cortana.owner.is_none() {
-            return Err("cannot commit Cortana without a durable managed owner".into());
-        }
-        #[cfg(test)]
-        if current.cortana.managed_launch.is_none() {
-            let owner = current
-                .cortana
-                .owner
-                .as_ref()
-                .expect("owner synthesized above");
-            current.cortana.managed_launch =
-                Some(crate::cortana_reconcile::CortanaManagedLaunchIntent {
-                    version: 4,
-                    operation_id: operation_id.to_string(),
-                    terminal_id: terminal_id.to_string(),
-                    tmux_target: tmux_target(terminal_id),
-                    identity_id: identity_id.to_string(),
-                    generation,
-                    harness: harness.to_string(),
-                    unit_name: owner.unit_name.clone(),
-                    launch_nonce: owner.launch_nonce.clone(),
-                    tools: owner.tools.clone(),
-                    phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed,
-                    expected_harness_launch_provenance: Some(
-                        synthetic_cortana_expected_harness_launch(harness),
-                    ),
-                    harness_process: Some(synthetic_cortana_harness_process(owner, harness)),
-                });
-        }
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_ref()
-            .ok_or("cannot commit Cortana without an observed managed launch")?;
-        if launch.version != 4
-            || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
-            || launch
-                .expected_harness_launch_provenance
-                .as_ref()
-                .is_none_or(|expected| expected.provider != launch.harness)
-            || launch.harness_process.is_none()
-            || launch.operation_id != operation_id
-            || launch.identity_id != identity_id
-            || launch.generation != generation
-            || launch.terminal_id != terminal_id
-            || launch.harness != harness
-        {
-            return Err("cannot commit Cortana outside its observed managed launch".into());
-        }
-        let active_harness_attestation =
-            crate::cortana_reconcile::CortanaActiveHarnessAttestation {
-                version: crate::cortana_reconcile::ACTIVE_HARNESS_ATTESTATION_VERSION,
-                expected_launch_provenance: launch
-                    .expected_harness_launch_provenance
-                    .clone()
-                    .expect("validated observed launch has expected provenance"),
-                process: launch
-                    .harness_process
-                    .clone()
-                    .expect("validated observed launch has process evidence"),
-            };
         current.cortana.identity_id = Some(identity_id.to_string());
-        current.cortana.generation = generation;
         current.cortana.terminal_id = Some(terminal_id.to_string());
-        current.cortana.harness = Some(harness.to_string());
-        current.cortana.legacy_orphan_provenance = None;
-        current.cortana.managed_launch = None;
-        current.cortana.active_harness_attestation = Some(active_harness_attestation);
-        current.cortana.active_harness_attestation_recovery = None;
-        if let Some(provider_session_id) = provider_session_id {
-            current.cortana.provider_session_id = Some(provider_session_id.to_string());
-            current.cortana.conversation_id = Some(provider_session_id.to_string());
-        }
-        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Healthy {
-            operation_id: operation_id.to_string(),
-            verified_at: now_ms().max(1),
-        };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn record_cortana_runtime_owner(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        owner: crate::cortana_reconcile::CortanaManagedOwnerToken,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        if operation_id.trim().is_empty()
-            || terminal_id.trim().is_empty()
-            || owner.version != crate::cortana_reconcile::MANAGED_OWNER_TOKEN_VERSION
-        {
-            return Err("cannot record an invalid Cortana runtime owner".into());
-        }
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let active_operation = match &current.cortana.recovery {
-            crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. }
-            | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id,
-                ..
-            }
-            | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                operation_id,
-                ..
-            } => operation_id,
-            _ => return Err("Cortana owner cannot be recorded outside recovery".into()),
-        };
-        if active_operation != operation_id {
-            return Err("Cortana owner operation does not match durable recovery".into());
-        }
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_ref()
-            .ok_or("Cortana owner has no durable prepared launch")?;
-        if launch.operation_id != operation_id
-            || launch.terminal_id != terminal_id
-            || launch.unit_name != owner.unit_name
-            || launch.launch_nonce != owner.launch_nonce
-            || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
-        {
-            return Err("Cortana owner does not match its durable prepared launch".into());
-        }
-        if let Some(existing) = current.cortana.owner.as_ref() {
-            return if existing == &owner {
-                Ok(current.cortana.clone())
-            } else {
-                Err("a different Cortana runtime owner is already durable".into())
-            };
-        }
-        let launch_version = launch.version;
-        let previous = current.clone();
-        current.cortana.owner = Some(owner);
-        current.cortana.terminal_id = Some(terminal_id.to_string());
-        current
-            .cortana
-            .managed_launch
-            .as_mut()
-            .expect("checked above")
-            .phase = if launch_version == 1 {
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-        } else {
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
-        };
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    #[cfg(all(test, unix))]
-    pub(super) fn replace_cortana_runtime_owner_for_test(
-        &self,
-        expected: &crate::cortana_reconcile::CortanaManagedOwnerToken,
-        replacement: crate::cortana_reconcile::CortanaManagedOwnerToken,
-    ) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if current.cortana.owner.as_ref() != Some(expected) {
-            return Err("test Cortana owner changed before replacement".into());
-        }
-        let previous = current.clone();
-        current.cortana.owner = Some(replacement);
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)
-    }
-
-    pub(super) fn record_cortana_expected_harness_launch_provenance(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        identity_id: &str,
-        generation: u64,
-        expected: crate::harness::ExpectedHarnessLaunchProvenance,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        if operation_id.trim().is_empty()
-            || terminal_id.trim().is_empty()
-            || identity_id.trim().is_empty()
-            || generation == 0
-            || !crate::harness::valid_expected_harness_launch_provenance(&expected)
-        {
-            return Err("cannot record invalid expected Cortana Harness launch provenance".into());
-        }
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_ref()
-            .ok_or("expected Cortana Harness provenance has no durable managed launch")?;
-        if launch.operation_id != operation_id
-            || launch.terminal_id != terminal_id
-            || launch.identity_id != identity_id
-            || launch.generation != generation
-            || launch.harness != expected.provider
-        {
-            return Err("expected Cortana Harness provenance does not match its launch".into());
-        }
-        let same_bound_entry = |legacy: &crate::harness::ExpectedHarnessLaunchProvenance| {
-            legacy.provider == expected.provider
-                && legacy.kind == expected.kind
-                && legacy.executable == expected.executable
-                && legacy.entry_script == expected.entry_script
-                && legacy.trusted_child_executable == expected.trusted_child_executable
-                && legacy.argv_layout_sha256 == expected.argv_layout_sha256
-        };
-        if launch.version == 4 {
-            if launch.expected_harness_launch_provenance.as_ref() == Some(&expected) {
-                return Ok(current.cortana.clone());
-            }
-            if launch
-                .expected_harness_launch_provenance
-                .as_ref()
-                .is_none_or(|legacy| {
-                    legacy.version != 2
-                        || legacy.launch_policy_sha256.is_some()
-                        || legacy.semantic_argv_sha256.is_some()
-                        || !same_bound_entry(legacy)
-                })
-            {
-                return Err(
-                    "different expected Cortana Harness provenance is already durable".into(),
-                );
-            }
-        }
-        if launch.version == 3
-            && launch
-                .expected_harness_launch_provenance
-                .as_ref()
-                .is_none_or(|legacy| {
-                    legacy.provider != expected.provider
-                        || legacy.kind != expected.kind
-                        || legacy.executable != expected.executable
-                        || legacy.entry_script != expected.entry_script
-                        || legacy.argv_layout_sha256 != expected.argv_layout_sha256
-                })
-        {
-            return Err(
-                "expected Cortana Harness provenance changed while enriching its trusted child"
-                    .into(),
-            );
-        }
-        if !matches!(launch.version, 1..=4)
-            || (launch.version != 3 && launch.expected_harness_launch_provenance.is_some())
-                && launch.version != 4
-        {
-            return Err("expected Cortana Harness provenance cannot enrich this launch".into());
-        }
-        let previous = current.clone();
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_mut()
-            .expect("checked above");
-        launch.version = 4;
-        if launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-            && launch.harness_process.is_none()
-        {
-            launch.phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved;
-        }
-        launch.expected_harness_launch_provenance = Some(expected);
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn record_cortana_harness_process(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        process: crate::harness::HarnessProcessIdentity,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        if operation_id.trim().is_empty()
-            || terminal_id.trim().is_empty()
-            || !crate::harness::valid_harness_process_identity(&process)
-        {
-            return Err("cannot record invalid Cortana Harness process evidence".into());
-        }
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_ref()
-            .ok_or("Cortana Harness process has no durable managed launch")?;
-        if launch.operation_id != operation_id
-            || launch.terminal_id != terminal_id
-            || !matches!(
-                launch.phase,
-                crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
-                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
-            )
-        {
-            return Err("Cortana Harness process does not match its managed launch".into());
-        }
-        let owner = current
-            .cortana
-            .owner
-            .as_ref()
-            .ok_or("Cortana Harness process has no durable managed owner")?;
-        if process.provider != launch.harness
-            || process.tmux_session_id != owner.tmux.tmux_session_id
-            || process.tmux_session_created != owner.tmux.tmux_session_created
-            || process.tmux_window_id != owner.tmux.tmux_window_id
-            || process.tmux_pane_id != owner.tmux.tmux_pane_id
-            || process.pane_pid != owner.tmux.pane_pid
-            || process.pane_start_ticks != owner.tmux.pane_start_ticks
-            || process.cgroup_path != owner.cgroup_path
-        {
-            return Err("Cortana Harness process does not match its managed owner".into());
-        }
-        if launch.version != 4 {
-            return Err("Cortana Harness process has an unsupported launch version".into());
-        }
-        if matches!(
-            launch.phase,
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
-        ) && launch.harness_process.is_some()
-        {
-            return if launch.harness_process.as_ref() == Some(&process) {
-                Ok(current.cortana.clone())
-            } else {
-                Err("a different Cortana Harness process is already durable".into())
-            };
-        }
-        if !matches!(
-            launch.phase,
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
-                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
-        ) {
-            return Err("Cortana Harness process cannot attest this launch phase".into());
-        }
-        let previous = current.clone();
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_mut()
-            .expect("checked above");
-        launch.phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed;
-        launch.harness_process = Some(process);
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn record_cortana_claimed_launch(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let exact_claims = current
-            .captains
-            .iter()
-            .filter(|claim| claim.role == FleetRole::Cortana && claim.state == ClaimState::Active)
-            .collect::<Vec<_>>();
-        let launch = current
-            .cortana
-            .managed_launch
-            .as_ref()
-            .ok_or("claimed Cortana has no managed launch")?;
-        if launch.operation_id != operation_id
-            || launch.terminal_id != terminal_id
-            || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-            || launch.harness_process.is_none()
-            || !matches!(
-                exact_claims.as_slice(),
-                [claim]
-                    if claim.terminal_id.as_deref() == Some(terminal_id)
-                        && claim.provider.as_deref().or(claim.harness.as_deref())
-                            == Some(launch.harness.as_str())
-            )
-        {
-            return Err("Cortana Fleet claim changed before durable claim phase".into());
-        }
-        let previous = current.clone();
-        current
-            .cortana
-            .managed_launch
-            .as_mut()
-            .expect("checked above")
-            .phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed;
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn prepare_cortana_managed_launch(
-        &self,
-        operation_id: &str,
-        terminal_id: &str,
-        identity_id: &str,
-        generation: u64,
-        harness: &str,
-        launch: &tmux::ManagedRuntimeLaunchSpec,
-        expected_harness_launch_provenance: crate::harness::ExpectedHarnessLaunchProvenance,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let tools = durable_cortana_tools(&launch.tools);
-        let intent = crate::cortana_reconcile::CortanaManagedLaunchIntent {
-            version: 4,
-            operation_id: operation_id.to_string(),
-            terminal_id: terminal_id.to_string(),
-            tmux_target: tmux_target(terminal_id),
-            identity_id: identity_id.to_string(),
-            generation,
-            harness: harness.to_string(),
-            unit_name: launch.unit_name.clone(),
-            launch_nonce: launch.launch_nonce.clone(),
-            tools,
-            phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
-            expected_harness_launch_provenance: Some(expected_harness_launch_provenance),
-            harness_process: None,
-        };
-        if !valid_cortana_managed_launch(&intent) {
-            return Err("cannot prepare an invalid Cortana managed launch".into());
-        }
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let active_operation = match &current.cortana.recovery {
-            crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. }
-            | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id,
-                ..
-            }
-            | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                operation_id,
-                ..
-            } => operation_id,
-            _ => return Err("Cortana launch cannot be prepared outside recovery".into()),
-        };
-        if active_operation != operation_id {
-            return Err("Cortana launch operation changed before prepare".into());
-        }
-        if let Some(existing) = current.cortana.managed_launch.as_ref() {
-            return if existing == &intent {
-                Ok(current.cortana.clone())
-            } else {
-                Err("a different Cortana managed launch is already prepared".into())
-            };
-        }
-        let previous = current.clone();
-        current.cortana.managed_launch = Some(intent);
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn clear_prepared_cortana_managed_launch(
-        &self,
-        expected: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if current.cortana.managed_launch.as_ref() != Some(expected) {
-            return Err("Cortana managed launch changed before cleanup commit".into());
-        }
-        let previous = current.clone();
-        current.cortana.managed_launch = None;
-        if matches!(
-            expected.phase,
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
-                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-        ) {
-            current.cortana.owner = None;
-            current.cortana.active_harness_attestation = None;
-            current.cortana.active_harness_attestation_recovery = None;
-            current.cortana.terminal_id = None;
-        }
-        current.seq = current.seq.saturating_add(1);
-        let result = current.cortana.clone();
-        self.commit_mutation(current, previous)?;
-        Ok(result)
-    }
-
-    pub(super) fn clear_gone_cortana_runtime_owner(
-        &self,
-        operation_id: &str,
-        expected: &crate::cortana_reconcile::CortanaManagedOwnerToken,
-    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if !matches!(
-            &current.cortana.recovery,
-            crate::cortana_reconcile::CortanaRecoveryState::Recovering {
-                operation_id: active,
-                ..
-            } if active == operation_id
-        ) || current.cortana.owner.as_ref() != Some(expected)
-        {
-            return Err("Cortana owner changed before gone-owner recovery".into());
-        }
-        let terminal_id = current
-            .cortana
-            .terminal_id
-            .clone()
-            .ok_or("gone Cortana owner has no durable terminal")?;
-        if current.captains.iter().any(|claim| {
-            claim.role == FleetRole::Cortana
-                && claim.state == ClaimState::Active
-                && claim.terminal_id.as_deref() != Some(terminal_id.as_str())
-        }) {
-            return Err("Cortana Fleet authority changed before gone-owner recovery".into());
-        }
-        let previous = current.clone();
-        let now = now_ms();
-        for claim in current.captains.iter_mut().filter(|claim| {
-            claim.role == FleetRole::Cortana
-                && claim.state == ClaimState::Active
-                && claim.terminal_id.as_deref() == Some(terminal_id.as_str())
-        }) {
-            claim.state = ClaimState::Orphaned { since: now };
-            claim.terminal_id = None;
-        }
         current.cortana.owner = None;
+        current.cortana.managed_launch = None;
         current.cortana.active_harness_attestation = None;
         current.cortana.active_harness_attestation_recovery = None;
-        current.cortana.terminal_id = None;
+        current.cortana.legacy_orphan_provenance = None;
+        current.cortana.quarantine_ledger.clear();
+        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Healthy {
+            operation_id: operation_id.to_string(),
+            verified_at: now_ms().max(1),
+        };
         current.seq = current.seq.saturating_add(1);
         let result = current.cortana.clone();
         self.commit_mutation(current, previous)?;

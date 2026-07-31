@@ -1,7 +1,7 @@
 {
   "name": "t-hub-desktop",
   "private": true,
-  "version": "0.3.153",
+  "version": "0.3.162",
   "type": "module",
   "description": "T-Hub - terminal-first command center for supervising many persistent Codex and Claude coding-agent sessions in WSL2.",
   "scripts": {
