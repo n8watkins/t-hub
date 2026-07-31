@@ -66,6 +66,7 @@ pub(super) fn reconcile_cortana(
     }
     std::fs::create_dir_all(files::to_host_path(&home))
         .map_err(|error| format!("reconcile_cortana: could not create '{home}': {error}"))?;
+    seed_orchestrator_instructions(&home);
 
     // ONE lock order for the whole operation: dispatch admission, then the
     // identity transaction, then provisioning. The previous implementation ran an
@@ -102,6 +103,47 @@ pub(super) fn reconcile_cortana(
         let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
     }
     result
+}
+
+/// The bootstrap instructions T-Hub seeds into the orchestrator home.
+///
+/// Kept as a repo file rather than a string literal so it is reviewable as prose
+/// and diffs like documentation.
+const ORCHESTRATOR_AGENTS_MD: &str = include_str!("../../resources/orchestrator-agents.md");
+
+/// `CLAUDE.md` is a POINTER, not a copy. One source of truth, and a copy would
+/// drift the moment either file was edited.
+const ORCHESTRATOR_CLAUDE_MD: &str =
+    "Read `AGENTS.md` in this directory. It is the single source for how to \
+operate in the T-Hub orchestrator shell; this file exists only because Claude \
+reads `CLAUDE.md` and Codex reads `AGENTS.md`.\n";
+
+/// Seed the orchestrator home with the instructions an agent needs to take the
+/// Cortana role, so ANY harness started there knows how without a skill.
+///
+/// Codex reads `AGENTS.md` from its working directory and Claude reads
+/// `CLAUDE.md`, so both are written; `CLAUDE.md` points at `AGENTS.md` rather
+/// than duplicating it. A symlink would be the tidier expression of that, but the
+/// app writes this over the `\\wsl.localhost` bridge on Windows, where creating a
+/// POSIX symlink is not something to rely on.
+///
+/// NEVER overwrites. A file the user has edited is theirs; a doctrine update
+/// reaching existing installs is worth less than silently discarding their
+/// changes. Best-effort throughout: failing to write a hint must not fail the
+/// reconcile that keeps Cortana alive.
+fn seed_orchestrator_instructions(home: &str) {
+    for (name, body) in [
+        ("AGENTS.md", ORCHESTRATOR_AGENTS_MD),
+        ("CLAUDE.md", ORCHESTRATOR_CLAUDE_MD),
+    ] {
+        let path = files::to_host_path(&format!("{}/{name}", home.trim_end_matches('/')));
+        if path.exists() {
+            continue;
+        }
+        if let Err(error) = std::fs::write(&path, body) {
+            eprintln!("t-hub-control: could not seed {name} in the orchestrator home: {error}");
+        }
+    }
 }
 
 fn reconcile_shell(
