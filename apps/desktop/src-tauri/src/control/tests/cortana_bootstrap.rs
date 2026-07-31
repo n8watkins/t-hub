@@ -602,6 +602,48 @@ fn the_recorded_singleton_may_claim_the_cortana_role_for_its_own_terminal() {
     .contains("only General/Cortana"));
 }
 
+/// The skill tells the orchestrator agent to claim on every session start, so a
+/// repeat claim of the SAME terminal must be a refresh, not a refusal - otherwise
+/// a resumed agent would be told the crown is taken by itself.
+#[test]
+fn reclaiming_the_cortana_role_on_the_same_terminal_is_idempotent() {
+    let registry = CaptainsRegistry::new();
+    let first = registry
+        .claim(
+            "cort0001",
+            None,
+            FleetRole::Cortana,
+            None,
+            vec![],
+            &all_alive,
+            &crew_all_alive,
+        )
+        .expect("first cortana claim");
+    let second = registry
+        .claim(
+            "cort0001",
+            None,
+            FleetRole::Cortana,
+            None,
+            vec![],
+            &all_alive,
+            &crew_all_alive,
+        )
+        .expect("a repeat claim of the same terminal must be admitted");
+    assert_eq!(second.record.terminal_id, first.record.terminal_id);
+    assert_eq!(second.record.role, FleetRole::Cortana);
+    assert_eq!(
+        registry
+            .snapshot()
+            .captains
+            .iter()
+            .filter(|c| c.role == FleetRole::Cortana)
+            .count(),
+        1,
+        "a repeat claim must not create a second Cortana"
+    );
+}
+
 fn modeled_codex_tool_approval(command: &str, tool: &str) -> &'static str {
     let override_flag = format!("mcp_servers.t-hub.tools.{tool}.approval_mode=");
     match command.split(&override_flag).nth(1) {
