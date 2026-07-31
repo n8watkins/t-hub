@@ -1077,6 +1077,13 @@ export function TerminalView({
                   await closeTerminal(terminalId);
                   updateTerminalResources(terminalId, { pty: false });
                   if (disposed) return;
+                  // Sub-timers for the `switch:unparked` split (optimization plan
+                  // Phase 1 step 1). The 587-610 ms per tile has never been
+                  // attributed, and the fix under consideration - stay attached -
+                  // is only the right one if the IPC round trip dominates. Measure
+                  // before choosing.
+                  const now = (): number =>
+                    typeof performance !== "undefined" ? performance.now() : 0;
                   // Buffer live output while we await the fresh seed, exactly
                   // like the mount path: bytes from the new conn replay AFTER
                   // the seed. Pre-drop queue contents are superseded by the
@@ -1085,22 +1092,30 @@ export function TerminalView({
                   pending.length = 0;
                   pendingBytes = 0;
                   liveBuffer.length = 0;
+                  const attachStartedAt = now();
                   await attachTerminal(
                     terminalId,
                     term.cols,
                     term.rows,
                   );
+                  const attachedAt = now();
                   if (disposed) return;
                   ptyAttachedRef.current = true;
                   updateTerminalResources(terminalId, { pty: true });
                   // Repopulate: reset the grid so the stale pre-drop frame (and
                   // the reconnecting banner) never duplicates under the seed.
                   await writes.waitForWrites();
+                  const drainedAt = now();
                   if (disposed) return;
                   term.reset();
+                  const resetAt = now();
                   seeded = true;
+                  let replayBytes = 0;
                   if (liveBuffer.length > 0) {
-                    for (const chunk of liveBuffer) writes.write(chunk);
+                    for (const chunk of liveBuffer) {
+                      replayBytes += chunk.length;
+                      writes.write(chunk);
+                    }
                     liveBuffer.length = 0;
                   }
                   reconnecting = false;
@@ -1111,6 +1126,16 @@ export function TerminalView({
                       typeof performance !== "undefined"
                         ? Math.round(performance.now() - reattachStartedAt)
                         : -1,
+                    // The split. `attachMs` is the control round trip that carries
+                    // the scrollback seed; `drainMs` is waiting out the write queue
+                    // before the grid can be cleared; `resetMs` is `term.reset()`
+                    // itself. `replayMs` is only the cost of ENQUEUEING the seed,
+                    // not of painting it, so read it together with `replayBytes`.
+                    attachMs: Math.round(attachedAt - attachStartedAt),
+                    drainMs: Math.round(drainedAt - attachedAt),
+                    resetMs: Math.round(resetAt - drainedAt),
+                    replayMs: Math.round(now() - resetAt),
+                    replayBytes,
                   });
                   tlog(
                     "attach",

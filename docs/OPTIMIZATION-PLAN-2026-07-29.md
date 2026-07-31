@@ -128,7 +128,12 @@ Only blocks at or above roughly 200 ms are recorded, so this UNDERSTATES typical
 
 No investigation required. Do this first.
 
-1. Delete the six branches that are safe to remove. Three have content provably on `main`: `perf/lazy-settings-panel`, `refactor/split-control-tests`, `fix/terminal-stability`. Three are exact duplicates of a sibling, so delete one of each pair: `review/control-continuity-remediation-903435e`, `integrate/terminal-stability-a155`, `integrate/package56-preflight-a155`.
+1. DONE 2026-07-30 for four of the six, and the other two were assessed WRONG here.
+   Deleted after verifying the content is on `main` by finding the actual code, not by ancestry (`git cherry` and `--merged` are both useless on this repo - every commit bumps the version, and everything lands squashed):
+   `perf/lazy-settings-panel` (lazy/Suspense settings panel, `dmark`, `switch:unparked` all present), `refactor/split-control-tests` (its whole diff reverse-applies to main; the origin copy was deleted too), `fix/terminal-stability` (`RemotePty::is_alive` plus its two callers, `TERMINAL_COLD_AFTER_MS = 300_000`, the Canvas poll split, the prune deferral), and `review/control-continuity-remediation-903435e` (identical tree to `crew/control-continuity-remediation`).
+   The remaining two are NOT "exact duplicates of a sibling".
+   `integrate/terminal-stability-a155` differs from `-29bc` in 7 files and `integrate/package56-preflight-a155` differs from `-29bc` in 9, because the `-29bc` side predates the Powder removal and still carries `powder.rs` (5,644 lines) plus a much older `control.rs`.
+   They are the same work on very different bases, so the question is whether either integration branch is still wanted at all, not which twin to drop. Left in place pending that decision.
 2. Make `save_shared_layout` use `spawn_blocking`. It is at `apps/desktop/src-tauri/src/theme.rs:170`, an `async fn` doing a blocking `std::fs::write`, and it fires on every tab switch. This is the same fix PERF-AUDIT Tier 1 applied to other commands.
 3. Make `tlog` lazy at the pool sync call sites, `apps/desktop/src/components/TerminalPool.tsx` around lines 591, 614, and 652. The debug gate is checked INSIDE `tlog`, so the caller still builds a template string with several `Math.round` calls per terminal per sync even when diagnostics are off. Pass a thunk, or export a `diagEnabled()` check to guard the call site.
 
@@ -245,6 +250,7 @@ Keep these in mind; each one cost real time.
 - `cargo test --workspace --lib` is NOT the gate. The `--lib` flag skips every integration-test target, which is where `mcp_e2e` lives - the suite that gates Cortana and captain authority end to end. Two green `--lib` runs still went red on CI for that reason. Run `apps/desktop/scripts/workspace_gate.sh full`, which is exactly what CI runs, plus `pnpm test:browser` when any frontend contract changes.
 - `pnpm test:browser` starts its own vite server on port 4180. A failed local run reporting `ERR_CONNECTION_REFUSED` is a dead server, not a test failure; re-run the whole `pnpm test:browser` command rather than a single Playwright case, and read the CI log for the real assertion.
 - Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach.
+- Tests that mock `../lib/diag` must mock every export they touch. Three test files mocked only `tlog`, so adding `dmark` made any call throw inside an attach try-block, which surfaced as a bogus triple-attach. It happened a SECOND time when `diagEnabled` was added, so those three mocks now spread the real module (`...(await importOriginal())`) instead of enumerating exports; keep them that way.
 - Do not arm an open-ended `until` wait on a condition you have reason to believe will not occur. Two such waits ran for 5 hours 41 minutes and 3 hours 37 minutes during this session before being noticed, each burning a sleep-polling shell. One waited for Cortana to become healthy, which is the very thing Phase 3 exists to fix. The other waited for hang-attribution lines that the session's own fixes had made impossible to produce. Both conditions were unreachable at the moment the wait was armed. Use a bounded wait with a timeout so an unreachable condition fails loudly instead of spinning silently, and prefer a single check plus a decision over an indefinite poll when the thing being waited on is itself under investigation.
 
 ---
@@ -271,3 +277,11 @@ Append an entry per landed change. Keep it short and factual, and include the me
   Use `apps/desktop/scripts/workspace_gate.sh full` - the script CI itself runs - not a narrower `--lib` invocation.
   The `mcp_e2e` update is a genuine widening and is recorded in the plan doc: authority now rests on the durable record plus a live terminal, with no evidence required about the process running inside it.
   NOT yet verified in a Windows build, which is the only measurement that decides whether Cortana is actually up.
+- 2026-07-30: Phase 0 code changes plus the Phase 1 step-1 measurement, on `perf/phase0-and-switch-timing`.
+  `save_shared_layout` moved to `spawn_blocking` (an `async fn` doing blocking `std::fs::write` on every tab switch), with its synchronous half now unit-tested.
+  The four pool-sync `tlog` sites are guarded by an exported `diagEnabled()`, and `rectStr` is only built when diagnostics are on: it cost several `Math.round` calls per terminal per sync with diagnostics off.
+  `switch:unparked` now carries the split the phase needs before choosing a fix - `attachMs` (control round trip carrying the seed), `drainMs` (write-queue wait), `resetMs` (`term.reset()`), `replayMs` + `replayBytes` (seed enqueue, not paint).
+  Neither code change is separately measurable, per the phase's own definition of done; the marker split is what the next Windows install should be read for.
+  Green: `workspace_gate.sh full`, clippy `-D warnings`, fmt, typecheck, 636 vitest, 7 Playwright.
+- 2026-07-30: Phase 0 branch prune, four of six deleted (see the corrected step 1 above).
+  The plan's claim that three branches were exact duplicates of a sibling held for one of them and was wrong for the other two, which is why the prune was verified branch by branch rather than executed as written.

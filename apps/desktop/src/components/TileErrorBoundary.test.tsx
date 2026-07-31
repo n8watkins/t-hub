@@ -8,7 +8,14 @@ import { render, screen } from "@testing-library/react";
 import { TileErrorBoundary } from "./TileErrorBoundary";
 
 // The boundary logs to the diag sink (Tauri/file-backed); stub it web-safe.
-vi.mock("../lib/diag", () => ({ tlog: () => {}, dmark: () => {} }));
+vi.mock("../lib/diag", async (importOriginal) => ({
+  // Spread the REAL module rather than enumerating exports: this mock has been
+  // broken twice by a NEW diag export (`dmark`, then `diagEnabled`), because a
+  // missing key makes any call throw from inside a component render.
+  ...(await importOriginal<typeof import("../lib/diag")>()),
+  tlog: () => {},
+  dmark: () => {},
+}));
 
 /** A stand-in tile: throws on render iff its id looks like debris (`ghost*`),
  *  mirroring a bad/dead/weird session whose tile fails to materialize. */

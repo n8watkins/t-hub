@@ -166,15 +166,27 @@ pub async fn load_shared_layout() -> Result<Option<String>, String> {
 }
 
 /// Write the shared workspace layout JSON (best-effort, creating the dir as needed).
+///
+/// The write runs on the BLOCKING pool. An `async fn` Tauri command whose body is
+/// synchronous filesystem IO still occupies the async runtime while it waits, and
+/// this one fires on every tab switch against the Windows home directory - the
+/// same shape PERF-AUDIT Tier 1 moved off the hot path elsewhere.
 #[tauri::command]
 pub async fn save_shared_layout(layout: String) -> Result<(), String> {
     let path = shared_layout_file().ok_or_else(|| {
         "could not resolve a config dir (no T_HUB_CONFIG_DIR / XDG_CONFIG_HOME / HOME)".to_string()
     })?;
+    tauri::async_runtime::spawn_blocking(move || write_shared_layout(&path, &layout))
+        .await
+        .map_err(|error| format!("shared layout write did not complete: {error}"))?
+}
+
+/// The synchronous half of [`save_shared_layout`].
+fn write_shared_layout(path: &std::path::Path, layout: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(&path, layout).map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(path, layout).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -233,6 +245,20 @@ mod tests {
         with_temp_config(|| {
             let state = ThemeState::load();
             assert_eq!(state.get(), "");
+        });
+    }
+
+    /// The shared layout write moved to the blocking pool; its synchronous half
+    /// must still create the config dir and round-trip through `load_shared_layout`.
+    #[test]
+    fn shared_layout_write_creates_its_directory_and_round_trips() {
+        with_temp_config(|| {
+            let path = shared_layout_file().expect("temp config dir resolves");
+            assert!(!path.exists(), "starts empty");
+            let layout = r#"{"tabs":[{"id":"a","order":[]}]}"#;
+            write_shared_layout(&path, layout).expect("write");
+            assert!(path.parent().expect("has a parent").is_dir());
+            assert_eq!(std::fs::read_to_string(&path).expect("read back"), layout);
         });
     }
 

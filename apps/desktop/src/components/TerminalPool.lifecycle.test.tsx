@@ -10,7 +10,14 @@ vi.mock("./CaptainOverlay", () => ({ CaptainOverlay: () => null }));
 vi.mock("./TileErrorBoundary", () => ({
   TileErrorBoundary: ({ children }: { children: React.ReactNode }) => children,
 }));
-vi.mock("../lib/diag", () => ({ tlog: () => {}, dmark: () => {} }));
+vi.mock("../lib/diag", async (importOriginal) => ({
+  // Spread the REAL module rather than enumerating exports: this mock has been
+  // broken twice by a NEW diag export (`dmark`, then `diagEnabled`), because a
+  // missing key makes any call throw from inside a component render.
+  ...(await importOriginal<typeof import("../lib/diag")>()),
+  tlog: () => {},
+  dmark: () => {},
+}));
 
 import { TerminalPoolProvider } from "./TerminalPool";
 import { useCaptain } from "../store/captain";
