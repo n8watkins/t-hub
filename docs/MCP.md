@@ -123,40 +123,93 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 
 ## 3. Tool catalog and permission tiers (PRD §11.2)
 
-| Tool | Tier | Default | Backed by |
-| --- | --- | --- | --- |
-| `list_terminals` | Read | allowed | tmux `list-sessions` on the isolated `t-hub` socket |
-| `get_status` | Read | allowed | supervision status + statusline snapshot for a `sessionId` |
-| `wait_for_status` | Read | allowed | long-polls the supervision reducer until a session reaches a target FR-012 status (or a timeout) |
-| `supervision_tree` | Read | allowed | orchestrator→subagent tree for a `sessionId` |
-| `wsl_health` | Read | allowed | host metrics from `/proc` (+ supervised-session count) |
-| `search_files` | Read | allowed | fuzzy file-index search (names + metadata only, never contents) |
-| `list_tabs` | Read | allowed | the liveness-reconciled workspace projection (`{id, name, tileIds}`) from the core's addressable tab registry; later user-originated layout reports keep the projection current |
-| `list_captains` | Read | allowed | the claimed captains (`{shipSlug, captainSessionId, workspaceTabIds, crew}` + revision) from the server captains registry — the one source of truth the UI and MCP share |
-| `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
-| `list_fleet_watches` | Read | allowed | the armed orchestrator wakes (who gets woken, for which sessions + states) from the fleet-watch registry |
-| `scribe_status` | Read | allowed | whether the general is dictating right now - Scribe's v1 status endpoint (discovered via `~/.scribe/control.json`; `status.json` file fallback with pid + 15s TTL); `listening` mirrors Scribe's level-triggered `busy` flag and fails open to `false` when it can't tell |
-| `focus_session` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
-| `move_tile` | Organization | allowed, **audited** | applies to the authoritative server registry FIRST (unknown `tabId` is a hard error), then forwards the registry snapshot; lands even when the target tab is hidden or the window is unfocused |
-| `rename_tab` | Organization | allowed, **audited** | registry-first + strict (unknown `tabId` is an error), then forwards the snapshot |
-| `new_tab` | Organization | allowed, **audited** | mints the tab id **core-side** and returns it (so the tab is addressable by `move_tile`/`focus_tab` and shows in `list_tabs`); the tab is created in the BACKGROUND (the user's active tab is not switched - use `focus_tab`) |
-| `focus_tab` | Organization | allowed, **audited** | the one organization command that intentionally moves the user's view; strict (the tab must exist) and mirrored into the registry's `activeTabId` |
-| `close_tab` | Organization | allowed, **audited** | closes a workspace tab headlessly; refused for the LAST tab, and for a non-empty tab unless `force: true` (see the tab-lifecycle policy below) |
-| `claim_captain` | Organization | allowed, **audited** | claims captaincy of a ship in the server captains registry (registry-first + strict: one captain per ship), then forwards the captains snapshot (`sync_captains`); a captain self-registers with its own session id instead of hand-editing ship files (see the captains-registry policy below) |
-| `release_captain` | Organization | allowed, **audited** | releases a claim by `captainSessionId` or `shipSlug` (unknown claims are refused), then forwards the snapshot |
-| `watch_fleet` | Organization | allowed, **audited** | arms a server-side push that re-invokes THIS orchestrator's loop (injects a prompt into its terminal) when a watched session (default: any captain) goes idle / needs-input / completes; idempotent (re-arming replaces the prior watch) |
-| `unwatch_fleet` | Organization | allowed, **audited** | disarms the orchestrator wake previously armed with `watch_fleet` |
-| `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
-| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns a generic worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; supervisor agent assignments are refused and must use `start_agent` after creating the worktree |
-| `remove_worktree` | Organization | temporarily unavailable | source `0.3.88` fails closed before UI detachment or Git mutation until the unified worktree status service is available; `force` cannot bypass the suspension |
-| `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns a generic user terminal, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; supervisor Crew/provider assignments are refused before admission and must use `start_agent` |
-| `commission_captain` | **Process-changing** | **confirmation required** | starts a new control-capability Codex or Claude Captain and binds it to a registered Project |
-| `attach_captain` | **Process-changing** | **confirmation required** | attaches an existing live harness only when it already holds the current control capability; read-only terminals are refused without changing their token |
-| `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
-| `send_keys` | **Process-changing** | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
-| `close_terminal` | **Process-changing** | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; also drops the dead tile from the server registry and pushes a `sync_tabs` snapshot, so the tile leaves its tab even when that tab is hidden |
-| `get_theme` / `set_theme` | Theme | forwarded by name | see the theme contract below |
+The catalog is 64 tools.
+`apps/desktop/src-tauri/crates/t-hub-mcp/src/tools.rs` is the source of truth for names, tiers, and schemas; the tier is also surfaced to the host in each tool's description prefix and in `t-hubTier`.
 
+### Read tier (22) - dispatch directly, return live data
+
+| Tool | Default | Backed by |
+| --- | --- | --- |
+| `list_terminals` | allowed | tmux `list-sessions` on the isolated `t-hub` socket |
+| `my_capability` | allowed | whether the presented token grants read or control capability - call this first when you are unsure why a write is being refused |
+| `get_status` | allowed | supervision status + statusline snapshot for a `sessionId` |
+| `wait_for_status` | allowed | long-polls the supervision reducer until a session reaches a target FR-012 status (or a timeout); returns the final status, elapsed ms, and whether it timed out |
+| `supervision_tree` | allowed | orchestrator→subagent tree for a `sessionId` |
+| `wsl_health` | allowed | host metrics from `/proc` (+ supervised-session count) |
+| `search_files` | allowed | fuzzy file-index search (names + metadata only, never contents) |
+| `list_tabs` | allowed | the liveness-reconciled workspace projection (`{id, name, tileIds}`) from the core's addressable tab registry; later user-originated layout reports keep the projection current |
+| `list_captains` | allowed | the claimed captains (`{shipSlug, captainSessionId, workspaceTabIds, crew}` + revision) from the server captains registry — the one source of truth the UI and MCP share |
+| `list_projects` | allowed | durable registered Projects and their Git repository metadata |
+| `list_agents` | allowed | bounded durable agent-session summaries for one Captain or Project; excludes stopped agents by default and exposes stopped history through `state: "removed"` with cursor pagination |
+| `get_agent` | allowed | the full durable record for one agent session, including its assignment — the authoritative way to retrieve an assignment |
+| `agent_events` | allowed | bounded lifecycle and checkpoint events after a cursor, with cursor-expiry signaling |
+| `captain_bootstrap` | allowed | recovers a Captain's durable Project, Assignment, and agent-session roster after a context reset or new conversation |
+| `cortana_bootstrap` | allowed | recovers the bounded, redacted Cortana singleton checkpoint and current ship resume points |
+| `dispatch_preflight` | allowed | evaluates lane ownership, dependencies, mutable-resource collisions, live capacity, and reserved supervisor/recovery headroom before a dispatch; imposes no fixed lane-count cap |
+| `list_admin_grants` | allowed | the caller's durable Ship Admin or Fleet Admin grants, including scope, generation, permitted operations, and revocation state |
+| `preview_discover` | allowed | bounded typed Preview targets for one exact Project root |
+| `preview_status` | allowed | the authoritative backend Preview lifecycle status for one Project or Workspace scope |
+| `list_fleet_watches` | allowed | the armed orchestrator wakes (who gets woken, for which sessions + states) from the fleet-watch registry |
+| `read_terminal` | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
+| `scribe_status` | allowed | whether the general is dictating right now - Scribe's v1 status endpoint (discovered via `~/.scribe/control.json`; `status.json` file fallback with pid + 15s TTL); `listening` mirrors Scribe's level-triggered `busy` flag and fails open to `false` when it can't tell |
+
+### Organization tier (29) - allowed, **audited**
+
+| Tool | Default | Backed by |
+| --- | --- | --- |
+| `focus_session` | allowed, **audited** | accepted + audited; UI application via the frontend command |
+| `move_tile` | allowed, **audited** | applies to the authoritative server registry FIRST (unknown `tabId` is a hard error), then forwards the registry snapshot; lands even when the target tab is hidden or the window is unfocused |
+| `rename_tab` | allowed, **audited** | registry-first + strict (unknown `tabId` is an error), then forwards the snapshot |
+| `new_tab` | allowed, **audited** | mints the tab id **core-side** and returns it (so the tab is addressable by `move_tile`/`focus_tab` and shows in `list_tabs`); the tab is created in the BACKGROUND (the user's active tab is not switched - use `focus_tab`) |
+| `focus_tab` | allowed, **audited** | the one organization command that intentionally moves the user's view; strict (the tab must exist) and mirrored into the registry's `activeTabId` |
+| `close_tab` | allowed, **audited** | closes a workspace tab headlessly; refused for the LAST tab, and for a non-empty tab unless `force: true` (see the tab-lifecycle policy below) |
+| `claim_captain` | allowed, **audited** | claims captaincy of a ship in the server captains registry (registry-first + strict: one captain per ship), then forwards the captains snapshot (`sync_captains`); a captain self-registers with its own session id instead of hand-editing ship files (see the captains-registry policy below). Pass `role: "cortana"` from inside the orchestrator shell to claim the Cortana singleton |
+| `release_captain` | allowed, **audited** | releases a claim by `captainSessionId` or `shipSlug` (unknown claims are refused), then forwards the snapshot |
+| `rename_captain` | allowed, **audited** | renames one durable Captain identity without changing its Assignment, terminal, Harness, or Workspace ownership |
+| `captain_checkpoint` | allowed, **audited** | persists a Captain or Crew conversation identifier and reset-safe resume point in the ship manifest |
+| `agent_checkpoint` | allowed, **audited** | appends a bounded human-readable checkpoint to a durable agent session; the authenticated exact agent may write only its own, selecting `working`, `needsInput`, or `readyForReview` |
+| `agent_followup` | allowed, **audited** | delivers a restart-safe, idempotent follow-up to an existing owned agent session through its durable inbox; assignment metadata changes only when `replacementAssignment` is supplied |
+| `record_agent_delivery` | allowed, **audited** | records immutable exact-commit evidence for implemented, reviewed, tested, complete, integrated, packaged, installed, and live-verified states; `complete` is derived only from review plus acceptance testing |
+| `register_project` | allowed, **audited** | registers an existing Git or non-Git WSL Project, or explicitly creates one absent empty-codebase leaf |
+| `initialize_git` | allowed, **audited** | explicitly initializes Git for an existing Project root; registration never creates a `.git` directory on its own |
+| `appoint_admin` | allowed, **audited** | appoints one Crew identity as a durable Ship Admin or Fleet Admin within the authenticated supervisor's exact authority |
+| `approve_admin_action` | allowed, **audited** | issues a durable one-time approval for one destructive delegated operation, bound to the exact grant, actor, target, supervisor, and authority generation; session target kind and ownership are derived by the backend from `sessionId` |
+| `execute_admin_operation` | allowed, **audited** | executes a bounded role-authorized Ship Admin or Fleet Admin maintenance operation, or prepares an authoritative recovery or retirement plan when mutation is unsafe |
+| `revoke_admin` | allowed, **audited** | revokes one durable administrative grant while retaining its audit tombstone |
+| `history_list` | allowed, **audited** | the provider-neutral History catalog with exact continuity and action compatibility (see [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md)) |
+| `history_focus` | allowed, **audited** | focuses the unique live terminal for one exact active History identity |
+| `preview_select` | allowed, **audited** | persists one exact discovered Preview target for a Project or Workspace scope |
+| `preview_refresh` | allowed, **audited** | revalidates the backend-owned endpoint for one active Preview run |
+| `preview_open` | allowed, **audited** | opens only the backend-verified URL for one active Preview run |
+| `watch_fleet` | allowed, **audited** | arms a server-side push that re-invokes THIS orchestrator's loop (injects a prompt into its terminal) when a watched session (default: any captain) goes idle / needs-input / completes; idempotent (re-arming replaces the prior watch) |
+| `unwatch_fleet` | allowed, **audited** | disarms the orchestrator wake previously armed with `watch_fleet` |
+| `open_file` | allowed, **audited** | capped text read via the Files reader |
+| `create_worktree` | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns a generic worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; supervisor agent assignments are refused and must use `start_agent` after creating the worktree |
+| `remove_worktree` | temporarily unavailable | source `0.3.88` fails closed before UI detachment or Git mutation until the unified worktree status service is available; `force` cannot bypass the suspension |
+
+### Process-changing tier (11) - **confirmation required**
+
+| Tool | Default | Backed by |
+| --- | --- | --- |
+| `spawn_terminal` | **confirmation required** | the server spawns a generic user terminal, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; supervisor Crew/provider assignments are refused before admission and must use `start_agent` |
+| `start_agent` | **confirmation required** | starts one Codex or Claude agent in an existing Project checkout with a durable assignment; creates the durable record before launch, applies the spawn governor, and binds the spawned identity to the owning Captain ship |
+| `commission_captain` | **confirmation required** | commissions one project-aware Codex or Claude Captain and binds it transactionally to its durable ship |
+| `attach_captain` | **confirmation required** | attaches an existing live harness only when it already holds the current control capability; read-only terminals are refused without changing their token |
+| `history_resume` | **confirmation required** | resumes one exact provider conversation using backend-owned Harness, identity, cwd, and command selection |
+| `preview_start` | **confirmation required** | starts one backend-selected typed Preview target with an idempotent request ID |
+| `preview_stop` | **confirmation required** | stops only the exact backend-owned Preview process identity |
+| `preview_restart` | **confirmation required** | restarts one exact backend-owned Preview target after revalidating ownership |
+| `send_text` | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
+| `send_keys` | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
+| `close_terminal` | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; also drops the dead tile from the server registry and pushes a `sync_tabs` snapshot, so the tile leaves its tab even when that tab is hidden |
+
+### Theme tier (2)
+
+| Tool | Default | Backed by |
+| --- | --- | --- |
+| `get_theme` / `set_theme` | forwarded by name | see the theme contract below |
+
+No retired Powder tool is advertised.
 ### How tiers are enforced
 - **Read** tools dispatch directly and return live data.
 - **Organization** tools are accepted and **audited** (PRD §11.2: "allowed with
