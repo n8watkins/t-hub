@@ -1,4 +1,9 @@
-# Lane C — Terminal Input (agent kickoff brief) · ACTIVE (3rd parallel lane)
+# Lane C — Terminal Input (agent kickoff brief)
+
+> ⚠️ **HISTORICAL — this lane shipped.** Its wave is recorded as complete in
+> [../FEATURE-PLAN.md](../FEATURE-PLAN.md), and its branch and worktree no longer exist.
+> This is a kickoff brief for work that is already in the product; do not execute it.
+> Kept for the lane/sequencing rationale. See [../REVIEW-INDEX.md](../REVIEW-INDEX.md).
 
 > **CONFLICT-FREE CONSTRAINT — do NOT edit `Tile.tsx`.** This lane now runs in
 > parallel with Lane A (which owns `Tile.tsx`). The file-drop is a **window-level**

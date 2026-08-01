@@ -1,6 +1,6 @@
 # T-Hub — Active Feature Plan
 
-> ⚠️ **HISTORICAL SNAPSHOT — all SHIPPED; do not treat as active.** This was the wave plan for the Codex-icon / usage-split / drag-drop / auto-resume work, which is **all built and committed** in the current `0.1.67` app (Codex icon + claude/codex split, sidebar strips, drag-into-workspace, auto-continue on rate-limit). Kept for the lane/sequencing rationale, not as a to-do list. The current forward plan is [ROADMAP-PLAN.md](./ROADMAP-PLAN.md); the long-horizon architecture is [PLAN.md](./PLAN.md).
+> ⚠️ **HISTORICAL SNAPSHOT — all SHIPPED; do not treat as active.** This was the wave plan for the Codex-icon / usage-split / drag-drop / auto-resume work, which was **all built and committed** by `0.1.67` (Codex icon + claude/codex split, sidebar strips, drag-into-workspace, auto-continue on rate-limit) and remains in the product at `0.3.163`. Kept for the lane/sequencing rationale, not as a to-do list; the three per-lane kickoff briefs are in [lanes/](./lanes/). [ROADMAP-PLAN.md](./ROADMAP-PLAN.md) and [PLAN.md](./PLAN.md) are both historical too now — for current work see [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 
 Features we are building **now** — split into parallel **worktree lanes** so
 multiple terminal sessions can drive them at once off `main`. This is NOT a

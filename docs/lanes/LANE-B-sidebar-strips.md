@@ -1,5 +1,10 @@
 # Lane B — Sidebar Strips (agent kickoff brief)
 
+> ⚠️ **HISTORICAL — this lane shipped.** Its wave is recorded as complete in
+> [../FEATURE-PLAN.md](../FEATURE-PLAN.md), and its branch and worktree no longer exist.
+> This is a kickoff brief for work that is already in the product; do not execute it.
+> Kept for the lane/sequencing rationale. See [../REVIEW-INDEX.md](../REVIEW-INDEX.md).
+
 **You are the agent for this lane.** Read top to bottom, then execute. Plan
 context: [../FEATURE-PLAN.md](../FEATURE-PLAN.md). You work in the worktree
 `…/wt-sidebar-strips` on branch **`feat/sidebar-strips`**, branched off `main`.
