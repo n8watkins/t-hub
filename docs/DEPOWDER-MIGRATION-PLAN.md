@@ -2,15 +2,17 @@
 
 ## Status
 
-This document is the decision-complete implementation plan for retiring Powder from T-Hub for now.
+DELIVERED. The Powder runtime was removed on `main` in `0.3.112` (2026-07-23): `powder.rs`, its handlers, and its tests are gone, and no Powder tool is advertised over MCP.
+The migration branch `fix/captain-control-runtime` has been merged and deleted, as have every other branch named in this plan.
+`main` is the only baseline; do not go looking for the branches or integration heads recorded below.
 
-The original implementation baseline was the independently reviewed integration commit `efd3271a4efcde2b801a4b07fa4316560b8d9d15`.
+What remains deliberately unfinished is the persisted schema.
+Legacy Powder fields are still parsed and carried as inert compatibility data (`agent_session.rs`, the `captains-schema-18` fixture, and the registry-schema tests), because retiring them is a separate schema migration that has not been scheduled.
+The sequence below is retained as the record of what was implemented and why, and as the specification for that remaining schema work.
 
-The release baseline is now the verified depowder branch `fix/captain-control-runtime`.
+This document was the decision-complete implementation plan for retiring Powder from T-Hub.
 
-The approved integration head remains preserved and reachable, but it is not merged into the release baseline because it contains Powder-era integration work and conflicts with the completed depowder changes.
-
-Do not reset the repository to the historical pre-Powder commit.
+The original implementation baseline was the independently reviewed integration commit `efd3271a4efcde2b801a4b07fa4316560b8d9d15`, which was preserved rather than merged because it contained Powder-era integration work that conflicted with the completed depowder changes.
 
 The historical commit `e0b2998455da8fc53c22ac402887fd4434364476` is a behavioral reference only.
 
@@ -294,7 +296,11 @@ Keep legacy deserialization until the General separately authorizes permanent hi
 
 ## Current Work Preservation
 
-The following approved component heads must remain reachable and unchanged while the migration branch is prepared.
+> Historical execution scaffolding.
+> The migration is delivered and every branch and worktree named below has been merged and pruned; the commits survive only as `main` history.
+> This section is the record of what the migration had to protect, not a live precondition.
+
+The following approved component heads had to remain reachable and unchanged while the migration branch was prepared.
 
 - Collaboration client head `696973d6b5abc5d3fa683092843c5126266925c6`.
 - Terminal lifecycle head `b535437398230bc0ea2a6a218cd34ba08e36c3df`.
@@ -311,13 +317,9 @@ Before implementation begins, record the exact live terminal list, worktree list
 
 Use one owner for the control-plane lane because the registry, dispatch, lifecycle, and reconciliation code overlap heavily.
 
-The implementation has been completed on the verified depowder branch `fix/captain-control-runtime`.
+The implementation was completed on the depowder branch `fix/captain-control-runtime` and has since landed on `main`.
 
-Do not merge or rebase the release baseline onto `efd3271a4efcde2b801a4b07fa4316560b8d9d15` without explicit authorization.
-
-Cherry-pick this plan document's commit onto that branch if the branch does not already contain it.
-
-Implement and verify these changes as separate logical commits.
+The steps below were implemented and verified as separate logical commits.
 
 1. Add the legacy Powder data module and schema-17 migration fixtures without changing behavior.
 2. Add the agent runtime and work-stage model with backward-compatible Crew loading.
@@ -478,6 +480,10 @@ The migration is complete only when all of the following are true.
 - No merge, push, install, restart, publish, release, or destructive cleanup occurs without explicit authorization.
 
 ## First Actions for the Implementation Terminal
+
+> Historical runbook: this sequence was executed and the migration is delivered.
+> Do not follow it. Its branches, integration heads, and worktrees no longer exist, and steps 2 through 6 would send you looking for them.
+> If you are picking up the remaining schema work, branch from `main` and use the Implementation Sequence above as the specification.
 
 1. Read `AGENTS.md`, `docs/cli-contract.md`, and this entire plan.
 2. Confirm the canonical repository and list every worktree before creating a branch or editing files.
