@@ -2,7 +2,9 @@
 
 Created: 2026-07-29.
 Last updated: 2026-07-29.
-Status: Phases 0, 1, 2 and 4 not started. Phase 3 is SUPERSEDED by `docs/CORTANA-SIMPLIFICATION-PLAN.md`.
+Status: Phase 0 DONE (2026-07-30). Phase 3 SUPERSEDED by `docs/CORTANA-SIMPLIFICATION-PLAN.md` and shipped.
+Phases 1, 2 and 4 not started; Phase 1 is now blocked on reading the `switch:unparked` split it already emits.
+Current next steps: `docs/NEXT-STEPS-2026-07-31.md`.
 
 This document is the working plan for the remaining performance and correctness work found during the 2026-07-29 optimization review.
 It is written to be picked up with NO prior conversation context.
