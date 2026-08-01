@@ -12,7 +12,8 @@ and `docs/CORTANA-SIMPLIFICATION-PLAN.md` (why Cortana was rebuilt and what chan
 ## Where things stand as of 2026-07-31
 
 Nothing is in flight.
-`main` is 0.3.162, the installed Windows build is 0.3.162, there are zero open pull requests, and the only branches anywhere are `main` and the deliberate `native-archive` (also tagged `native-pivot-final`).
+`main` is 0.3.163, the installed Windows build is 0.3.162, there are zero open pull requests, and the only branches anywhere are `main` and the deliberate `native-archive` (also tagged `native-pivot-final`).
+The one-patch gap is the docs commit that recorded the branch triage; there is no source difference between the two.
 
 Landed and verified in production on 2026-07-30:
 
@@ -100,9 +101,11 @@ Phase 1 also carries a known risk recorded in the plan: it touches `apps/desktop
 ## 3. Smaller things that are open
 
 - **Phase 2** (startup latency) and **Phase 4** (switch write amplification) in the optimization plan are unstarted. Phase 2 begins with a measurement, not a fix: `boot:inventory` was 707 ms on one boot and 7,995 ms on another and that eleven-fold variance is not explained.
-- **Two latent test-infra defects on main**, found during the branch triage and still open:
-  `ControlContext::new` (`control.rs`) defaults `live_sessions` to the real `tmux::list_sessions()` shell-out with no `#[cfg(test)]` variant, unlike its `provider_capacity` neighbours, so spawn-path tests that omit `.with_live_sessions(...)` silently need live tmux;
-  and five `current_exe()` re-exec sites remain unfixed (`apps/cli/src/control.rs`, `crates/t-hub-agent/src/journal.rs`, `crates/t-hub-mcp/src/control_client.rs`, and two in `tests/mcp_e2e.rs`).
+- **Two latent test-infra defects on main**, found during the branch triage and still open.
+  All paths below are repo-relative; note that the workspace crates live under `apps/desktop/src-tauri/crates/`, not at the repo root.
+  First, `ControlContext::new` (`apps/desktop/src-tauri/src/control.rs:9027`) defaults `live_sessions` to the real `tmux::list_sessions()` shell-out with no `#[cfg(test)]` variant, unlike its `provider_capacity` neighbours, so spawn-path tests that omit `.with_live_sessions(...)` silently need live tmux.
+  Second, five `current_exe()` re-exec sites remain unfixed: `apps/cli/src/control.rs:721`, `apps/desktop/src-tauri/crates/t-hub-agent/src/journal.rs:1108`, `apps/desktop/src-tauri/crates/t-hub-mcp/src/control_client.rs:2387`, and two in `apps/desktop/src-tauri/tests/mcp_e2e.rs` (lines 443 and 2287).
+  The fixed reference implementation is `apps/desktop/src-tauri/src/tmux.rs:2278-2297`, which prefers `/proc/self/exe` on Linux and falls back to `current_exe()`.
 - **The 64s first-reconcile** seen once on 0.3.157 was never explained. It did not reproduce (6.2s on the next boot) and the sidebar no longer depends on it, but `cortana:first-healthy` is in place to catch it if it returns.
 - **`/fleet-orchestrator`** (in `~/.claude/skills/`, outside this repo) now instructs the agent to claim. The seeded `AGENTS.md` covers Codex and Claude automatically, so the skill is only needed for the full doctrine.
 
