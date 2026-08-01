@@ -59,9 +59,15 @@ apps/
       src/agent/               core↔agent transport + journal spine
       src/claude/              hook install + startup self-heal (managed-marker reconcile)
       src/{codex,usage,recent,supervision,files,db,devserver,control,theme,diag,…}.rs   feature modules
-      crates/                  t-hub-agent (statusline/hook sidecar) · t-hub-mcp (MCP server) · t-hub-protocol
+      src/control/             Control-socket handlers, split by surface (spawn · captains · agents ·
+                               comms · admin · worktrees · history · tabs · terminal · files · status)
+      crates/                  t-hub-agent (statusline/hook sidecar) · t-hub-mcp (MCP server) ·
+                               t-hub-protocol (shared wire types) · t-hub-preview-runtime (preview supervisor)
+  cli/                         `th`, the standalone Rust CLI — a control-socket client with no MCP
+                               runtime required. See apps/cli/README.md and docs/cli-contract.md.
   site/                        Marketing site (npm-based; its own package-lock.json)
-docs/                          PLAN · HANDOFF · DEV-BUILD · MCP · WORKTREE-WORKFLOW · SESSION_AWARENESS · AUDIT · …
+docs/                          REVIEW-INDEX (start here — classifies every doc) · NEXT-STEPS · MCP ·
+                               TESTING · DEV-BUILD · cli-contract · the subsystem contracts · …
 PRD.md                         Product Requirements Document v1.0
 REVIEW.md                      Technical review of the PRD + verified Claude Code facts
 pnpm-workspace.yaml            Workspace manifest (lists apps/desktop)
@@ -90,9 +96,11 @@ Then `pnpm tauri dev` (a window opens through WSLg).
 
 ## Roadmap & docs
 
-- **[docs/POST-POWDER-ROADMAP.md](./docs/POST-POWDER-ROADMAP.md)** - the authoritative agent-session roadmap and acceptance gates.
-- **[docs/AGENT-SESSION-SMOKE-0.3.106.md](./docs/AGENT-SESSION-SMOKE-0.3.106.md)** - the historical bounded smoke procedure for the 0.3.106 Windows and WSL release.
-
-- **[docs/PRODUCTION-READINESS.md](./docs/PRODUCTION-READINESS.md)** - the active stabilization program, CI target, security workstreams, and measurable Alpha/Beta/Stable release gates.
+- **[docs/REVIEW-INDEX.md](./docs/REVIEW-INDEX.md)** — **start here.** It classifies every document in the repository as current, a canonical contract, a completed record, historical, or archived, and gives the reading order. Several docs here are deliberately kept as history; the index is how you tell which is which.
+- **[docs/NEXT-STEPS-2026-07-31.md](./docs/NEXT-STEPS-2026-07-31.md)** — what is actually being worked on right now, written for a reader with no prior context.
+- **[docs/POST-POWDER-ROADMAP.md](./docs/POST-POWDER-ROADMAP.md)** - the agent-session acceptance surface and its next gates.
+- **[docs/TESTING.md](./docs/TESTING.md)** — the ten test profiles, what each covers, and what each costs.
+- **[docs/cli-contract.md](./docs/cli-contract.md)** — the target public behavior of `th`; required reading for any CLI change.
+- **[docs/PRODUCTION-READINESS.md](./docs/PRODUCTION-READINESS.md)** - the measurable Alpha/Beta/Stable release gates, none of which has been passed yet.
 - **[docs/PLAN.md](./docs/PLAN.md)** — the original phased plan (0.5 → 2.0). Most of the 0.5 supervision track has since shipped; kept as the design-rationale record.
-- **[PRD.md](./PRD.md)** — full product spec. **[REVIEW.md](./REVIEW.md)** — review + the verified Claude Code integration facts (hooks, sessions, statusline, SDK) the plan relies on.
+- **[PRD.md](./PRD.md)** — full product spec. **[REVIEW.md](./REVIEW.md)** — review + the verified Claude Code integration facts (hooks, sessions, statusline, SDK) the plan relies on. Both predate the agent-session model.
