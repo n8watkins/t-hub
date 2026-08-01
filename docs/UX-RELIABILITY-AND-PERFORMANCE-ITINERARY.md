@@ -2,10 +2,16 @@
 
 ## Status
 
-This is the active outline for the General's July 20, 2026 T-Hub follow-up.
-Implementation must proceed serially so each package is reproduced, fixed, reviewed, committed, and accepted before the next package begins.
-The Captain remains at orchestration altitude and uses one visible T-Hub Crew workspace with one terminal for the single active implementer.
-An independent reviewer may follow the implementer, but implementation packages must not overlap in time.
+Superseded as the governing program; retained as the package specifications.
+
+This was the outline for the General's July 20, 2026 T-Hub follow-up, and its serialized Package 0 through Package 6 process is no longer how work is being sequenced.
+The package implementation branches (including the Package 3 preview service and the Package 5/6 preflight) were all verified landed on `main` during the 2026-07-30 branch triage recorded in `docs/OPTIMIZATION-PLAN-2026-07-29.md`.
+That is a statement about code, not about the per-package acceptance gates, which were never formally signed off.
+Current priorities come from `docs/NEXT-STEPS-2026-07-31.md`.
+
+The requirements in each package below remain the specification for that surface, and `PACKAGE-5-LIVE-ACCEPTANCE.md` and `PACKAGE-6-PERFORMANCE-CLOSURE.md` remain the release and performance evidence standards.
+
+The original serialization rule, recorded as history: implementation was to proceed serially so each package was reproduced, fixed, reviewed, committed, and accepted before the next began, with the Captain at orchestration altitude over a single active implementer and no overlapping packages.
 
 ## Outcomes
 

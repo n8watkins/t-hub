@@ -5,9 +5,11 @@
 >
 > **Headline:** the **server-split is largely shipped** — M1 (decouple locally), M2a/M2b-core (tiles + events over the socket; opt-in Tailscale bind + peer gate), and **all of M3** (every overlay/index read: recent · usage · codex · git · host_metrics · file index) are on `main`, each verified live. **Remaining tail:** the file BROWSER/READER/EDITOR remoting (M4-gated — arbitrary-path read+write needs peer-gating/path-scoping), M2b deferred hardening (per-client `attach_pty` auth, read/idle timeout, protocol versioning, reconnect re-sync) + a real two-device Tailscale test, then M4 (multi-client). See [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) §6. Also still deferred: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), more vitest coverage (component/RTL tests), the WS-9 nits (`sanitizeBranchToDir` collision + remote-branch DWIM-tracking), and the parked beyond-parity differentiators (bottom).
 
-**Status:** Active plan, **verified against the live codebase** (six read-only audits, file:line-grounded). Turns [HERDR-PARITY.md](./HERDR-PARITY.md) (the *why* + gap analysis) into an *executable* plan organized for **parallel agent execution**. Companion: [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) (item ⑥).
+**Status:** ⚠️ **HISTORICAL — shipped-wave record, not an active plan.** Its whole active scope (Wave 0 + Wave 1 + WS-9) shipped in v0.2.0, as the banner above records; the codebase is now `0.3.163`. Per [REVIEW-INDEX.md](./REVIEW-INDEX.md) this is a historical execution plan. Kept because the file:line-grounded slice breakdowns are still the best record of *how* each parity feature was built. Verify anything here against current source before acting on it; current priorities are in [NEXT-STEPS-2026-07-31.md](./NEXT-STEPS-2026-07-31.md).
 
-**Active scope = Wave 0 + Wave 1.** Remote/SSH (⑥) and the beyond-parity wildcards are deferred to *Later / someday* (bottom). All paths below are real (`apps/desktop/…` monorepo).
+Turns [HERDR-PARITY.md](./HERDR-PARITY.md) (the *why* + gap analysis) into an *executable* plan organized for **parallel agent execution**. Companion: [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) (item ⑥).
+
+**Scope as planned = Wave 0 + Wave 1.** Remote/SSH (⑥) and the beyond-parity wildcards were deferred to *Later / someday* (bottom) and remain deferred. All paths below were real at the time (`apps/desktop/…` monorepo).
 
 **Progress:** ✅ **Wave 0 + Wave 1 complete.** All eight slices implemented, verified (cargo build + lib tests + tsc + pnpm install), and committed:
 - Wave 0 — WS-1 copy-on-select/open-file (`a00085c`), WS-2 OS toasts (`c5915d8`), WS-5a `wait_for_status` (`683ff61`).

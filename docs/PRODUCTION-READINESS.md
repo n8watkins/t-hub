@@ -1,7 +1,10 @@
 # T-Hub Production Readiness Plan
 
-**Status:** Active stabilization program.
-**Audit baseline:** 2026-07-13, `main` at `e936e33`, source version `0.3.64`.
+**Status:** Reference gates, not an active program.
+The Alpha, Beta, and Stable release gates below still stand and have never been formally passed.
+The *sequencing* directive did not hold: this document asked for a feature pause after `0.3.65`, and development continued instead (currently `0.3.163`).
+Treat the gates as the definition of "ready to call this stable", and take current priorities from `docs/NEXT-STEPS-2026-07-31.md`.
+**Audit baseline:** 2026-07-13, `main` at `e936e33`, source version `0.3.64`. Every count and measurement below is from that snapshot.
 **Owner:** T-Hub maintainers.
 
 ## Executive Decision
@@ -10,10 +13,9 @@ T-Hub is a capable personal alpha, but it is not ready to be called stable or pr
 The current CI proves that the Linux-compatible Rust and frontend unit suites compile and pass.
 It does not prove that the Windows and WSL product works, that a released installer is trustworthy, or that upgrades and recovery are safe.
 
-Feature expansion should pause after the current `0.3.65` integration wave.
-The resulting build becomes the stabilization baseline, not the stable release.
-Additional orchestration features and broad UI work resume only after the Beta
-gate in this document passes.
+This document recommended pausing feature expansion after the `0.3.65` integration wave, making that build the stabilization baseline.
+That pause was not taken, and the recommendation is recorded here as history rather than as a live instruction.
+The underlying judgement is unchanged: the Beta gate below has still not been passed.
 
 ## Supported Production Scope
 

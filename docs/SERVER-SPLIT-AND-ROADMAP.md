@@ -227,6 +227,8 @@ When several clients attach to one tmux pane, tmux shares the resize: the pane s
 
 The single decision that most shapes priority was: **"rich cockpit, locally" vs "reach my agents from anywhere."** With ①–⑤ shipped (the rich local cockpit is *built*), the owner has **chosen "reach my agents from anywhere."**
 
-→ **Pull M1–M2 forward and accept a degraded overlay on remote until M3.** That is the active plan: §7 step 3 is now the head of the queue, and §6's M1 cold-start task is where to begin.
+→ **Pull M1–M2 forward and accept a degraded overlay on remote until M3.** That was the plan of record when this section was written, and M1 through M3 duly shipped.
+
+> **No longer the head of the queue.** M4 and the M2b hardening tail have been dormant since the 2026-07-05 native-pivot decision, and nothing since has been sequenced against this document. Remote multi-client remains a real deferred goal, not current work; take current priorities from [NEXT-STEPS-2026-07-31.md](./NEXT-STEPS-2026-07-31.md).
 
 The forward-compatibility discipline (§6) already paid off — ③④⑤ shipped on the control channel, so the split is an extraction from here, not a rewrite.
