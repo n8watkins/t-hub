@@ -1,10 +1,15 @@
 # Simplify Cortana to a reattach-or-create shell singleton
 
 Created: 2026-07-29.
-Status: item 1 (the Windows empty-cwd spawn fix) landed in PR #92.
-The Cortana simplification is BUILT and green on `refactor/cortana-singleton`, and is not yet verified in a Windows build.
+Status: DELIVERED and verified in production on 2026-07-30.
+Item 1 (the Windows empty-cwd spawn fix) landed in PR #92, and the Cortana simplification itself landed in PR #93; the `refactor/cortana-singleton` branch has been merged and deleted.
+Production evidence, along with the five follow-on gate fixes it exposed (PRs #95, #96, #97, #98), is recorded in `docs/NEXT-STEPS-2026-07-31.md`.
+One claim from this work remains unverified: whether an agent started inside the Cortana tile can claim the role and keep CONTROL capability across an app restart.
+That verification is step 1 of `docs/NEXT-STEPS-2026-07-31.md`.
 
-This is the approved implementation plan.
+This document is retained as the design rationale for the delivered change, not as pending work.
+
+This was the approved implementation plan.
 It supersedes Phase 3 of `docs/OPTIMIZATION-PLAN-2026-07-29.md`, which said to root-cause `observe-managed-runtime-owner exit 91`.
 The decision recorded here is to remove the mechanism instead of debugging it.
 
@@ -34,10 +39,13 @@ The old inspect-under-provisioning-then-re-enter pass existed to keep a 30-secon
 
 ## Context
 
-Cortana is currently broken and has been for a long time.
-It fails every reconcile with `observe-managed-runtime-owner exit 91` ("systemd, cgroup, process, nonce, and tmux ownership did not agree") followed by `retire-prepared-managed-runtime exit 120`.
-The durable record has reached generation 16 with 15 revoked identities, which is the signature of a launch path that has been thrashing for a long time.
-Earlier today the reconcile loop was failing 2,891 consecutive times in a single session, and its retry cost was degrading the whole app until it was backed off in PR #90.
+This section describes the state that motivated the work, as of 2026-07-29.
+It is history now: the mechanism below was removed, and the 15-entry quarantine ledger cleared in production on 2026-07-30.
+
+Cortana was broken and had been for a long time.
+It failed every reconcile with `observe-managed-runtime-owner exit 91` ("systemd, cgroup, process, nonce, and tmux ownership did not agree") followed by `retire-prepared-managed-runtime exit 120`.
+The durable record had reached generation 16 with 15 revoked identities, which is the signature of a launch path that has been thrashing for a long time.
+On the day this plan was written the reconcile loop was failing 2,891 consecutive times in a single session, and its retry cost was degrading the whole app until it was backed off in PR #90.
 
 The root cause of exit 91 was never established, and that is deliberate: rather than keep debugging a mechanism we do not need, remove the mechanism.
 
@@ -147,8 +155,10 @@ Other postures, for completeness:
 
 ## Separate bug found: cannot add a terminal to a workspace on Windows
 
+FIXED in PR #92 and verified in production: a no-cwd terminal now spawns into `~`, and the error below has not recurred.
+
 Reported during planning and root-caused, so it is captured here rather than lost.
-This is INDEPENDENT of the Cortana work and should land as its own commit or PR.
+This was INDEPENDENT of the Cortana work and landed as its own PR.
 
 Symptom, from the diag log at 2026-07-30T02:47:03 and again at 02:47:06:
 
