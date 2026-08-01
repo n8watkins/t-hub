@@ -3,6 +3,19 @@
 A full-project review of `t-hub-app` at `main` @ `8ba599fc` (v0.3.140).
 Covers code health, correctness and security, and runtime behaviour.
 
+> **Status as of 2026-08-01: a point-in-time review, partly actioned. Not an open backlog.**
+>
+> Resolved since it was written:
+> finding 1 (41 GB of stale worktrees) - all 18 worktrees and all 14 remaining local branches were verified landed by content and pruned on 2026-07-30; only `main` is left.
+> Finding 2 (`fix/startup-reconciliation-release`) - verified landed as part of that same triage.
+> Finding 5 (no JS/TS linting) - `apps/desktop/eslint.config.js` and `pnpm lint` exist and pass with 0 errors and 28 warnings, and `.github/workflows/test.yml` runs eslint as the JS/TS counterpart to the Rust clippy gate.
+> Finding 8 (documentation sprawl) - `REVIEW-INDEX.md` now classifies every document, and `README.md` points at it.
+> Finding 9 (three frozen pull requests) - #67, #72, and #73 are all closed, and there are no open pull requests.
+>
+> Still open: findings 3, 4, 6, 7, and 10.
+> The gate results and the security assessment are a 2026-07-28 snapshot at v0.3.140; re-run rather than cite them.
+> The methodology warning about `git cherry` being unreliable on this repository is durable and still worth reading before any branch cleanup.
+
 ## Headline
 
 Nothing is broken.
