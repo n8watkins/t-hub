@@ -738,6 +738,29 @@ test("enters and activates every panel tab by keyboard at full and icon widths",
 }, testInfo) => {
   await seedTiles(page, 1);
   await assertKeyboardFlow(page, 680);
+  const emptyContrast = await page.getByText("Nothing to preview yet", { exact: true }).evaluate((element) => {
+    const luminance = (color: string) => {
+      const rgb = color.match(/[\d.]+/g)!.slice(0, 3).map(Number).map((v) => {
+        const c = v / 255;
+        return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+      });
+      return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+    };
+    let parent: Element | null = element;
+    let background = "rgb(255, 255, 255)";
+    while (parent) {
+      const color = getComputedStyle(parent).backgroundColor;
+      if (color !== "rgba(0, 0, 0, 0)" && color !== "transparent") {
+        background = color;
+        break;
+      }
+      parent = parent.parentElement;
+    }
+    const fg = luminance(getComputedStyle(element).color);
+    const bg = luminance(background);
+    return (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+  });
+  expect(emptyContrast).toBeGreaterThanOrEqual(4.5);
   await screenshot(page, testInfo, "keyboard-full.png");
   await page.evaluate(() => {
     const stores = (window as BrowserHost).__BROWSER_STORES__;

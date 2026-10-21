@@ -347,7 +347,7 @@ export function WebPreview({
       {/* Body: the framed page, with overlays for the blocked/error cases. The
           iframe stays mounted under a blocked/error notice so a successful late
           load can still clear it; the notice just covers it until then. */}
-      <div className="relative min-h-0 flex-1" style={{ background: "#fff" }}>
+      <div className="relative min-h-0 flex-1" style={{ background: url && loadUrl ? "#fff" : "var(--th-tile-bg)" }}>
         {url && loadUrl ? (
           <iframe
             // Remount on each navigation so a refused load doesn't leave a stale
