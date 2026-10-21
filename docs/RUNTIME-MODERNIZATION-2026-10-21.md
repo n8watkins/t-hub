@@ -10,7 +10,7 @@ The assessment remains a historical account of the original baseline.
 | --- | --- | --- |
 | Unsafe account-wide quota recovery | Removed automatic terminal writes, rejected the legacy recovery source in the backend, and retained fresh session-specific manual reset alerts. | Any future automatic recovery must use explicit session/turn ownership and provider acknowledgement. |
 | Process presence reported as agent activity | Reconciled provider lifecycle with tmux evidence, surfaced permission/idle/exited/unavailable states, and retained last-known state separately. | Packaged Windows reconnect and crash scenarios. |
-| Terminal writes lack provider acknowledgement | Added an isolated, opt-in app-server pilot with durable request IDs, uncertain-delivery handling, explicit approval responses, and lifecycle replay. | Production integration and authenticated turn, quota, and approval UX acceptance. |
+| Terminal writes lack provider acknowledgement | Added an isolated, opt-in app-server pilot with durable request IDs, uncertain-delivery handling, explicit approval responses, and lifecycle replay. | Production integration plus live quota and approval UX acceptance; an authenticated isolated turn now passes. |
 | Missing execution provenance | Persisted provider-reported model IDs and model changes in durable agent observations/events; pilot records provider-confirmed thread settings and CLI version. | Legacy terminals may not report reasoning effort or CLI version; these remain explicitly unknown. |
 | Delegation policy lacks comparative evidence | Added a matched-trial protocol and scorer requiring all three modes, repeated attempts, usage, interventions, and hashed evidence. | Run representative model trials before changing Captain policy. |
 | Agent listing reconciles unbounded history | Reconcile only the requested active page, share process inventory, skip stopped history, and avoid unchanged-observation journal writes. | Continue measuring large real registries; registry snapshots still have costs. |
@@ -27,7 +27,9 @@ The provenance regression first returned no model despite provider telemetry and
 
 The full local suite passed after the recovery, runtime reconciliation, pagination, and CSP changes.
 It included Rust workspace and process tests, standalone CLI tests, typecheck, lint, 637 frontend tests, production bundling, nine Chromium tests, and portable contracts.
-Frontend lint reported 28 existing warnings and no errors.
+Frontend lint initially reported 28 existing warnings and no errors.
+A subsequent shared-helper extraction resolved all 28 warnings without suppressions, and the standard lint command now rejects any warnings.
+The extraction passed typecheck, all 637 frontend tests, production bundling, nine Chromium tests, and the lint/CI contracts.
 Additional provenance changes passed the focused real-tmux regression, typecheck, all 637 frontend tests, and the subsequent Rust gate.
 That gate included 412 control tests and 30 tmux tests.
 Clippy passed for the workspace and all targets with warnings treated as errors.
@@ -38,7 +40,18 @@ The evaluation scorer passes four tests covering incomplete comparisons, configu
 
 Handshake and model discovery passed against installed Codex 0.163.0 and baseline Codex 0.145.0 without starting a model turn.
 The older provider reported an incompatible existing model cache and successfully fell back to its catalog; the runtime did not assume the newer catalog.
-These checks do not establish authenticated model-turn behavior or comparative model quality.
+A subsequent opt-in authenticated smoke test completed a real turn using Codex 0.163.0 with provider-confirmed `gpt-6.1-sol` and medium reasoning effort.
+The final run completed in 3.215 seconds with 29 recorded events, matched the thread and turn identifiers, returned the exact requested marker, and replayed the acknowledged request without submitting it again.
+The harness rejects tool use and approval requests and verifies that the disposable workspace remains unchanged.
+Its three fixture tests also pass, bringing the runtime test total to nine.
+This establishes a narrow authenticated completion path, not comparative model quality or production readiness.
+
+A Chromium accessibility check reproduced unreadable empty-preview text at a contrast ratio of 1.26:1.
+The empty preview now uses the tile background, and the regression verifies at least 4.5:1 contrast.
+The corrected screenshot was reviewed visually.
+
+Packaged Windows acceptance is in progress using an isolated source copy and dedicated runtime state.
+Do not count a successful native build or installer extraction as completed runtime acceptance.
 
 ## Next acceptance gates
 
