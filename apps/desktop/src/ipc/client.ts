@@ -53,10 +53,11 @@ export function writeTerminal(id: TerminalId, data: string): Promise<void> {
 
 /** comms-plane Phase 1: deliver AUTOMATION input through the plane's primary path.
  *  `source` names the internal automation writer (the backend refuses an unknown
- *  source). Auto-continue and the rules engine call this instead of
+ *  source). The rules engine calls this instead of
  *  {@link writeTerminal}; the bytes are written immediately (no durability yet -
  *  that is Phase 2), but now funnelled + attributed. */
-export type PlaneWriteSource = "fleet-wake" | "auto-continue" | "rules-engine";
+// Legacy auto-continue requests are rejected by the backend.
+export type PlaneWriteSource = "fleet-wake" | "rules-engine";
 export function deliverAgentInput(
   id: TerminalId,
   data: string,

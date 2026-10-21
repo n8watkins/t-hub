@@ -69,9 +69,8 @@ const DEFAULTS = {
    *  quieter without them; a header toggle reveals them. Read by FileTree.tsx
    *  and FilePanel.tsx, which filter entries at render at every level. */
   hideDotfiles: true,
-  /** The command auto-continue injects when an opted-in terminal's Claude session
-   *  hits its usage limit and the window resets (see lib/autoContinueMount). The
-   *  text is typed + Enter; default "continue". */
+  /** Legacy persisted setting retained for compatibility. Usage reset alerts
+   *  never inject this text or any other terminal input. */
   autoContinueText: "continue",
 } as const;
 
@@ -248,8 +247,7 @@ interface SettingsState {
   hideDotfiles: boolean;
   setHideDotfiles: (v: boolean) => void;
 
-  /** Command auto-continue types when an opted-in session resets (default
-   *  "continue"). See store/autoContinue + lib/autoContinueMount. */
+  /** Legacy persisted text, unused by the manual usage-reset alert watcher. */
   autoContinueText: string;
   setAutoContinueText: (v: string) => void;
 

@@ -37,10 +37,10 @@ function save(optedOut: Record<TerminalId, true>): void {
 }
 
 interface AutoContinueState {
-  /** terminalId -> true when the user OPTED THIS TILE OUT of auto-continue. A
+  /** terminalId -> true when the user OPTED THIS TILE OUT of usage reset alerts. A
    *  tile absent from this map is WATCHED (the default). */
   optedOut: Record<TerminalId, true>;
-  /** Whether auto-continue is active for a tile: watched unless opted out. */
+  /** Whether usage reset alerts are active for a tile: watched unless opted out. */
   isWatched: (id: TerminalId) => boolean;
   /** Flip a tile between watched (default) and opted-out. */
   toggle: (id: TerminalId) => void;
