@@ -258,10 +258,13 @@ async def serve(args):
         relay_task = asyncio.create_task(relay())
         # Thread input leaves the provider event reader active while waiting.
         while line := await asyncio.to_thread(sys.stdin.readline, MAX_FRAME + 1):
+            # A partial oversized line must never be reinterpreted as several
+            # requests. Close this connection rather than parsing its tail.
+            if len(line.encode()) > MAX_FRAME:
+                emit({"requestId": None, "error": "input exceeds frame limit"})
+                break
             request = {}
             try:
-                if len(line.encode()) > MAX_FRAME:
-                    raise RuntimeError("input exceeds frame limit")
                 request = json.loads(line)
                 if not isinstance(request, dict):
                     raise RuntimeError("input must be a JSON object")

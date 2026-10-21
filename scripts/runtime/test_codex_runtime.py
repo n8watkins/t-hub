@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 
-from codex_runtime import CodexRuntime, RuntimeError
+from codex_runtime import CodexRuntime, RuntimeError, MAX_FRAME
 
 FAKE = r'''
 import json, sys
@@ -101,6 +101,21 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.counter.read_text(), "0")
         result = await self.runtime.request("steer", "turn/steer", {"threadId":"thread-1","expectedTurnId":"turn-1","input":[]})
         self.assertEqual(result, {"turnId":"turn-1"})
+
+    async def test_cli_rejects_oversized_frame_without_executing_its_tail(self):
+        executable = self.root / "codex-fixture"
+        executable.write_text("#!" + sys.executable + "\nimport sys\n"
+            + "if '--version' in sys.argv:\n print('fixture 1'); sys.exit(0)\n"
+            + FAKE.replace("Path(sys.argv[1])", "Path(" + repr(str(self.counter)) + ")"))
+        executable.chmod(0o700)
+        process = await asyncio.create_subprocess_exec(sys.executable,
+            str(Path(__file__).with_name("codex_runtime.py")), "--experimental",
+            "--state-dir", str(self.root / "cli-state"), "--codex", str(executable),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        tail = json.dumps({"requestId":"tail", "method":"thread/start", "params":{}})
+        output, _ = await asyncio.wait_for(process.communicate(("x" * (MAX_FRAME + 1) + tail + "\n").encode()), 10)
+        self.assertIn(b"frame limit", output)
+        self.assertEqual(self.counter.read_text(), "0", "an oversized frame must not turn its tail into a new request")
 
     async def test_exclusive_state_and_metadata_cursor(self):
         with self.assertRaisesRegex(RuntimeError, "another runtime"):
