@@ -28,8 +28,8 @@
 // into tabs (Colors / Layout / Typography / Terminal) so the user focuses on
 // one panel at a time instead of one long scroll. Each control is bound
 // straight to a store's setters, so editing is live.
-import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { useEffect, useState } from "react";
 // Shared settings-row primitives (extracted so section components can live in
 // their own files - see settingRows.tsx; VoiceSection uses them too).
 import {
@@ -51,17 +51,17 @@ import { ThemeSection } from "./theme-editor/ThemeSection";
 // check() resolves the signed update package (same call the on-launch mount and
 // the manual Install button use); relaunch() restarts the app after install;
 // detectUpdate() is the tolerant availability probe over latest.json.
-import { check as checkUpdaterPackage } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { check as checkUpdaterPackage } from "@tauri-apps/plugin-updater";
+import { FILE_ICON_THEMES } from "../lib/fileIcons.helpers";
 import { detectUpdate, RELEASES_URL, type UpdateCheckResult } from "../lib/updates";
 import {
-  useSettings,
-  TITLEBAR_HIDE_DELAY_MIN,
   TITLEBAR_HIDE_DELAY_MAX,
-  TITLEBAR_REVEAL_ANIM_MIN,
+  TITLEBAR_HIDE_DELAY_MIN,
   TITLEBAR_REVEAL_ANIM_MAX,
+  TITLEBAR_REVEAL_ANIM_MIN,
+  useSettings,
 } from "../store/settings";
-import { FILE_ICON_THEMES } from "../lib/fileIcons";
 // Build-time app version/name from package.json (resolveJsonModule is on). Used
 // as the fallback / "build" version; the live Tauri runtime version is fetched
 // at runtime via getVersion() in the About group.
@@ -69,30 +69,31 @@ import pkg from "../../package.json";
 // Recovery review (#recovery): a self-contained modal opened from a button in the
 // General section. It renders its own scrim/panel above this one (z-[60] > z-50).
 import { RecoveryReview } from "./RecoveryReview";
-import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
+import { StatusIndicator } from "./StatusIndicator";
+import { type StatusVariant } from "./StatusIndicator.helpers";
 // Claude hooks install/uninstall now lives in Settings (moved out of the sidebar).
-import { HookInstallPanel } from "./HookInstallPanel";
-import { CodexHookInstallPanel } from "./CodexHookInstallPanel";
 import { claudeHooksInstalled } from "../ipc/client05";
+import { CodexHookInstallPanel } from "./CodexHookInstallPanel";
+import { HookInstallPanel } from "./HookInstallPanel";
 // Hybrid keymap (WS-3): the interactive Keyboard section shows every command's
 // live direct/prefixed binding, opens the palette to rebind, and resets defaults.
-import { useKeybindings } from "../store/keybindings";
-import { COMMANDS } from "../lib/commands";
 import { useAppName } from "../lib/appName";
 import { formatChord } from "../lib/chord";
-import { openKeyboardPalette } from "./CommandPalette";
+import { COMMANDS } from "../lib/commands";
+import { useKeybindings } from "../store/keybindings";
+import { openKeyboardPalette } from "./CommandPalette.helpers";
 // Rules (WS-5b): the event→action engine's config surface. The list + CRUD live
 // in store/rules; lib/rulesMount does the firing.
-import {
-  useRules,
-  TRIGGER_STATUSES,
-  ACTION_KINDS,
-  statusLabel,
-  actionKindLabel,
-  type Rule,
-  type ActionKind,
-} from "../store/rules";
 import type { SessionStatus } from "../ipc/model";
+import {
+  ACTION_KINDS,
+  actionKindLabel,
+  statusLabel,
+  TRIGGER_STATUSES,
+  useRules,
+  type ActionKind,
+  type Rule,
+} from "../store/rules";
 // ---------------------------------------------------------------------------
 // The panel (only mounted while open).
 // ---------------------------------------------------------------------------

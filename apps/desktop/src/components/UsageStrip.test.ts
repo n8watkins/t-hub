@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CodexUsage } from "../ipc/codex";
-import {
-  advanceCodexUsage,
-  isUsableCodexUsage,
-  loadCachedCodexUsage,
-  mergeCodexUsage,
-} from "./UsageStrip";
+import { advanceCodexUsage, isUsableCodexUsage, loadCachedCodexUsage, mergeCodexUsage } from "./UsageStrip.helpers";
 
 const complete: CodexUsage = {
   primary: { usedPercent: 50, windowMinutes: 300, resetsAt: 2_000 },

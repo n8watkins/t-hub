@@ -17,29 +17,30 @@
 //     working on right from here.
 //
 // Reads the workspace store directly (no props), so App needs no extra wiring.
-import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import {
-  useWorkspace,
-  deriveLabel,
-  CAPTAINS_TAB_ID,
-} from "../store/workspace";
-import type { WorkspaceTab } from "../store/workspace";
-import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
-import { useSupervision, sessionStatusForTmux } from "../store/supervision";
+import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
+import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { resolveDropTarget } from "../lib/dropTarget";
+import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
+import { popOutTab } from "../lib/windows";
 import { useActivity } from "../store/activity";
-import { sessionNameForTerminal } from "../store/sessionContext";
 import { useClientForTerminal } from "../store/clientType";
+import { sessionNameForTerminal } from "../store/sessionContext";
+import { sessionStatusForTmux, useSupervision } from "../store/supervision";
+import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
+import type { WorkspaceTab } from "../store/workspace";
+import {
+  CAPTAINS_TAB_ID,
+  deriveLabel,
+  useWorkspace,
+} from "../store/workspace";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
-import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
-import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
-import { resolveDropTarget } from "../lib/dropTarget";
-import { createDragGhost, type DragGhost } from "../lib/dragGhost";
-import { popOutTab } from "../lib/windows";
 import { ChevronIcon, CountBadge } from "./SidebarChrome";
-import { StatusIndicator, terminalVariant } from "./StatusIndicator";
+import { StatusIndicator } from "./StatusIndicator";
+import { terminalVariant } from "./StatusIndicator.helpers";
 
 /** "Open in new window" arrow — pop a workspace out into its own window (item 4,
  *  re-homed from the removed top tab strip). */

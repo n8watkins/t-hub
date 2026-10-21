@@ -1,3 +1,4 @@
+import { PoolContext, PoolRegistry, poolSync } from "./TerminalPool.helpers";
 // Persistent terminal pool (#20 — seamless moves).
 //
 // Problem: T-Hub keeps every tab mounted, but a terminal's xterm instance is
@@ -21,32 +22,30 @@
 // xterm stays warm briefly for fast tab switching, then goes cold and disposes
 // its renderer and PTY attachment while this stable wrapper remains mounted.
 import {
-  createContext,
   useCallback,
-  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
-  useState,
+  useState
 } from "react";
-import { useWorkspace } from "../store/workspace";
-import { usePanels } from "../store/panels";
+import type { TerminalId } from "../ipc/types";
 import { useCaptain } from "../store/captain";
+import { usePanels } from "../store/panels";
+import { useWorkspace } from "../store/workspace";
+import { CaptainOverlay } from "./CaptainOverlay";
 import { TerminalView } from "./Terminal";
 import { TileErrorBoundary } from "./TileErrorBoundary";
-import { CaptainOverlay } from "./CaptainOverlay";
-import type { TerminalId } from "../ipc/types";
 // Diagnostics: tlog mirrors every pool show/park decision into a file the
 // orchestrator can read from a RELEASE build (no devtools). Importing this here
 // also self-installs the console/window diag hooks once at app startup (the pool
 // mounts with the canvas) — see src/lib/diag.ts.
 import { diagEnabled, tlog } from "../lib/diag";
+import { TerminalLifecycleController } from "../lib/terminalLifecycle";
 import {
   removeTerminalResources,
   updateTerminalResources,
 } from "../lib/terminalResources";
-import { TerminalLifecycleController } from "../lib/terminalLifecycle";
 
 // Upper bound on the chained deferred re-syncs the pool will schedule while an
 // active-tab terminal's placeholder rect is still degenerate. A transient
@@ -64,63 +63,6 @@ const MAX_DEFERRED_RETRIES = 10;
 // terminals whose placeholders never lay out at all) still stops spinning a
 // re-sync every frame forever, rather than relying solely on firstPaintSettled.
 const MAX_FIRST_PAINT_RETRIES = 60;
-
-// ---------------------------------------------------------------------------
-// Placeholder registry (context). Each Tile registers the empty body box it
-// renders, keyed by terminal id; the pool reads the registry to know where to
-// position each pooled terminal. A monotonic `version` bumps whenever the set of
-// placeholders changes (mount/unmount) so the pool re-syncs immediately.
-// ---------------------------------------------------------------------------
-
-interface PoolRegistry {
-  /** Register (or replace) the body placeholder element for a terminal id. */
-  register: (id: TerminalId, el: HTMLElement) => void;
-  /** Remove a terminal id's placeholder (on tile unmount). */
-  unregister: (id: TerminalId, el: HTMLElement) => void;
-  /** Ask the pool to re-measure now (e.g. after a layout-affecting change). */
-  requestSync: () => void;
-}
-
-const PoolContext = createContext<PoolRegistry | null>(null);
-
-/**
- * Register this element as terminal `id`'s body placeholder for the lifetime of
- * the calling component. The pool positions `id`'s pooled terminal over it.
- * No-op outside a <TerminalPoolProvider> (so Tile still works standalone).
- */
-// ---------------------------------------------------------------------------
-// External imperative re-sync (captain-overlay). The overlay's drag/resize
-// gestures move its slot placeholder WITHOUT any store/layout change the pool
-// would notice (ResizeObserver only fires on SIZE changes, and we deliberately
-// avoid a React version-bump per pointermove). This module-level hook lets the
-// gesture call straight into the live layer's imperative sync(), which measures
-// and repositions without a render. Null outside a mounted pool layer.
-// ---------------------------------------------------------------------------
-
-let externalSync: ((trigger: string) => void) | null = null;
-
-/** Imperatively re-measure + reposition every pooled terminal now. No-op when
- *  no pool layer is mounted. Safe to call at pointer-move rate (the caller
- *  should still rAF-coalesce). */
-export function requestPoolSync(trigger: string): void {
-  externalSync?.(trigger);
-}
-
-export function useTerminalSlot(id: TerminalId) {
-  const reg = useContext(PoolContext);
-  const ref = useRef<HTMLDivElement | null>(null);
-  const setRef = useCallback(
-    (el: HTMLDivElement | null) => {
-      const prev = ref.current;
-      if (prev === el) return;
-      if (prev && reg) reg.unregister(id, prev);
-      ref.current = el;
-      if (el && reg) reg.register(id, el);
-    },
-    [id, reg],
-  );
-  return setRef;
-}
 
 // ---------------------------------------------------------------------------
 // Provider + pool layer.
@@ -700,21 +642,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         }
       }
     },
-    // panelTab + fullscreenId are dependencies even though sync reads the LIVE
-    // store via getState(): including them regenerates `sync` when a tile's tab
-    // or the fullscreen target changes, which cascades to the position layout-
-    // effect (it depends on `sync`) so visibility re-syncs immediately on a
-    // tab/fullscreen toggle. tabOfId/activeTabId stay for the workspace-tab gate.
+    // Visibility changes explicitly trigger the layout effect below; this
+    // callback reads current store state when it runs.
     [
       containerRef,
       slotsRef,
       tabOfId,
       activeTabId,
-      panelTab,
-      panelExpanded,
-      fullscreenId,
-      captainOpen,
-      captainId,
       applyVisible,
       scheduleDeferredSync,
     ],
@@ -730,9 +664,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // via the store), AND the per-tile panel state (a tile's panel tab or the
   // fullscreen target — both gate `shouldShow`). useLayoutEffect lands the
   // position/visibility before paint so a tab switch / move / panel-tab switch /
-  // fullscreen toggle shows no transient mis-place or flash. (`sync` already
-  // depends on panelTab/fullscreenId so it changes identity on those, but we
-  // also list them here so the intent is explicit and robust.)
+  // fullscreen toggle shows no transient mis-place or flash. Visibility state
+  // belongs in this effect's dependencies even though sync reads it live.
   //
   // A same-tab REORDER (moveTile) produces a new `tabs` reference (it drops
   // manual sizes), so this fires and re-measures -- confirming the reorder path
@@ -762,9 +695,9 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // Publish the imperative sync for external callers (the captain overlay's
   // drag/resize gestures) for this layer's lifetime. See requestPoolSync.
   useEffect(() => {
-    externalSync = (trigger) => syncRef.current(trigger);
+    poolSync.current = (trigger) => syncRef.current(trigger);
     return () => {
-      externalSync = null;
+      poolSync.current = null;
     };
   }, []);
 

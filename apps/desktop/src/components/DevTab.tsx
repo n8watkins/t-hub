@@ -1,3 +1,4 @@
+import { DevState, listeners, states, unlisteners } from "./DevTab.helpers";
 // Managed-runner portion of the per-project Preview surface.
 //
 // The backend discovers and validates typed package-script or static-site
@@ -5,7 +6,6 @@
 // owns lifecycle state. This component never accepts or sends shell text.
 
 import { useEffect, useRef, useState } from "react";
-import { usePanels } from "../store/panels";
 import {
   devServerSnapshot,
   discoverRunTargets,
@@ -16,11 +16,11 @@ import {
   type DevServerEvent,
   type DevServerSnapshot,
   type RunTarget,
-  type RunTargetDiscovery,
-  type RunnerState,
+  type RunnerState
 } from "../ipc/devserver";
 import type { TerminalId } from "../ipc/types";
 import { stripAnsi } from "../lib/ansi";
+import { usePanels } from "../store/panels";
 
 export interface DevTabProps {
   terminalId: TerminalId;
@@ -45,19 +45,6 @@ function detectUrl(line: string): string | null {
     /https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/[^\s)]*)?/i,
   );
   return match ? match[0] : null;
-}
-
-type DiscoveryState = "loading" | RunTargetDiscovery["state"];
-
-interface DevState {
-  snapshot: DevServerSnapshot;
-  lines: string[];
-  url: string | null;
-  targets: RunTarget[];
-  discoveryState: DiscoveryState;
-  discoveryMessage: string | null;
-  selectedTargetId: string | null;
-  subscribed: boolean;
 }
 
 function idleSnapshot(terminalId: TerminalId): DevServerSnapshot {
@@ -88,10 +75,6 @@ function freshState(terminalId: TerminalId): DevState {
     subscribed: false,
   };
 }
-
-const states = new Map<TerminalId, DevState>();
-const listeners = new Map<TerminalId, Set<() => void>>();
-const unlisteners = new Map<TerminalId, () => void>();
 
 function getState(id: TerminalId): DevState {
   let state = states.get(id);
@@ -128,20 +111,6 @@ function subscribe(id: TerminalId, callback: () => void): () => void {
   }
   subscribers.add(callback);
   return () => subscribers?.delete(callback);
-}
-
-export function forgetDevState(id: TerminalId): void {
-  const unlisten = unlisteners.get(id);
-  if (unlisten) {
-    try {
-      unlisten();
-    } catch {
-      // The runtime may already have removed the listener.
-    }
-  }
-  unlisteners.delete(id);
-  states.delete(id);
-  listeners.delete(id);
 }
 
 function chooseTarget(

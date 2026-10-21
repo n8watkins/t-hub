@@ -13,9 +13,8 @@
 //
 // Severity policy:
 //   error - real defects, and mechanical cleanups with no judgement involved.
-//   warn  - a real signal with an existing backlog. Warnings do NOT fail CI
-//           (the lint step deliberately does not pass `--max-warnings 0`), so
-//           the backlog can be burned down without gating unrelated PRs.
+//   warn  - advisory severity in editors; the lint command still rejects
+//           warnings with --max-warnings 0 now that the backlog is cleared.
 
 import js from "@eslint/js";
 import globals from "globals";

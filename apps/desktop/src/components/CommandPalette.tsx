@@ -1,3 +1,4 @@
+import { usePalette } from "./CommandPalette.helpers";
 // The fuzzy command palette + prefix HUD (WS-3). Mounted once at the app root.
 //
 // PALETTE (opened by the `commandPalette` command, default Ctrl+K):
@@ -12,33 +13,14 @@
 // armed (driven by usePrefixHud), so the user sees "Ctrl/Cmd+B …" and knows the
 // next key is being captured.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { create } from "zustand";
-import { COMMANDS, type CommandId } from "../lib/commands";
-import { useKeybindings } from "../store/keybindings";
-import { useCaptain } from "../store/captain";
-import { useWorkspace } from "../store/workspace";
-import { stableCaptainIdentity } from "./CaptainOverlay";
-import { runCommand, registerPaletteOpener } from "../lib/keymapExecutor";
 import { chordFromEvent, formatChord } from "../lib/chord";
+import { COMMANDS, type CommandId } from "../lib/commands";
+import { registerPaletteOpener, runCommand } from "../lib/keymapExecutor";
 import { usePrefixHud } from "../lib/prefixKeyHandler";
-
-// --- Open-state store -------------------------------------------------------
-// A tiny store so the executor (registerPaletteOpener) and any UI can open the
-// palette without threading props through the tree.
-interface PaletteState {
-  open: boolean;
-  setOpen: (v: boolean) => void;
-}
-const usePalette = create<PaletteState>((set) => ({
-  open: false,
-  setOpen: (v) => set({ open: v }),
-}));
-
-/** Open the palette imperatively. Used by the Settings "Keyboard" section's
- *  rebind affordance (the palette is where rebinding lives). */
-export function openKeyboardPalette(): void {
-  usePalette.getState().setOpen(true);
-}
+import { useCaptain } from "../store/captain";
+import { useKeybindings } from "../store/keybindings";
+import { useWorkspace } from "../store/workspace";
+import { stableCaptainIdentity } from "./CaptainOverlay.helpers";
 
 // --- Fuzzy matching ---------------------------------------------------------
 /** Case-insensitive subsequence test with a light score: lower is better

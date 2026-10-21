@@ -5,23 +5,8 @@
 // the app-wide settingRows.tsx primitives because they're bound to the theme
 // store's ChromeTokens shape, not plain callbacks.
 import React from "react";
-import { Switch } from "../settingRows";
 import type { ChromeTokens } from "../../store/theme";
-
-export const FONT_OPTIONS: { label: string; value: string }[] = [
-  {
-    label: "System Sans",
-    value:
-      'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
-  },
-  {
-    label: "Monospace",
-    value:
-      'ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace',
-  },
-  { label: "Georgia (serif)", value: 'Georgia, Cambria, "Times New Roman", serif' },
-  { label: "Inter", value: 'Inter, ui-sans-serif, system-ui, sans-serif' },
-];
+import { Switch } from "../settingRows";
 
 /** A color control wired to a chrome token by key. */
 export function ColorRow({

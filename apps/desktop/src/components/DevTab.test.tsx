@@ -1,12 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { usePanels } from "../store/panels";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  DevServerEvent,
-  DevServerSnapshot,
-  RunTargetDiscovery,
+DevServerEvent,
+DevServerSnapshot,
+RunTargetDiscovery,
 } from "../ipc/devserver";
-import { DevTab, forgetDevState } from "./DevTab";
+import { usePanels } from "../store/panels";
+import { DevTab } from "./DevTab";
+import { forgetDevState } from "./DevTab.helpers";
 
 const mocks = vi.hoisted(() => ({
   discoverRunTargets: vi.fn(),

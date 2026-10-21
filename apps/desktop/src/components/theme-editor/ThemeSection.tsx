@@ -8,17 +8,12 @@
 // are grouped into tabs so the user works through one focused panel at a time
 // instead of one long scroll. Every control stays bound straight to `useTheme`.
 import { useState } from "react";
-import { Btn, Group, Opt, Row, ThemeSelect } from "../settingRows";
 import { useTheme, type AnsiPalette } from "../../store/theme";
+import { Btn, Group, Opt, Row, ThemeSelect } from "../settingRows";
 import { PresetGroup } from "./PresetGroup";
-import {
-  ColorRow,
-  ColorInputRow,
-  SliderRow,
-  ToggleRow,
-  FONT_OPTIONS,
-} from "./themeRows";
 import { Chevron } from "./themeIcons";
+import { ColorInputRow, ColorRow, SliderRow, ToggleRow } from "./themeRows";
+import { FONT_OPTIONS } from "./themeRows.helpers";
 
 type ThemeTabId = "colors" | "layout" | "typography" | "terminal";
 

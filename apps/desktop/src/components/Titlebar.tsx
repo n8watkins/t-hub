@@ -14,25 +14,22 @@
 // the titlebar regardless of the sidebar's collapse state, so they're never
 // unreachable. They use the Tauri window API / settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
-import { useEffect, useRef } from "react";
-import type { RefObject } from "react";
-import { createPortal } from "react-dom";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { exit } from "@tauri-apps/plugin-process";
 import { Anchor } from "lucide-react";
-import { useWorkspace } from "../store/workspace";
-import { useSettings } from "../store/settings";
-import { useCaptain } from "../store/captain";
-import {
-  CaptainStatusDot,
-  useCaptainDisplayLabel,
-  useWorkspaceNameForTerminal,
-} from "./CaptainOverlay";
+import type { RefObject } from "react";
+import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import brandIcon from "../assets/brand.png";
+import { useAppName, useAppVersion } from "../lib/appName";
 import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
-import { useAppName, useAppVersion } from "../lib/appName";
-import brandIcon from "../assets/brand.png";
+import { useCaptain } from "../store/captain";
+import { useSettings } from "../store/settings";
+import { useWorkspace } from "../store/workspace";
+import { CaptainStatusDot } from "./CaptainOverlay";
+import { useCaptainDisplayLabel, useWorkspaceNameForTerminal } from "./CaptainOverlay.helpers";
 
 /** Minimize the window, swallowing any IPC rejection. */
 function minimize(): void {

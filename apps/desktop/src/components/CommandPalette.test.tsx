@@ -1,8 +1,8 @@
 // The command palette's "Summon captain" entries must use the STABLE identity
 // (user rename -> cwd basename -> workspace tab name), never the volatile Claude
 // session title - this was the one surface the deck's identity fix missed.
-import { describe, it, expect, beforeEach, vi } from "vitest";
 import { act, fireEvent, render } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // CommandPalette -> CaptainOverlay (stableCaptainIdentity) -> TerminalPool ->
 // xterm; stub the pool so xterm's canvas math stays out of jsdom.
@@ -11,10 +11,11 @@ vi.mock("./TerminalPool", () => ({
   requestPoolSync: () => {},
 }));
 
-import { CommandPalette, openKeyboardPalette } from "./CommandPalette";
+import type { TerminalInfo } from "../ipc/types";
 import { useCaptain } from "../store/captain";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
-import type { TerminalInfo } from "../ipc/types";
+import { CommandPalette } from "./CommandPalette";
+import { openKeyboardPalette } from "./CommandPalette.helpers";
 
 function term(id: string, cwd = "/tmp"): TerminalInfo {
   return { id, tmuxSession: `th_${id}`, cwd, title: id, state: "live" };

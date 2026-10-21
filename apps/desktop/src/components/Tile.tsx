@@ -24,47 +24,6 @@
 // point resolves to the owning tile (data-tile-id) rather than the canvas. The
 // drag never touches the backend — only the visual order changes; the tmux
 // session and any agent stay attached and alive.
-import { useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
-import type { TerminalId, TerminalState } from "../ipc/types";
-import { useWorkspace, deriveLabel, tabIdForTerminal } from "../store/workspace";
-import { useTheme } from "../store/theme";
-import {
-  usePanels,
-  type PanelTab,
-  DEFAULT_SPLIT_RATIO,
-  clampSplitRatio,
-} from "../store/panels";
-import { useTerminalSlot } from "./TerminalPool";
-import { TilePanel } from "./TilePanel";
-import { ClaudeIcon } from "./ClaudeIcon";
-import { CodexIcon } from "./CodexIcon";
-import {
-  useAuthoritativeIdentityForTerminal,
-  useClientForTerminal,
-} from "../store/clientType";
-import { useAutoContinue } from "../store/autoContinue";
-import { useSettings } from "../store/settings";
-import { ContextMeter } from "./ContextMeter";
-import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
-import {
-  useSupervision,
-  tmuxSessionMidTurn,
-  sessionStatusForTmux,
-} from "../store/supervision";
-import { useActivity } from "../store/activity";
-import { StatusIndicator, terminalVariant } from "./StatusIndicator";
-import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
-import { resolveDropTarget } from "../lib/dropTarget";
-import { createDragGhost, type DragGhost } from "../lib/dragGhost";
-import { refreshTerminal } from "../lib/repaint";
-import { useCaptain } from "../store/captain";
-import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
-import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { gitInfo, type GitInfo } from "../ipc/git";
-import { runWhenIdle } from "../lib/windowInteraction";
-import { clipboardWrite } from "../lib/clipboard";
 import {
   Anchor,
   Copy,
@@ -74,6 +33,48 @@ import {
   RotateCcw,
   SquareTerminal,
 } from "lucide-react";
+import type { PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState } from "react";
+import { gitInfo, type GitInfo } from "../ipc/git";
+import type { TerminalId, TerminalState } from "../ipc/types";
+import { clipboardWrite } from "../lib/clipboard";
+import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { resolveDropTarget } from "../lib/dropTarget";
+import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
+import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
+import { refreshTerminal } from "../lib/repaint";
+import { runWhenIdle } from "../lib/windowInteraction";
+import { useActivity } from "../store/activity";
+import { useAutoContinue } from "../store/autoContinue";
+import { useCaptain } from "../store/captain";
+import {
+  useAuthoritativeIdentityForTerminal,
+  useClientForTerminal,
+} from "../store/clientType";
+import {
+  DEFAULT_SPLIT_RATIO,
+  clampSplitRatio,
+  usePanels,
+  type PanelTab,
+} from "../store/panels";
+import { sessionNameForTerminal, useContextPctForTile } from "../store/sessionContext";
+import { useSettings } from "../store/settings";
+import {
+  sessionStatusForTmux,
+  tmuxSessionMidTurn,
+  useSupervision,
+} from "../store/supervision";
+import { useTheme } from "../store/theme";
+import { deriveLabel, tabIdForTerminal, useWorkspace } from "../store/workspace";
+import { ClaudeIcon } from "./ClaudeIcon";
+import { CodexIcon } from "./CodexIcon";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { ContextMeter } from "./ContextMeter";
+import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
+import { StatusIndicator } from "./StatusIndicator";
+import { terminalVariant } from "./StatusIndicator.helpers";
+import { useTerminalSlot } from "./TerminalPool.helpers";
+import { TilePanel } from "./TilePanel";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
  *  on mount and whenever the window regains focus (cheap; the backend best-efforts

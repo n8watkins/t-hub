@@ -4,12 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { listDir } from "../ipc/files";
 import { gitInfo, gitWorktreeList } from "../ipc/git";
 import { normalizeWslPath, pickWslFolder } from "../ipc/wslFolderDialog";
-import {
-  normalizePosixPath,
-  parentPath,
-  pathBreadcrumbs,
-  WslFolderPicker,
-} from "./WslFolderPicker";
+import { WslFolderPicker } from "./WslFolderPicker";
+import { normalizePosixPath, parentPath, pathBreadcrumbs } from "./WslFolderPicker.helpers";
 
 vi.mock("../ipc/files", () => ({ listDir: vi.fn() }));
 vi.mock("../ipc/git", () => ({ gitInfo: vi.fn(), gitWorktreeList: vi.fn() }));

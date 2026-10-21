@@ -29,33 +29,30 @@
 // on a prompt bubbles amber onto its captain. Expanding a captain lists its
 // crewmates (each with its own status dot) above the captain's own subagent
 // tree.
-import { useEffect, useState } from "react";
 import { Pencil } from "lucide-react";
-import { useCaptain } from "../store/captain";
-import { useWorkspace } from "../store/workspace";
-import {
-  useSupervision,
-  sessionStatusForTmux,
-  isRateLimited,
-} from "../store/supervision";
-import { sessionNameForTerminal } from "../store/sessionContext";
-import {
-  CaptainStatusDot,
-  useWorkspaceNameForTerminal,
-  stableCaptainIdentity,
-} from "./CaptainOverlay";
+import { useEffect, useState } from "react";
 import { useCrewSummary } from "../hooks/useCrewSummary";
-import { SupervisionTreeView } from "./SupervisionTree";
-import { ContextMeter } from "./ContextMeter";
-import { ChevronIcon } from "./SidebarChrome";
-import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
-import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
-import { StartAgentDialog } from "./StartAgentDialog";
 import {
   DELIVERY_STATE_LABELS,
   getAgent,
   type DeliveryStates,
 } from "../ipc/agents";
+import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
+import { useCaptain } from "../store/captain";
+import { sessionNameForTerminal } from "../store/sessionContext";
+import {
+  isRateLimited,
+  sessionStatusForTmux,
+  useSupervision,
+} from "../store/supervision";
+import { useWorkspace } from "../store/workspace";
+import { CaptainStatusDot } from "./CaptainOverlay";
+import { stableCaptainIdentity, useWorkspaceNameForTerminal } from "./CaptainOverlay.helpers";
+import { ContextMeter } from "./ContextMeter";
+import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
+import { ChevronIcon } from "./SidebarChrome";
+import { StartAgentDialog } from "./StartAgentDialog";
+import { SupervisionTreeView } from "./SupervisionTree";
 
 /** Navigate to the reserved Captains workspace tab and focus an agent's live
  *  terminal tile - the sidebar-row click behavior now that agents live as

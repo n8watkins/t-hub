@@ -14,13 +14,8 @@ if grep -Fq "frontend-product" <<<"$fast_plan"; then
   echo "fast plan must not run browser tests" >&2
   exit 1
 fi
-# The lint lane reports warnings without gating on them. Pinning `--max-warnings`
-# to 0 would turn the react-hooks/exhaustive-deps backlog into a merge blocker,
-# so the contract asserts the flag stays absent until that backlog is cleared.
-if grep -Fq -- "--max-warnings" <<<"$fast_plan"; then
-  echo "lint lane must not gate on warnings yet" >&2
-  exit 1
-fi
+# The warning backlog is cleared; every lint lane must now reject warnings.
+grep -Fq '"lint": "eslint . --max-warnings 0"' "$ROOT/apps/desktop/package.json"
 
 standard_plan="$(bash "$SCRIPT" standard --plan)"
 grep -Fq "workspace_gate.sh standard" <<<"$standard_plan"

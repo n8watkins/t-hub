@@ -1,6 +1,7 @@
 import { ChevronRight, Folder, FolderOpen, Home, MoveUp } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
+import { parentPath, pathBreadcrumbs } from "./WslFolderPicker.helpers";
 
 import { listDir } from "../ipc/files";
 import { gitInfo, gitWorktreeList, type GitInfo, type WorktreeInfo } from "../ipc/git";
@@ -67,12 +68,15 @@ export function WslFolderPicker({
     if (!path) return;
     const generation = ++requestGeneration.current;
     let cancelled = false;
-    const priorKind = listing.kind === "loaded-empty"
+    // The request's selection snapshot carries the previous listing state.
+    // Reading it avoids making listing completion restart its own effect.
+    const prior = selectionRef.current;
+    const priorKind = prior?.listingStatus === "valid-empty"
       ? "empty"
-      : listing.kind === "loaded-populated"
+      : prior?.listingStatus === "valid-populated"
         ? "populated"
-        : listing.kind === "stale"
-          ? listing.prior
+        : prior?.listingStatus === "stale"
+          ? prior.listingPrior
           : null;
     const nextListing = priorKind
       ? { kind: "stale" as const, prior: priorKind }
@@ -369,35 +373,4 @@ function ShortcutButton({
       {label}
     </button>
   );
-}
-
-export function normalizePosixPath(path: string): string | null {
-  const trimmed = path.trim();
-  if (!trimmed.startsWith("/") || trimmed.startsWith("//") || trimmed.includes("\\")) return null;
-  const parts = trimmed.split("/").filter((part) => part && part !== ".");
-  const normalized: string[] = [];
-  for (const part of parts) {
-    if (part === "..") return null;
-    normalized.push(part);
-  }
-  return `/${normalized.join("/")}`;
-}
-
-export function parentPath(path: string): string | null {
-  const normalized = normalizePosixPath(path);
-  if (!normalized || normalized === "/") return null;
-  const splitAt = normalized.lastIndexOf("/");
-  return splitAt === 0 ? "/" : normalized.slice(0, splitAt);
-}
-
-export function pathBreadcrumbs(path: string): Array<{ label: string; path: string }> {
-  const normalized = normalizePosixPath(path) ?? "/";
-  const parts = normalized.split("/").filter(Boolean);
-  return [
-    { label: "/", path: "/" },
-    ...parts.map((part, index) => ({
-      label: part,
-      path: `/${parts.slice(0, index + 1).join("/")}`,
-    })),
-  ];
 }

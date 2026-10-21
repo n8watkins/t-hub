@@ -23,34 +23,29 @@
 // WSL health strip, the secondary settings gear, and the public exports
 // (SIDEBAR_RAIL_WIDTH, SidebarMode, the Sidebar props) App/Titlebar compile
 // against. Telemetry is still read for the bottom WSL/host-metrics strip.
+import { LayoutGrid, Trash2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { usePersistedToggle } from "../hooks/usePersistedToggle";
+import type { ConnectionState, HostMetrics } from "../ipc/protocol";
+import { useCaptain } from "../store/captain";
+import { useHasCodexSession } from "../store/clientType";
 import { useAgentTelemetry } from "../store/telemetry";
+import { useTheme } from "../store/theme";
 import {
-  useWorkspace,
   CAPTAINS_TAB_ID,
+  useWorkspace,
   type WorkspaceTab,
 } from "../store/workspace";
-import { useTheme } from "../store/theme";
-import { useHasCodexSession } from "../store/clientType";
-import { WslHealth, gib, usedFraction } from "./WslHealth";
-import {
-  UsageStrip,
-  UsageInline,
-  useClaudeUsage,
-  CodexUsageStrip,
-  CodexUsageInline,
-  useCodexUsage,
-} from "./UsageStrip";
-import { useMemo, useState } from "react";
-import { LayoutGrid, Trash2 } from "lucide-react";
-import { useCaptain } from "../store/captain";
 import { CaptainsList, OrchestratorRow } from "./CaptainsList";
-import { WorkspacesList } from "./WorkspacesList";
-import { HistoryList } from "./HistoryList";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
+import { HistoryList } from "./HistoryList";
 import { ChevronIcon } from "./SidebarChrome";
-import { usePersistedToggle } from "../hooks/usePersistedToggle";
-import type { HostMetrics, ConnectionState } from "../ipc/protocol";
+import { CodexUsageInline, CodexUsageStrip, UsageInline, UsageStrip } from "./UsageStrip";
+import { useClaudeUsage, useCodexUsage } from "./UsageStrip.helpers";
+import { WorkspacesList } from "./WorkspacesList";
+import { WslHealth } from "./WslHealth";
+import { gib, usedFraction } from "./WslHealth.helpers";
 
 // --- Sidebar header chrome -------------------------------------------------
 // The window controls (minimize / maximize-restore / close) and the PRIMARY

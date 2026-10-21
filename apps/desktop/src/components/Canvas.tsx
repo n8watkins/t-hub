@@ -1,3 +1,4 @@
+import { isEditableTarget } from "./Canvas.helpers";
 // The canvas renders the active workspace tab as a responsive auto-grid of
 // terminal tiles (PRD §5.2 tabs, §5.3 layout):
 //   - On mount: listTerminals() seeds the store; onState() keeps tile chrome live.
@@ -16,6 +17,7 @@
 //     moving a tile to another tab only REPOSITIONS the pooled terminal — it is
 //     never unmounted/reattached, so there's no reload/flash. Terminal.tsx's own
 //     ResizeObserver refits a terminal when its positioned box changes size.
+import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   useCallback,
   useEffect,
@@ -23,29 +25,29 @@ import {
   useRef,
   useState,
 } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
-import { useWorkspace } from "../store/workspace";
-import type { WorkspaceTab } from "../store/workspace";
-import { usePanels } from "../store/panels";
-import { useCaptain } from "../store/captain";
-import { spawnTerminal, listTerminals, onState } from "../ipc/client";
-import { Tile } from "./Tile";
-import { TerminalPoolProvider } from "./TerminalPool";
-import { SpawnMenu, type SpawnSelection } from "./SpawnMenu";
-import { repaintAllTerminals } from "../lib/repaint";
-import { tlog } from "../lib/diag";
+import { listTerminals, onState, spawnTerminal } from "../ipc/client";
 import type { TerminalId } from "../ipc/types";
-import { useKeybindings, directCommandForChord } from "../store/keybindings";
-import { runCommand, registerSidebarFocus } from "../lib/keymapExecutor";
 import { chordFromEvent } from "../lib/chord";
-import {
-  isPrefixArmed,
-  armPrefix,
-  handlePrefixedKey,
-  disarm,
-} from "../lib/prefixKeyHandler";
+import { tlog } from "../lib/diag";
 import { handleOverlayEscape, overlayEscapeArmed } from "../lib/escOverlays";
+import { registerSidebarFocus, runCommand } from "../lib/keymapExecutor";
+import {
+  armPrefix,
+  disarm,
+  handlePrefixedKey,
+  isPrefixArmed,
+} from "../lib/prefixKeyHandler";
+import { repaintAllTerminals } from "../lib/repaint";
 import { runWhenIdle } from "../lib/windowInteraction";
+import { useCaptain } from "../store/captain";
+import { directCommandForChord, useKeybindings } from "../store/keybindings";
+import { usePanels } from "../store/panels";
+import type { WorkspaceTab } from "../store/workspace";
+import { useWorkspace } from "../store/workspace";
+import { SpawnMenu } from "./SpawnMenu";
+import { type SpawnSelection } from "./SpawnMenu.helpers";
+import { TerminalPoolProvider } from "./TerminalPool";
+import { Tile } from "./Tile";
 
 /**
  * Split `ids` into balanced rows that completely fill the canvas — no empty
@@ -91,36 +93,6 @@ function focusSidebarTarget(): void {
     const el = document.querySelector<HTMLElement>("[data-th-sidebar-focus]");
     el?.focus();
   });
-}
-
-/**
- * True when the keydown's target is a real text-entry surface that should keep
- * its OWN keystrokes — a form `<input>`/`<textarea>`/`<select>`, or any
- * `contentEditable` host. The global keymap bails out for these so:
- *   - the command palette's search input + its "press new key" rebind capture
- *     actually RECEIVE the chord (the capture-phase keymap used to fire the
- *     direct command — e.g. Ctrl+T — before the palette could capture it, so a
- *     currently-bound chord was unrebindable);
- *   - typing chords into the worktree-path form, rename-tab, or theme fields
- *     can't accidentally trigger app commands.
- *
- * CRITICAL EXCLUSION: xterm renders an OFFSCREEN `<textarea class=
- * "xterm-helper-textarea">` as a focused terminal's keyboard input sink, so when
- * a terminal is focused EVERY keydown's target is that textarea. We must treat
- * it as NON-editable here, or the editable-guard would disable all global
- * hotkeys (Ctrl+T/+W/+Tab/prefix…) the moment a terminal has focus. We
- * explicitly let that one class fall through so terminal-focused hotkeys keep
- * working; the prefix/direct chords still beat xterm via the capture phase.
- */
-export function isEditableTarget(t: EventTarget | null): boolean {
-  const el = t as HTMLElement | null;
-  if (!el || typeof el.tagName !== "string") return false;
-  // xterm's hidden input sink is NOT an editable surface for the keymap — global
-  // hotkeys must keep firing while a terminal is focused.
-  if (el.classList?.contains("xterm-helper-textarea")) return false;
-  const tag = el.tagName;
-  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
-  return el.isContentEditable === true;
 }
 
 export function Canvas({ onFocusSidebar }: CanvasProps = {}) {

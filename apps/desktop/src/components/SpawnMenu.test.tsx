@@ -2,18 +2,13 @@
 // the confirmation boundary around a control-capable Captain Codex spawn.
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { SpawnMenu } from "./SpawnMenu";
+import { CLAUDE_RESUME_CMD, CODEX_CMD, CODEX_RESUME_CMD, PRESETS } from "./SpawnMenu.helpers";
 vi.mock("../ipc/projects", () => ({
   listProjects: vi.fn().mockResolvedValue({ projects: [], count: 0, seq: 0 }),
   registerProject: vi.fn(),
   commissionCaptain: vi.fn(),
 }));
-import {
-  SpawnMenu,
-  PRESETS,
-  CLAUDE_RESUME_CMD,
-  CODEX_CMD,
-  CODEX_RESUME_CMD,
-} from "./SpawnMenu";
 
 const byKey = (key: string) => PRESETS.find((p) => p.key === key);
 

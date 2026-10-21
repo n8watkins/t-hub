@@ -132,7 +132,7 @@ function cleanupTileSideState(id: TerminalId): void {
   // DevTab module-level state + its live backend listener. Dynamic import keeps
   // the store from eagerly pulling a React component module and stays web/test
   // safe (same pattern as the devserver stop below).
-  void import("../components/DevTab")
+  void import("../components/DevTab.helpers")
     .then((m) => m.forgetDevState(id))
     .catch(() => {
       /* DevTab never loaded for this id, or no runtime — nothing to forget */

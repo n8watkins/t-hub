@@ -1,3 +1,4 @@
+import { useCaptainDisplayLabel } from "./CaptainOverlay.helpers";
 // The CAPTAIN OVERLAY (captain-overlay + captain-list): ONE floating,
 // draggable, resizable panel that summons the ACTIVE pinned captain above
 // whatever workspace tab is active. Summoned by the `toggleCaptainOverlay`
@@ -20,22 +21,23 @@
 //
 // The panel deliberately has NO backdrop: everything outside it stays visible
 // AND interactive (clicking another tile focuses it; the overlay stays up).
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
 import { Anchor } from "lucide-react";
-import {
-  useCaptain,
-  CAPTAIN_MIN_WIDTH,
-  CAPTAIN_MIN_HEIGHT,
-} from "../store/captain";
-import { useWorkspace, tabIdForTerminal } from "../store/workspace";
-import { useSupervision, sessionStatusForTmux } from "../store/supervision";
-import { sessionNameForTerminal } from "../store/sessionContext";
-import { useActivity } from "../store/activity";
+import type { PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
-import { useTerminalSlot, requestPoolSync } from "./TerminalPool";
-import { StatusIndicator, terminalVariant } from "./StatusIndicator";
 import { repaintAllTerminals } from "../lib/repaint";
+import { useActivity } from "../store/activity";
+import {
+  CAPTAIN_MIN_HEIGHT,
+  CAPTAIN_MIN_WIDTH,
+  useCaptain,
+} from "../store/captain";
+import { sessionNameForTerminal } from "../store/sessionContext";
+import { sessionStatusForTmux, useSupervision } from "../store/supervision";
+import { useWorkspace } from "../store/workspace";
+import { StatusIndicator } from "./StatusIndicator";
+import { terminalVariant } from "./StatusIndicator.helpers";
+import { requestPoolSync, useTerminalSlot } from "./TerminalPool.helpers";
 
 /** Margin kept between the panel and the canvas edges when clamping. */
 const EDGE_PAD = 8;
@@ -57,46 +59,6 @@ function clampGeometry(
   const x = Math.min(Math.max(EDGE_PAD, g.x), Math.max(EDGE_PAD, parentW - width - EDGE_PAD));
   const y = Math.min(Math.max(EDGE_PAD, g.y), Math.max(EDGE_PAD, parentH - height - EDGE_PAD));
   return { x, y, width, height };
-}
-
-/** Resolve one user-facing Captain name from durable registry identity only. */
-export function stableCaptainIdentity(
-  displayName: string | undefined,
-  shipSlug: string | undefined,
-  terminalId: string,
-): string {
-  const named = (displayName ?? "").trim();
-  if (named) return named;
-  const slug = (shipSlug ?? "").trim();
-  if (slug) return slug;
-  return terminalId.slice(0, 8);
-}
-
-/** The user-facing display label for a captain terminal, resolved to the STABLE
- *  identity (rename -> workspace tab name -> cwd basename -> short id; NEVER the
- *  Claude title). Reads the raw user rename from `userLabels` (not the merged
- *  `labels`, which folds in Claude titles). Shared by the overlay switcher, the
- *  titlebar dropdown, the deck tiles, and the palette so a captain reads
- *  identically everywhere. */
-export function useCaptainDisplayLabel(terminalId: string): string {
-  const claim = useCaptain((s) => s.claims[terminalId]);
-  return stableCaptainIdentity(claim?.displayName, claim?.shipSlug, terminalId);
-}
-
-/** The NAME of the workspace tab holding `terminalId`'s tile, or undefined
- *  when the tile is gone (tab popped out to a satellite / terminal killed) -
- *  undefined doubles as the liveness affordance (dim + "tile not available").
- *  Shared by the titlebar dropdown rows and the sidebar captain rows so the
- *  workspace-context lookup cannot drift between the two surfaces. Built on
- *  tabIdForTerminal (memoized O(1) per tile) rather than a per-row scan. */
-export function useWorkspaceNameForTerminal(
-  terminalId: string,
-): string | undefined {
-  return useWorkspace((s) => {
-    const tabId = tabIdForTerminal(s, terminalId);
-    if (tabId === undefined) return undefined;
-    return s.tabs.find((t) => t.id === tabId)?.name;
-  });
 }
 
 /** The per-captain status dot: the same precise indicator the tiles/sidebar

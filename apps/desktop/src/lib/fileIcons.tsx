@@ -1,3 +1,4 @@
+import { FileIconThemeId } from "./fileIcons.helpers";
 // Pluggable file-tree icon themes.
 //
 // The Files tree (FileTree.tsx) and the compact panel tree (FilePanel.tsx) both
@@ -14,10 +15,7 @@
 // (~3.6MB of JSON — code-split so it never lands in the main bundle); until it
 // loads, rows fall back to the lucide glyph so they never flash a blank box.
 
-import { useEffect, useState } from "react";
 import { Icon, addCollection } from "@iconify/react";
-import vscodeIconsJs from "vscode-icons-js";
-import { themeIcons as setiThemeIcons } from "seti-icons";
 import {
   File,
   FileCode,
@@ -29,16 +27,10 @@ import {
   Image as ImageIcon,
   type LucideIcon,
 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { themeIcons as setiThemeIcons } from "seti-icons";
+import vscodeIconsJs from "vscode-icons-js";
 import { useSettings } from "../store/settings";
-
-export type FileIconThemeId = "lucide" | "vscode" | "seti";
-
-/** The selectable icon themes, in picker order. */
-export const FILE_ICON_THEMES: { id: FileIconThemeId; label: string }[] = [
-  { id: "lucide", label: "Lucide (minimal)" },
-  { id: "vscode", label: "VS Code (colorful)" },
-  { id: "seti", label: "Seti (muted)" },
-];
 
 const ICON_PX = 14;
 

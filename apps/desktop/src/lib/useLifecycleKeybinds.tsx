@@ -20,9 +20,9 @@
 // The component renders nothing but a (conditionally shown) ConfirmDialog, so it
 // is safe to mount once at the app root.
 import { useEffect, useState } from "react";
-import { useWorkspace } from "../store/workspace";
+import { isEditableTarget } from "../components/Canvas.helpers";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { isEditableTarget } from "../components/Canvas";
+import { useWorkspace } from "../store/workspace";
 
 export function LifecycleKeybinds() {
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);

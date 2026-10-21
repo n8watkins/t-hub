@@ -1,11 +1,11 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 vi.mock("./TerminalPool", () => ({
   useTerminalSlot: () => ({ current: null }),
   requestPoolSync: () => {},
 }));
 
-import { stableCaptainIdentity } from "./CaptainOverlay";
+import { stableCaptainIdentity } from "./CaptainOverlay.helpers";
 
 describe("stableCaptainIdentity durable precedence", () => {
   it("uses the trimmed durable display name", () => {
