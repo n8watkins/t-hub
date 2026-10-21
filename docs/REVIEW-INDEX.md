@@ -42,6 +42,8 @@ These define subsystem behavior and change only when the corresponding implement
 
 ## Current Supporting Specifications
 
+- [PROJECT-ASSESSMENT-2026-10-21.md](./PROJECT-ASSESSMENT-2026-10-21.md) assesses runtime correctness, provider integration, model provenance, orchestration policy, and verification gaps against `88872dce`.
+  Its recommendations are proposed priorities, not changes to the active operating contracts.
 - [TESTING.md](./TESTING.md) defines the ten local test profiles and their measured costs. Verified against `package.json` on 2026-08-01.
 - [MCP.md](./MCP.md) documents the MCP architecture, control-channel contract, and tool catalog, while the CLI-first roadmap governs its future surface.
 - [DEV-BUILD.md](./DEV-BUILD.md) defines the side-by-side production and Dev variant boundary, including the separate socket, state root, and bundle identity.
