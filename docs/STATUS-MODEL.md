@@ -128,3 +128,12 @@ Missing transport or lifecycle evidence projects to `unavailable`, retaining `la
 Unchanged reads do not append events or rewrite the registry.
 Stopped records are historical and are not reconciled.
 Active listing reconciles only the requested page using shared inventories, then returns a consistent registry snapshot and cursor.
+
+### Execution configuration evidence
+
+Durable runtime observations include `executionConfiguration` when an exactly bound provider reports a model.
+Claude statusline model IDs and Codex native-hook model IDs feed this evidence.
+The observation records its provider session ID, source, and observation time.
+A model switch emits a `runtime_reconciled` event containing the new configuration; identical model heartbeats do not create extra durable writes.
+Missing reasoning effort and harness version remain null for terminal telemetry rather than being inferred from defaults or the hook producer's compatibility version.
+The structured runtime pilot records those fields from its CLI version check and provider thread responses.

@@ -1300,6 +1300,8 @@ fn get_agent_projects_provider_permission_and_completion_with_live_tmux() {
         "test-runtime".into(),
     );
     seed_starting_agent(&ctx, &id);
+    ctx.status
+        .ingest(&id, &json!({"model":{"id":"provider-model"}}), now_ms());
     for (event, expected) in [
         (JournalEventType::PermissionRequest, "needsPermission"),
         (JournalEventType::UserPromptSubmit, "running"),
@@ -1310,7 +1312,35 @@ fn get_agent_projects_provider_permission_and_completion_with_live_tmux() {
             .ingest(Some(&id), None, None, None, event, now_ms());
         let value = dispatch(&ctx, "get_agent", &json!({"agentSessionId": id})).unwrap();
         assert_eq!(value["runtimeState"], expected);
+        assert_eq!(
+            value["runtimeObservation"]["executionConfiguration"]["effectiveModel"],
+            "provider-model"
+        );
     }
+    let cursor = ctx.captains.snapshot().seq;
+    ctx.status
+        .ingest(&id, &json!({"model":{"id":"provider-model"}}), now_ms() + 1);
+    dispatch(&ctx, "get_agent", &json!({"agentSessionId": id})).unwrap();
+    assert_eq!(
+        ctx.captains.snapshot().seq,
+        cursor,
+        "identical model telemetry must not amplify writes"
+    );
+    ctx.status
+        .ingest(&id, &json!({"model":{"id":"switched-model"}}), now_ms() + 2);
+    dispatch(&ctx, "get_agent", &json!({"agentSessionId": id})).unwrap();
+    let snapshot = ctx.captains.snapshot();
+    assert_eq!(
+        snapshot
+            .agent_events
+            .last()
+            .unwrap()
+            .execution_configuration
+            .as_ref()
+            .unwrap()
+            .effective_model,
+        "switched-model"
+    );
 }
 
 #[test]

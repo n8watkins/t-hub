@@ -201,6 +201,7 @@ export interface RateLimitWindow {
  * (REVIEW / PRD §6.10 caveat).
  */
 export interface StatusSnapshot {
+  effectiveModel?: string;
   sessionId: string;
   contextUsedPct?: number;
   costUsd?: number;

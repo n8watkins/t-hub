@@ -54,6 +54,8 @@ pub struct RateLimitWindow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
     /// The exact session id this snapshot is for.
     pub session_id: String,
     /// The session's working directory, lifted straight from the statusline
@@ -107,6 +109,7 @@ impl StatusSnapshot {
     /// session (the freeze); callers skip the emit when this returns true.
     pub fn same_status(&self, other: &StatusSnapshot) -> bool {
         self.session_id == other.session_id
+            && self.effective_model == other.effective_model
             && self.cwd == other.cwd
             && self.tmux_pane == other.tmux_pane
             && self.tmux_session == other.tmux_session
@@ -151,6 +154,17 @@ impl StatusSnapshot {
         let seven_day = rl.and_then(|v| v.get("seven_day")).map(parse_window);
 
         Self {
+            effective_model: raw
+                .get("model")
+                .and_then(|model| {
+                    model
+                        .as_str()
+                        .or_else(|| model.get("id").and_then(|id| id.as_str()))
+                })
+                .filter(|model| {
+                    !model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
+                })
+                .map(str::to_owned),
             session_id: session_id.to_string(),
             cwd,
             tmux_pane,

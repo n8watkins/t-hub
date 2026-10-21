@@ -838,6 +838,9 @@ fn entry_from_native_hook(
         _ => health_entry(&state, &binding, "degraded", "unsupported_native_hook"),
     }?;
     entry.source = JournalSource::Hook;
+    if let Some(model) = exact_string(raw.get("model"), MAX_ID_BYTES) {
+        entry.payload["model"] = Value::String(model);
+    }
     Some(entry)
 }
 

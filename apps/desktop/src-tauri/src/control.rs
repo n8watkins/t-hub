@@ -7419,7 +7419,31 @@ fn reconcile_agent_records(
         } else {
             Some(runtime)
         };
+        let execution_configuration = ctx
+            .status
+            .get(&key)
+            .filter(|snapshot| snapshot.ingested_at_ms >= agent.created_at)
+            .and_then(|snapshot| {
+                snapshot
+                    .effective_model
+                    .map(|model| crate::agent_session::ExecutionConfiguration {
+                        provider_session_id: key.clone(),
+                        effective_model: model,
+                        effective_reasoning_effort: None,
+                        harness_version: None,
+                        observed_at_ms: snapshot.ingested_at_ms,
+                        source: "provider-telemetry".into(),
+                    })
+            })
+            .or_else(|| {
+                agent
+                    .runtime_observation
+                    .as_ref()
+                    .and_then(|observation| observation.execution_configuration.clone())
+                    .filter(|configuration| configuration.provider_session_id == key)
+            });
         let observation = crate::agent_session::RuntimeObservation {
+            execution_configuration,
             process_state: process_state.into(),
             provider_status: status,
             provider_observed_at_ms: evidence_at,

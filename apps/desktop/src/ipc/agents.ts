@@ -15,6 +15,14 @@ export interface AgentStatus {
   agentSessionId: string;
   runtimeState: string;
   runtimeObservation?: {
+    executionConfiguration?: {
+      providerSessionId: string;
+      effectiveModel: string;
+      effectiveReasoningEffort: string | null;
+      harnessVersion: string | null;
+      observedAtMs: number;
+      source: string;
+    };
     processState: "alive" | "exited" | "unknown";
     providerStatus: import("./model").SessionStatus;
     providerObservedAtMs: number | null;

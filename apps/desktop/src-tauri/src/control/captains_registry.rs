@@ -2520,6 +2520,7 @@ impl CaptainsRegistry {
         let delivery_states = current.agent_sessions[agent_index].delivery_states();
         current.agent_checkpoints.push(checkpoint.clone());
         current.agent_events.push(AgentEvent {
+            execution_configuration: None,
             cursor,
             agent_session_id: agent_session_id.to_string(),
             kind: "checkpoint".into(),
@@ -2579,6 +2580,7 @@ impl CaptainsRegistry {
         let result = agent.clone();
         let cursor = current.seq.saturating_add(1);
         current.agent_events.push(AgentEvent {
+            execution_configuration: None,
             cursor,
             agent_session_id: agent_session_id.to_string(),
             kind: "delivery_evidence".into(),
@@ -2691,10 +2693,19 @@ impl CaptainsRegistry {
             .ok_or_else(|| format!("agent session '{agent_session_id}' was not found"))?;
         let observation_changed = observation.as_ref().is_some_and(|next| {
             agent.runtime_observation.as_ref().is_none_or(|previous| {
-                previous.process_state != next.process_state
-                    || previous.provider_status != next.provider_status
-                    || previous.provider_observed_at_ms != next.provider_observed_at_ms
-                    || previous.source != next.source
+                (match (
+                    &previous.execution_configuration,
+                    &next.execution_configuration,
+                ) {
+                    (Some(previous), Some(next)) => !previous.same_settings(next),
+                    (None, None) => false,
+                    _ => true,
+                }) || {
+                    previous.process_state != next.process_state
+                        || previous.provider_status != next.provider_status
+                        || previous.provider_observed_at_ms != next.provider_observed_at_ms
+                        || previous.source != next.source
+                }
             })
         });
         let changed = observation_changed
@@ -2717,6 +2728,10 @@ impl CaptainsRegistry {
         let result = agent.clone();
         let cursor = current.seq.saturating_add(1);
         current.agent_events.push(AgentEvent {
+            execution_configuration: result
+                .runtime_observation
+                .as_ref()
+                .and_then(|observation| observation.execution_configuration.clone()),
             cursor,
             agent_session_id: agent_session_id.to_string(),
             kind: "runtime_reconciled".into(),
@@ -2769,6 +2784,7 @@ impl CaptainsRegistry {
         let result = agent.clone();
         let cursor = current.seq.saturating_add(1);
         current.agent_events.push(AgentEvent {
+            execution_configuration: None,
             cursor,
             agent_session_id: agent_session_id.to_string(),
             kind: "assignment_replaced".into(),
@@ -2807,6 +2823,7 @@ impl CaptainsRegistry {
         let result = agent.clone();
         let cursor = current.seq.saturating_add(1);
         current.agent_events.push(AgentEvent {
+            execution_configuration: None,
             cursor,
             agent_session_id: agent_session_id.to_string(),
             kind: kind.to_string(),

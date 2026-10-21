@@ -121,10 +121,34 @@ pub enum RuntimeState {
     Unavailable,
 }
 
+/// Provider-reported settings, never inferred from a default model or producer version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionConfiguration {
+    pub provider_session_id: String,
+    pub effective_model: String,
+    pub effective_reasoning_effort: Option<String>,
+    pub harness_version: Option<String>,
+    pub observed_at_ms: u64,
+    pub source: String,
+}
+
+impl ExecutionConfiguration {
+    pub fn same_settings(&self, other: &Self) -> bool {
+        self.provider_session_id == other.provider_session_id
+            && self.effective_model == other.effective_model
+            && self.effective_reasoning_effort == other.effective_reasoning_effort
+            && self.harness_version == other.harness_version
+            && self.source == other.source
+    }
+}
+
 /// Last persisted runtime evidence, separate from assignment progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_configuration: Option<ExecutionConfiguration>,
     pub process_state: String,
     pub provider_status: crate::model::SessionStatus,
     pub provider_observed_at_ms: Option<u64>,
@@ -1023,6 +1047,8 @@ impl AgentCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_configuration: Option<ExecutionConfiguration>,
     pub cursor: u64,
     pub agent_session_id: String,
     pub kind: String,

@@ -52,6 +52,7 @@ interface SupervisionState {
  */
 function sameSnapshot(a: StatusSnapshot, b: StatusSnapshot): boolean {
   return (
+    a.effectiveModel === b.effectiveModel &&
     a.contextUsedPct === b.contextUsedPct &&
     a.costUsd === b.costUsd &&
     a.rateLimitsPresent === b.rateLimitsPresent &&
