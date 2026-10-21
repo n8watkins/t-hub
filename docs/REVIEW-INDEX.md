@@ -42,6 +42,8 @@ These define subsystem behavior and change only when the corresponding implement
 
 ## Current Supporting Specifications
 
+- [RUNTIME-MODERNIZATION-2026-10-21.md](./RUNTIME-MODERNIZATION-2026-10-21.md) records implemented assessment fixes, verification, and remaining production acceptance gates.
+
 - [PROJECT-ASSESSMENT-2026-10-21.md](./PROJECT-ASSESSMENT-2026-10-21.md) assesses runtime correctness, provider integration, model provenance, orchestration policy, and verification gaps against `88872dce`.
   Its recommendations are proposed priorities, not changes to the active operating contracts.
 - [TESTING.md](./TESTING.md) defines the ten local test profiles and their measured costs. Verified against `package.json` on 2026-08-01.
