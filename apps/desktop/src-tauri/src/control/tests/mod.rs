@@ -126,6 +126,7 @@ fn seed_starting_agent_with_purpose(
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Starting,
             work_stage: crate::agent_session::WorkStage::Assigned,
             delivery: Some(crate::agent_session::DeliveryProvenance::new(

@@ -121,6 +121,18 @@ pub enum RuntimeState {
     Unavailable,
 }
 
+/// Last persisted runtime evidence, separate from assignment progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeObservation {
+    pub process_state: String,
+    pub provider_status: crate::model::SessionStatus,
+    pub provider_observed_at_ms: Option<u64>,
+    pub observed_at_ms: u64,
+    pub source: String,
+    pub last_known_state: Option<RuntimeState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkStage {
     #[serde(rename = "assigned")]
@@ -857,6 +869,8 @@ pub struct AgentSessionRecord {
     pub provider_conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_point: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_observation: Option<RuntimeObservation>,
     pub runtime_state: RuntimeState,
     pub work_stage: WorkStage,
     /// Missing only on records written before delivery provenance was added.
@@ -1053,6 +1067,7 @@ mod tests {
             provider: "codex".into(),
             provider_conversation_id: Some("conversation-1".into()),
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Starting,
             work_stage: WorkStage::Assigned,
             delivery: None,

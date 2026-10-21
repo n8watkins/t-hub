@@ -247,6 +247,7 @@ fn start_agent_rejects_dependency_result_missing_from_source_baseline() {
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Exited,
             work_stage: crate::agent_session::WorkStage::Complete,
             delivery: Some(completed_delivery(&initial_commit, &dependency_result)),

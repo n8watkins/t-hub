@@ -148,6 +148,7 @@ struct SessionEntry {
     /// [`SESSION_MAP_CAP`] backstop — NOT wall-clock, so it is immune to clock
     /// skew and deterministic in tests. Higher = more recently updated.
     update_stamp: u64,
+    observed_at_ms: u64,
 }
 
 impl SessionEntry {
@@ -317,6 +318,7 @@ impl Supervisor {
         let touch = self.touch_seq;
         let entry = self.sessions.entry(session_id.to_string()).or_default();
         entry.update_stamp = touch;
+        entry.observed_at_ms = timestamp_ms;
         // Capture the status before the reducer runs so we can log an *edge* only
         // when it actually changes (not on a same-status re-ingest). `SessionStatus`
         // is `Copy`, so this is a cheap snapshot.
@@ -730,6 +732,13 @@ impl Supervisor {
             .get(session_id)
             .map(|e| e.status)
             .unwrap_or(SessionStatus::Unknown)
+    }
+
+    /// Timestamp of the latest lifecycle evidence, not the time of a status poll.
+    pub fn observed_at_ms(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .get(session_id)
+            .map(|entry| entry.observed_at_ms)
     }
 
     /// Structured permission request currently awaiting a decision.

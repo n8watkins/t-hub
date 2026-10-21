@@ -94,6 +94,7 @@ fn durable_agent_checkpoint_persists_and_advances_the_event_cursor() {
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: crate::agent_session::RuntimeState::Starting,
             work_stage: crate::agent_session::WorkStage::Assigned,
             delivery: Some(crate::agent_session::DeliveryProvenance::new(
@@ -556,6 +557,7 @@ fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Exited,
             work_stage: crate::agent_session::WorkStage::Complete,
             delivery: Some(interface_delivery),
@@ -583,6 +585,7 @@ fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Exited,
             work_stage: crate::agent_session::WorkStage::Complete,
             delivery: Some(completed_delivery(&baseline, &divergent_result)),
@@ -614,6 +617,7 @@ fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Idle,
             work_stage: crate::agent_session::WorkStage::Working,
             delivery: Some(incomplete_delivery),
@@ -649,6 +653,7 @@ fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Running,
             work_stage: crate::agent_session::WorkStage::Working,
             delivery: Some(crate::agent_session::DeliveryProvenance::new(
@@ -1271,4 +1276,107 @@ fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
         .any(|event| event["kind"] == "delivery_evidence"
             && event["deliveryStates"]["complete"] == true)));
     std::fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn get_agent_projects_provider_permission_and_completion_with_live_tmux() {
+    use t_hub_protocol::JournalEventType;
+    let id = format!("runtime-{}", uuid::Uuid::new_v4().simple());
+    let target = tmux_target(&id);
+    let (bin_dir, command) = test_harness_command("codex");
+    struct Cleanup(String, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = tmux::kill_session(&self.0);
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _cleanup = Cleanup(target.clone(), bin_dir);
+    tmux::new_session_with_env(&target, "/tmp", Some(&command), &[]).unwrap();
+    let supervisor = Arc::new(parking_lot::Mutex::new(Supervisor::new()));
+    let ctx = ControlContext::with_shared_supervisor(
+        Arc::new(StatusBridge::new()),
+        supervisor.clone(),
+        "test-runtime".into(),
+    );
+    seed_starting_agent(&ctx, &id);
+    for (event, expected) in [
+        (JournalEventType::PermissionRequest, "needsPermission"),
+        (JournalEventType::UserPromptSubmit, "running"),
+        (JournalEventType::Stop, "idle"),
+    ] {
+        supervisor
+            .lock()
+            .ingest(Some(&id), None, None, None, event, now_ms());
+        let value = dispatch(&ctx, "get_agent", &json!({"agentSessionId": id})).unwrap();
+        assert_eq!(value["runtimeState"], expected);
+    }
+}
+
+#[test]
+fn list_agents_only_reconciles_the_requested_page_and_skips_removed_history() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let ctx = test_ctx("bounded-runtime").with_live_sessions(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![])
+    });
+    for id in ["page-a", "page-b", "page-c"] {
+        seed_starting_agent(&ctx, id);
+    }
+    ctx.captains
+        .update_agent_stage("page-c", crate::agent_session::WorkStage::Stopped)
+        .unwrap();
+    let response = dispatch(
+        &ctx,
+        "list_agents",
+        &json!({"projectId":"capacity-project","limit":1}),
+    )
+    .unwrap();
+    assert_eq!(response["count"], 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let snapshot = ctx.captains.snapshot();
+    assert_eq!(
+        snapshot
+            .agent_sessions
+            .iter()
+            .find(|agent| agent.agent_session_id == "page-b")
+            .unwrap()
+            .runtime_state,
+        RuntimeState::Starting
+    );
+    dispatch(
+        &ctx,
+        "list_agents",
+        &json!({"projectId":"capacity-project","state":"removed"}),
+    )
+    .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn unavailable_runtime_retains_last_known_state_and_surfaces_evidence_failure() {
+    let ctx = test_ctx("unknown-runtime").with_live_sessions(|| Err("bridge offline".into()));
+    seed_starting_agent(&ctx, "unknown-agent");
+    let response = dispatch(
+        &ctx,
+        "get_agent",
+        &json!({"agentSessionId":"unknown-agent"}),
+    )
+    .unwrap();
+    assert_eq!(response["runtimeState"], "unavailable");
+    assert_eq!(response["runtimeObservation"]["processState"], "unknown");
+    assert_eq!(response["runtimeObservation"]["lastKnownState"], "starting");
+    let cursor = ctx.captains.snapshot().seq;
+    dispatch(
+        &ctx,
+        "get_agent",
+        &json!({"agentSessionId":"unknown-agent"}),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.captains.snapshot().seq,
+        cursor,
+        "unchanged observations must not amplify journal writes"
+    );
 }

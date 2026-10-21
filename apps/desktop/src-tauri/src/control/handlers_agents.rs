@@ -40,26 +40,34 @@ pub(super) fn list_agents(
         true,
     )?;
     let result = (|| {
-        let candidate_ids: Vec<String> = ctx
-            .captains
-            .snapshot()
-            .agent_sessions
-            .into_iter()
-            .filter(|agent| {
-                captain_session_id
-                    .as_deref()
-                    .is_none_or(|captain| agent.captain_session_id == captain)
-                    && project_id
-                        .as_deref()
-                        .is_none_or(|project| agent.project_id == project)
-            })
-            .map(|agent| agent.agent_session_id)
-            .collect();
-        for agent_session_id in candidate_ids {
-            reconcile_agent_runtime(ctx, &agent_session_id);
-        }
         let cursor = agent_page_cursor(args, "list_agents")?;
         let limit = agent_page_limit(args, "list_agents")?;
+        // Historical pages are immutable work evidence, not live runtimes.
+        if state == "active" {
+            let mut candidates: Vec<_> = ctx
+                .captains
+                .snapshot()
+                .agent_sessions
+                .into_iter()
+                .filter(|agent| {
+                    agent.work_stage != crate::agent_session::WorkStage::Stopped
+                        && captain_session_id
+                            .as_deref()
+                            .is_none_or(|id| agent.captain_session_id == id)
+                        && project_id
+                            .as_deref()
+                            .is_none_or(|id| agent.project_id == id)
+                        && authorization.caller_ship.as_deref().is_none_or(|ship| {
+                            ctx.captains
+                                .captain_for_session(&agent.captain_session_id)
+                                .is_some_and(|captain| captain.ship_slug == ship)
+                        })
+                })
+                .collect();
+            candidates.sort_by(|a, b| a.agent_session_id.cmp(&b.agent_session_id));
+            let page: Vec<_> = candidates.into_iter().skip(cursor).take(limit).collect();
+            reconcile_agent_records(ctx, &page)?;
+        }
         let snapshot = ctx.captains.snapshot();
         let mut records: Vec<_> = snapshot
             .agent_sessions
@@ -224,7 +232,9 @@ pub(super) fn get_agent(
         .find(|agent| agent.agent_session_id == agent_session_id)
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
     authorize_agent(ctx, &initial, caller, trusted_internal, "get_agent")?;
-    reconcile_agent_runtime(ctx, &agent_session_id);
+    if initial.work_stage != crate::agent_session::WorkStage::Stopped {
+        reconcile_agent_records(ctx, &[initial])?;
+    }
     let agent = ctx
         .captains
         .snapshot()

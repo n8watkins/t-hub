@@ -2666,6 +2666,21 @@ impl CaptainsRegistry {
         runtime_state: RuntimeState,
         provider_conversation_id: Option<String>,
     ) -> Result<AgentSessionRecord, String> {
+        self.reconcile_agent_runtime_observed(
+            agent_session_id,
+            runtime_state,
+            provider_conversation_id,
+            None,
+        )
+    }
+
+    pub fn reconcile_agent_runtime_observed(
+        &self,
+        agent_session_id: &str,
+        runtime_state: RuntimeState,
+        provider_conversation_id: Option<String>,
+        observation: Option<crate::agent_session::RuntimeObservation>,
+    ) -> Result<AgentSessionRecord, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
@@ -2674,12 +2689,24 @@ impl CaptainsRegistry {
             .iter_mut()
             .find(|agent| agent.agent_session_id == agent_session_id)
             .ok_or_else(|| format!("agent session '{agent_session_id}' was not found"))?;
-        let changed = agent.runtime_state != runtime_state
+        let observation_changed = observation.as_ref().is_some_and(|next| {
+            agent.runtime_observation.as_ref().is_none_or(|previous| {
+                previous.process_state != next.process_state
+                    || previous.provider_status != next.provider_status
+                    || previous.provider_observed_at_ms != next.provider_observed_at_ms
+                    || previous.source != next.source
+            })
+        });
+        let changed = observation_changed
+            || agent.runtime_state != runtime_state
             || provider_conversation_id
                 .as_deref()
                 .is_some_and(|id| agent.provider_conversation_id.as_deref() != Some(id));
         if !changed {
             return Ok(agent.clone());
+        }
+        if observation_changed {
+            agent.runtime_observation = observation;
         }
         agent.runtime_state = runtime_state;
         if provider_conversation_id.is_some() {

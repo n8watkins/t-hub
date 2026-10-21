@@ -728,6 +728,7 @@ fn real_dispatch_preflight_and_delivery_gates_return_native_git_required_without
             provider: "codex".into(),
             provider_conversation_id: None,
             resume_point: None,
+            runtime_observation: None,
             runtime_state: RuntimeState::Starting,
             work_stage: crate::agent_session::WorkStage::Assigned,
             delivery: Some(crate::agent_session::DeliveryProvenance::new(

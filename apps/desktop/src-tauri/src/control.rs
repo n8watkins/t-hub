@@ -7328,39 +7328,118 @@ struct AgentFilterAuthorization {
 /// Refresh one durable agent from terminal and provider evidence.
 /// Unknown probes are deliberately non-mutating so a transient WSL or tmux
 /// failure cannot turn a live agent into an exited one.
-fn reconcile_agent_runtime(ctx: &ControlContext, agent_session_id: &str) {
-    let snapshot = ctx.captains.snapshot();
-    let Some(agent) = snapshot
-        .agent_sessions
-        .iter()
-        .find(|agent| agent.agent_session_id == agent_session_id)
-        .cloned()
-    else {
-        return;
-    };
-    let runtime_state = match tmux::session_liveness(&tmux_target(&agent.agent_session_id)) {
-        tmux::SessionLiveness::Gone => RuntimeState::Exited,
-        tmux::SessionLiveness::Unknown => return,
-        tmux::SessionLiveness::Alive => {
-            match tmux::harness_liveness(&tmux_target(&agent.agent_session_id), &agent.provider) {
-                tmux::SessionLiveness::Alive => RuntimeState::Running,
-                tmux::SessionLiveness::Gone => RuntimeState::Idle,
-                tmux::SessionLiveness::Unknown => return,
-            }
-        }
-    };
-    let provider_conversation_id = if matches!(runtime_state, RuntimeState::Running) {
-        trusted_provider_session_id(ctx, &agent.agent_session_id, &agent.provider, None)
-            .ok()
-            .flatten()
+/// Reconcile a bounded page using one terminal inventory and one pane inventory.
+/// Unknown transport evidence is explicit; process presence never implies work.
+fn reconcile_agent_records(
+    ctx: &ControlContext,
+    records: &[AgentSessionRecord],
+) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let live = (ctx.live_sessions)();
+    let panes = if live.is_ok() {
+        tmux::pane_info().ok()
     } else {
         None
     };
-    let _ = ctx.captains.reconcile_agent_runtime(
-        &agent.agent_session_id,
-        runtime_state,
-        provider_conversation_id,
-    );
+    for agent in records {
+        let target = tmux_target(&agent.agent_session_id);
+        let command = panes
+            .as_ref()
+            .and_then(|panes| panes.iter().find(|pane| pane.session == target));
+        let process_state = match &live {
+            Err(_) => "unknown",
+            Ok(sessions) if !sessions.contains(&target) => "exited",
+            Ok(_)
+                if command
+                    .is_some_and(|pane| pane.command.eq_ignore_ascii_case(&agent.provider)) =>
+            {
+                "alive"
+            }
+            Ok(_)
+                if command.is_some_and(|pane| {
+                    matches!(
+                        pane.command.as_str(),
+                        "bash" | "zsh" | "sh" | "fish" | "pwsh" | "nu"
+                    )
+                }) =>
+            {
+                "exited"
+            }
+            Ok(_) => "unknown",
+        };
+        let provider_id = if process_state == "alive" {
+            trusted_provider_session_id(ctx, &agent.agent_session_id, &agent.provider, None)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let key = provider_id
+            .clone()
+            .unwrap_or_else(|| resolve_supervisor_key(ctx, &agent.agent_session_id));
+        let (status, evidence_at, health) = ctx.with_supervisor(|supervisor| {
+            (
+                supervisor.status(&key),
+                supervisor.observed_at_ms(&key),
+                supervisor.runtime_health(&key),
+            )
+        });
+        let usable = evidence_at.is_some_and(|at| at >= agent.created_at)
+            && !health.as_ref().is_some_and(|health| {
+                matches!(
+                    health.health,
+                    crate::supervision::RuntimeHealth::Disconnected
+                        | crate::supervision::RuntimeHealth::Unknown
+                )
+            });
+        let runtime = match process_state {
+            "exited" => RuntimeState::Exited,
+            "alive" if usable => match status {
+                crate::model::SessionStatus::Working
+                | crate::model::SessionStatus::WaitingOnSubagents => RuntimeState::Running,
+                crate::model::SessionStatus::NeedsPermission => RuntimeState::NeedsPermission,
+                crate::model::SessionStatus::Completed
+                | crate::model::SessionStatus::Failed
+                | crate::model::SessionStatus::NeedsQuestion => RuntimeState::Idle,
+                _ => RuntimeState::Unavailable,
+            },
+            _ => RuntimeState::Unavailable,
+        };
+        let last_known_state = if runtime == RuntimeState::Unavailable {
+            if agent.runtime_state == RuntimeState::Unavailable {
+                agent
+                    .runtime_observation
+                    .as_ref()
+                    .and_then(|observation| observation.last_known_state)
+            } else {
+                Some(agent.runtime_state)
+            }
+        } else {
+            Some(runtime)
+        };
+        let observation = crate::agent_session::RuntimeObservation {
+            process_state: process_state.into(),
+            provider_status: status,
+            provider_observed_at_ms: evidence_at,
+            observed_at_ms: now_ms(),
+            source: if usable {
+                "provider-lifecycle+tmux"
+            } else {
+                "tmux-only"
+            }
+            .into(),
+            last_known_state,
+        };
+        ctx.captains.reconcile_agent_runtime_observed(
+            &agent.agent_session_id,
+            runtime,
+            provider_id,
+            Some(observation),
+        )?;
+    }
+    Ok(())
 }
 
 mod handlers_agents;

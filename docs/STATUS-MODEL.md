@@ -116,3 +116,15 @@ If exact resume identity cannot be proven, T-Hub retains a visible recovery-requ
 - Test that delivery states remain distinct across backend, CLI, MCP, and graphical surfaces.
 - Test that `complete` requires independent review and acceptance tests for the exact result commit.
 - Test that visible product bugs cannot become `complete` from source-only tests.
+
+
+## Durable agent runtime observations
+
+`get_agent` and active `list_agents` pages reconcile process inventory with provider lifecycle evidence.
+A live provider process alone is insufficient to report `running`.
+Permission requests project to `needsPermission`; completed turns and questions project to `idle`, with the precise provider status retained in `runtimeObservation`.
+Missing transport or lifecycle evidence projects to `unavailable`, retaining `lastKnownState` separately.
+`providerObservedAtMs` dates the lifecycle event, while `observedAtMs` dates the last persisted change in runtime evidence; neither is a fabricated provider heartbeat.
+Unchanged reads do not append events or rewrite the registry.
+Stopped records are historical and are not reconciled.
+Active listing reconciles only the requested page using shared inventories, then returns a consistent registry snapshot and cursor.

@@ -14,6 +14,14 @@ export interface DeliveryStates {
 export interface AgentStatus {
   agentSessionId: string;
   runtimeState: string;
+  runtimeObservation?: {
+    processState: "alive" | "exited" | "unknown";
+    providerStatus: import("./model").SessionStatus;
+    providerObservedAtMs: number | null;
+    observedAtMs: number;
+    source: string;
+    lastKnownState: string | null;
+  };
   workStage: string;
   deliveryStates: DeliveryStates | null;
 }

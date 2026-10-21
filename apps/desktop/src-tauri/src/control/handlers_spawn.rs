@@ -885,6 +885,7 @@ pub(super) fn start_agent(
         provider: harness_name,
         provider_conversation_id: None,
         resume_point: None,
+        runtime_observation: None,
         runtime_state: RuntimeState::Starting,
         work_stage: crate::agent_session::WorkStage::Assigned,
         delivery: Some(crate::agent_session::DeliveryProvenance::new(
