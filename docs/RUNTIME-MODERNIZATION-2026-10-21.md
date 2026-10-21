@@ -31,6 +31,8 @@ Frontend lint reported 28 existing warnings and no errors.
 Additional provenance changes passed the focused real-tmux regression, typecheck, all 637 frontend tests, and the subsequent Rust gate.
 That gate included 412 control tests and 30 tmux tests.
 Clippy passed for the workspace and all targets with warnings treated as errors.
+The host CLI contract profile passed against the installed providers, including provisioning, interrupted installation recovery, provenance checks, and concurrent installer locking.
+Portable contracts passed with the runtime and evaluation suites included.
 The runtime subprocess suite passes six tests, including restart replay, lost acknowledgement, exact approval routing, model configuration validation, exclusive state ownership, and oversized-frame rejection.
 The evaluation scorer passes four tests covering incomplete comparisons, configuration drift, evidence integrity, and unknown billing cost.
 
