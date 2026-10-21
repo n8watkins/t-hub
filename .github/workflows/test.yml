@@ -197,12 +197,25 @@ jobs:
       - name: GitHub Actions pinning contract
         run: bash scripts/ci/workflow-actions.test.sh
 
+      - name: Orchestration evaluation scorer
+        run: python3 -m unittest discover -s scripts/eval -p 'test_*.py' -v
+
       - name: Handoff skill contract
         run: bash scripts/captain/handoff-skill.test.sh
 
   host-cli-contracts:
-    name: Host CLI contracts (Codex + Claude)
+    name: Host CLI contracts (${{ matrix.channel }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: baseline
+            packages: '@openai/codex@0.145.0 @anthropic-ai/claude-code@2.1.220'
+          - channel: current
+            packages: '@openai/codex@0.163.0 @anthropic-ai/claude-code@2.1.306'
+          - channel: latest
+            packages: '@openai/codex@latest @anthropic-ai/claude-code@latest'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -210,8 +223,19 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install pinned host CLIs
-        run: npm install --global @openai/codex@0.145.0 @anthropic-ai/claude-code@2.1.220
+      - name: Install host CLIs
+        run: npm install --global ${{ matrix.packages }}
+
+      - name: Record provider versions
+        run: |
+          codex --version
+          claude --version
+
+      - name: Structured runtime subprocess tests
+        run: python3 -m unittest discover -s scripts/runtime -p 'test_*.py' -v
+
+      - name: Structured runtime handshake and model discovery
+        run: python3 scripts/runtime/codex_runtime.py --experimental --state-dir "$RUNNER_TEMP/thub-runtime" --check
 
       - name: Codex provisioning contract
         run: bash scripts/captain/ensure-thub-codex.test.sh

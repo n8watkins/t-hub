@@ -106,7 +106,9 @@ portable_contracts() {
     bash scripts/perf/perf-benchmark.test.sh &&
     bash scripts/ci/local-test.test.sh &&
     bash scripts/ci/workflow-actions.test.sh &&
-    bash scripts/captain/handoff-skill.test.sh
+    bash scripts/captain/handoff-skill.test.sh &&
+    python3 -m unittest discover -s scripts/runtime -p 'test_*.py' -v &&
+    python3 -m unittest discover -s scripts/eval -p 'test_*.py' -v
 }
 
 host_contracts() {
@@ -143,6 +145,7 @@ EOF
 rust: apps/desktop/scripts/workspace_gate.sh standard
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
+frontend-lint: pnpm --filter t-hub-desktop lint
 frontend-unit: pnpm --filter t-hub-desktop test
 EOF
       ;;
@@ -172,7 +175,7 @@ EOF
       ;;
     contracts)
       cat <<'EOF'
-contracts: version, voice gate, performance, test profile, workflow pinning, and handoff skill
+contracts: version, voice gate, performance, test profile, workflow pinning, handoff skill, structured runtime, and orchestration evaluation
 EOF
       ;;
     host-contracts)
@@ -188,7 +191,7 @@ frontend-typecheck: pnpm --filter t-hub-desktop typecheck
 frontend-lint: pnpm --filter t-hub-desktop lint
 frontend-unit: pnpm --filter t-hub-desktop test
 frontend-product: pnpm --filter t-hub-desktop build:bundle, then test:browser
-contracts: version, voice gate, performance, test profile, workflow pinning, and handoff skill
+contracts: version, voice gate, performance, test profile, workflow pinning, handoff skill, structured runtime, and orchestration evaluation
 EOF
       ;;
   esac
@@ -227,6 +230,7 @@ case "$PROFILE" in
     start_lane rust rust_standard
     start_lane cli cli_tests
     start_lane frontend-typecheck frontend_typecheck
+    start_lane frontend-lint frontend_lint
     start_lane frontend-unit frontend_tests
     ;;
   backend)

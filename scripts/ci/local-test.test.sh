@@ -24,6 +24,7 @@ fi
 
 standard_plan="$(bash "$SCRIPT" standard --plan)"
 grep -Fq "workspace_gate.sh standard" <<<"$standard_plan"
+grep -Fq "frontend-lint" <<<"$standard_plan"
 
 backend_plan="$(bash "$SCRIPT" backend --plan)"
 grep -Fq "workspace_gate.sh standard" <<<"$backend_plan"
