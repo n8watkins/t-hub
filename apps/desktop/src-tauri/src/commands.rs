@@ -687,6 +687,9 @@ pub async fn deliver_agent_input(
     source: String,
 ) -> Result<(), String> {
     let source = crate::plane::WriteSource::parse(&source)?;
+    if source == crate::plane::WriteSource::AutoContinue {
+        return Err("Automatic terminal recovery is unavailable: resume manually or use a structured provider runtime".into());
+    }
     crate::plane::note_primary(source, &id, data.len());
     let conn = remote
         .conns

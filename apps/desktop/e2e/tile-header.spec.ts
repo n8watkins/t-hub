@@ -63,7 +63,13 @@ async function installTauriMock(page: Page): Promise<void> {
     const host = window as typeof window & Record<string, unknown>;
     host.__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: Record<string, unknown>) => {
+        if (command === "deliver_agent_input") {
+          const writes = (host.__RECOVERY_WRITES__ ??= []) as unknown[];
+          writes.push(args);
+          return null;
+        }
         if (command === "control_request") {
+          if (args?.command === "codex_usage") return host.__CODEX_USAGE__ ?? { ok: false };
           if (args?.command === "git_info") {
             return {
               isRepo: true,
@@ -839,4 +845,22 @@ test("preserves the full 16-tile chrome under emulated display scales", async ({
   for (const scale of [1, 1.25, 1.5, 2]) {
     await verifyScale(browser, scale, testInfo);
   }
+});
+
+
+test("account quota never types into working, idle, or permission-blocked terminals", async ({ page }) => {
+  await page.clock.install();
+  await seedTiles(page, 4);
+  await page.evaluate(() => {
+    const host = window as BrowserHost & Record<string, unknown>;
+    host.__RECOVERY_WRITES__ = [];
+    host.__CODEX_USAGE__ = { ok: true, primary: { usedPercent: 100, resetsAt: Date.now() / 1000 - 10 } };
+    const stores = host.__BROWSER_STORES__!;
+    const terminals = Object.fromEntries(Object.entries(stores.workspace.useWorkspace.getState().terminals)
+      .map(([id, terminal]) => [id, { ...terminal, title: "codex" }]));
+    host.__BROWSER_TERMINALS__ = Object.values(terminals);
+    stores.workspace.useWorkspace.setState({ terminals });
+  });
+  await page.clock.runFor(121000);
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__RECOVERY_WRITES__)).toEqual([]);
 });

@@ -1,24 +1,5 @@
-// Per-terminal "auto-continue on usage limit" coverage — DEFAULT ON, opt-out.
-//
-// When a terminal's agent session RUNS OUT of usage — either the on-screen Claude
-// usage-limit MODAL appears (pane-text trigger) or a rate-limit window hits its
-// cap and carries a reset time (statusline/Codex timer trigger) — T-Hub recovers
-// it automatically: dismiss the dialog (ESC) and inject the continue command so
-// the agent picks the work back up on its own. src/lib/autoContinueMount watches
-// for both triggers and does the recovery.
-//
-// Coverage is DEFAULT ON fleet-wide: every terminal is watched unless the user
-// OPTED IT OUT via the tile ⋯ menu. This store records the opt-OUT set (the
-// inverse of the old opt-in map); `isWatched` is the single question the mount +
-// the tile UI ask. Persisted so the choice survives an app restart while the
-// tmux session (and thus the terminal id) lives.
-//
-// MIGRATION — the shape changed (opt-in map → opt-out set), so this uses a NEW
-// versioned key (v2). The old v1 key was an opt-IN map; under default-ON its
-// contents are moot (an opted-in tile is watched anyway, and the tiles NOT in it
-// are now watched too), so we deliberately do NOT read it as if it were opt-out.
-// v2 simply starts empty (everyone watched); the stale v1 key is left in place
-// for rollback safety, never read here.
+// Per-terminal usage-reset alerts. Retains the legacy preference key and
+// opt-outs; terminal recovery never injects automatic keystrokes.
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 

@@ -318,11 +318,7 @@ export function Tile({
   const setTermFocusRing = useTheme((s) => s.setTermFocusRing);
   const clearTermFocusRing = useTheme((s) => s.clearTermFocusRing);
   const themeFocusRing = useTheme((s) => s.active.chrome.focusRing);
-  // Auto-continue on usage limit (the ⋯ menu): DEFAULT ON. When on, if this
-  // session runs out of usage, lib/autoContinueMount dismisses the limit dialog
-  // and types the continue command. The toggle is an OPT-OUT — a primitive
-  // boolean selector (watched unless opted out), so the tile only re-renders when
-  // THIS terminal's coverage flips.
+  // Retain the per-terminal preference for manual recovery alerts.
   const autoContinueOn = useAutoContinue((s) => s.optedOut[terminalId] !== true);
   const toggleAutoContinue = useAutoContinue((s) => s.toggle);
   // The workspace (tab) this tile belongs to, and that workspace's color identity
@@ -1356,10 +1352,7 @@ export function Tile({
               Reset to theme
             </button>
 
-            {/* Auto-continue on usage limit (DEFAULT ON, per-terminal opt-out).
-                When on, T-Hub dismisses this session's usage-limit dialog and
-                types the continue command so the agent resumes. Toggle off to
-                exclude this tile. */}
+            {/* Quota alerts never submit terminal input. */}
             <div
               className="my-2 border-t"
               style={{ borderColor: "var(--th-border)" }}
@@ -1370,10 +1363,10 @@ export function Tile({
               aria-checked={autoContinueOn}
               onClick={() => toggleAutoContinue(terminalId)}
               className="flex w-full items-center justify-between gap-2 rounded px-0.5 py-1 text-xs hover:bg-neutral-800/40"
-              title="On by default: when this session hits its usage limit, T-Hub dismisses the dialog and types the continue command automatically. Toggle off to exclude this tile."
+              title="Notify when a supported session reports that its usage window has reset. Resume manually in the terminal."
             >
               <span className="text-left leading-tight">
-                Auto-continue on usage limit
+                Usage reset alerts
               </span>
               <span
                 className="ml-2 inline-flex h-4 w-7 shrink-0 items-center rounded-full px-0.5 transition-colors"
