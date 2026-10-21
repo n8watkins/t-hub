@@ -45,3 +45,16 @@ Event replay is paginated and live queues are bounded; overflow disconnects the 
 Before production adoption, validate actual authenticated turns, approval UX, quota recovery, provider upgrades, and packaged Windows/WSL reconnects.
 The subprocess tests cover protocol behavior, duplicate delivery, lost acknowledgements, and restart safety using a deterministic provider fixture.
 They do not establish model quality or replace packaged application testing.
+
+## Authenticated turn acceptance
+
+Run `python3 scripts/runtime/live_smoke.py --live` to perform one real model turn using the provider's discovered default model.
+This consumes provider usage and is intentionally excluded from automatic CI.
+An optional `--model` selects a model from the discovered catalog.
+The check creates an ephemeral thread in a temporary read-only workspace, grants no approvals, requires the exact response marker and matching completed turn, and verifies acknowledgement replay.
+Unexpected tools, approvals, failed turns, or workspace writes fail acceptance.
+Output includes effective model, reasoning effort, CLI version, elapsed time, and a response hash rather than transcript content.
+
+The first live run on 2026-10-21 passed with Codex 0.163.0, provider-default `gpt-6.1-sol`, and provider-reported `medium` reasoning in 3.647 seconds.
+This establishes one authenticated turn and duplicate-acknowledgement replay, not quota recovery or production integration.
+The protocol follows the [official app-server documentation](https://learn.chatgpt.com/docs/app-server).
