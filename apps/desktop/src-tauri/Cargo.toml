@@ -45,14 +45,15 @@ default = []
 # "T-Hub Dev", distinct bundle id `com.t-hub.dev`, and updater disabled) so it installs
 # ALONGSIDE production. Build: `pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json`.
 devbuild = []
+# Explicit opt-in for release diagnostics, never enabled by production builds.
+diagnostic-devtools = ["tauri/devtools"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# `devtools` keeps the WebView2 devtools (F12) available in the RELEASE build so
-# the user can open the console on their machine (feat/diag).
-tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+# Release devtools are available only through diagnostic-devtools.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # Opens URLs/paths in the OS default app (the web-preview "Open externally"
 # button + external links). The JS @tauri-apps/plugin-shell needs this Rust side
 # registered + the `shell:allow-open` capability or its open() is a no-op.

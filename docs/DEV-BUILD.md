@@ -240,3 +240,12 @@ The fixed installer can then migrate the same `com.t-hub.dev` installation to `t
 | MCP server name | `t-hub` |
 | Hook marker | `__t_hub_managed__` |
 | Repository | `n8watkins/t-hub` |
+
+## Release diagnostics and content security
+
+Production builds enforce the CSP in `tauri.conf.json` and do not enable release devtools.
+Use the explicit `diagnostic-devtools` Cargo feature for a diagnostic release build; `devbuild` alone does not enable devtools.
+The application permits HTTP(S) preview frames, but remote scripts and arbitrary network connections are not allowed in the privileged parent document.
+Inline styles remain allowed for dynamic terminal geometry and themes.
+The development CSP separately permits Vite's inline bootstrap and WebSocket connection.
+The browser security test exercises local scripts, inline styles, preview isolation, and blocked script/network injection against the production policy.
