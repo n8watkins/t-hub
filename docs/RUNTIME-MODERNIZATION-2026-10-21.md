@@ -50,8 +50,28 @@ A Chromium accessibility check reproduced unreadable empty-preview text at a con
 The empty preview now uses the tile background, and the regression verifies at least 4.5:1 contrast.
 The corrected screenshot was reviewed visually.
 
-Packaged Windows acceptance is in progress using an isolated source copy and dedicated runtime state.
-Do not count a successful native build or installer extraction as completed runtime acceptance.
+Packaged Windows testing reproduced a socket mismatch: native terminal writes succeeded, but `list_terminals` returned an empty list while the sessions remained alive in tmux.
+The Windows launcher had not forwarded the desktop's configured tmux socket to the WSL helper.
+Commit `bd667edd` passes the resolved socket as an explicit environment argument without shell interpolation.
+All 59 agent tests and workspace/all-target Clippy with warnings denied pass.
+
+The rebuilt development installer passed the generated NSIS contract and exact raw-to-extracted executable validation.
+Its extracted executable then passed native WebView2 checks with isolated application state, a dedicated tmux socket, and Ubuntu-24.04.
+The checks confirmed a live helper connection, blocked inline-script injection, real terminal writes and reads through Tauri IPC, terminal discovery after renderer reload, and preserved terminal identity/output after full application process restart.
+Native terminal and empty-preview screenshots were reviewed visually.
+WebView2 reported version `155.0.4283.62`.
+The test app, dedicated tmux server, and remaining isolated helper were stopped afterward.
+
+| Candidate evidence | Value |
+| --- | --- |
+| Source commit | `bd667edd` |
+| Installer SHA-256 | `e1dbd9d87910f56025ca49cfcacd7f0f78315c8ec08e5069fd8eb08319480f97` |
+| Raw executable SHA-256 | `16612376ef648bca088352485c5e2d7f92602ccee2cca8123826e12151196fa7` |
+| Extracted executable SHA-256 | `58406fec63bad60303972a778ea0d449eb812a2c202f0ac024f74731d4e62268` |
+
+Local artifacts and probe scripts remain under `C:\Users\natha\AppData\Local\Temp\thub-validation-cgzs3cay`.
+These checks used the extracted payload and did not install, update, or uninstall the application.
+They do not establish automatic helper crash recovery, live provider permission/quota behavior, remote preview loading, or the production/development coexistence installer contract.
 
 ## Next acceptance gates
 
