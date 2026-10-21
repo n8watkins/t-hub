@@ -90,6 +90,7 @@ fn direct_agent_argv(program: &str, journal_dir: Option<&str>) -> Vec<String> {
 fn windows_agent_argv(
     distro: &str,
     verified_agent: &str,
+    socket: &str,
     journal_dir: Option<&str>,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -99,6 +100,8 @@ fn windows_agent_argv(
         "--cd".to_string(),
         "~".to_string(),
         "-e".to_string(),
+        "/usr/bin/env".to_string(),
+        format!("T_HUB_TMUX_SOCKET={socket}"),
         verified_agent.to_string(),
     ];
     if let Some(dir) = journal_dir {
@@ -128,6 +131,7 @@ pub fn launch_argv(distro: &str, verified_agent: Option<&str>) -> Result<Vec<Str
         Ok(windows_agent_argv(
             distro,
             verified_agent,
+            crate::tmux::socket(),
             journal_dir.as_deref(),
         ))
     }
@@ -1592,7 +1596,12 @@ mod tests {
         );
         let verified = "/home/natkins/.local/lib/t-hub/agents/0123456789abcdef/t-hub-agent";
         assert_eq!(
-            windows_agent_argv("Ubuntu-24.04", verified, Some(".t-hub-dev/journal dir")),
+            windows_agent_argv(
+                "Ubuntu-24.04",
+                verified,
+                "t-hub-dev",
+                Some(".t-hub-dev/journal dir")
+            ),
             vec![
                 "wsl.exe",
                 "-d",
@@ -1600,6 +1609,8 @@ mod tests {
                 "--cd",
                 "~",
                 "-e",
+                "/usr/bin/env",
+                "T_HUB_TMUX_SOCKET=t-hub-dev",
                 verified,
                 "--journal-dir",
                 ".t-hub-dev/journal dir",
