@@ -181,7 +181,6 @@ class CodexRuntime:
             raise RuntimeError("steering requires expectedTurnId")
         if method == "turn/interrupt" and not params.get("turnId"):
             raise RuntimeError("interruption requires turnId")
-        self.validate_configuration(method, params)
         digest = hashlib.sha256(json.dumps([method, params], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         previous = self.db.execute("SELECT digest,state,response FROM requests WHERE id=?", (request_id,)).fetchone()
         if previous:
@@ -190,6 +189,7 @@ class CodexRuntime:
             if previous[1] == "acknowledged":
                 return json.loads(previous[2])
             raise RuntimeError("delivery is uncertain; inspect thread state instead of replaying the mutation")
+        self.validate_configuration(method, params)
         with self.db:
             self.db.execute("INSERT INTO requests VALUES(?,?,?,?,?,?)",
                             (request_id, digest, method, "uncertain", None, time.time()))
@@ -228,7 +228,12 @@ class CodexRuntime:
                 self.process.kill()
                 await self.process.wait()
         if self.reader:
-            await self.reader
+            # A descendant can retain stdout after the direct child exits.
+            # Never let an inherited pipe prevent shutdown and lock release.
+            try:
+                await asyncio.wait_for(self.reader, timeout=5)
+            except asyncio.TimeoutError:
+                pass
         self.db.close()
         self.lock.close()
 

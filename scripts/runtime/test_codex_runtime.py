@@ -56,6 +56,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["thread"]["id"], "thread-1")
         await self.runtime.close()
         self.runtime = await self.open_runtime()
+        # A provider catalog can change between boots. Durable acknowledgements
+        # must remain replayable even when the original model is now unavailable.
+        self.runtime.models.clear()
         replay = await self.runtime.request("create-1", "thread/start", {"model":"fixture-model"})
         self.assertEqual(replay, result)
         self.assertEqual(self.counter.read_text(), "1")
