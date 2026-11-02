@@ -59,7 +59,8 @@ use crate::governor::SpawnGovernor;
 use crate::harness::{
     attest_final_launch_permissions, attest_launch_permissions, attest_respawn_launch_permissions,
     confirm_stable_launch_baseline, observe_harness_process, Harness, HarnessPermissionAttestation,
-    HarnessProcessEvidence, LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
+    HarnessProcessEvidence, HarnessRuntimePolicyReceipt, HarnessTerminalGenerationReceipt,
+    LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
@@ -1092,10 +1093,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 19;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 20;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 3;
-const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 18 && CORTANA_RUNTIME_SCHEMA_VERSION > 2);
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 4;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 19 && CORTANA_RUNTIME_SCHEMA_VERSION > 3);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -1262,6 +1263,7 @@ pub struct CortanaRuntimeAttestation {
     pub authority_generation: u64,
     pub observed_provider: String,
     pub observed_harness: String,
+    pub runtime_policy_receipt: HarnessRuntimePolicyReceipt,
     pub provider_session_id: String,
     pub conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1281,6 +1283,8 @@ pub struct CortanaCandidateRuntimeEvidence {
     pub reserved_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_generation: Option<HarnessTerminalGenerationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_attestation: Option<CortanaRuntimeAttestation>,
 }
@@ -1579,11 +1583,32 @@ fn validate_cortana_attestation(
     ] {
         validate_cortana_optional_text(value, field)?;
     }
+    let receipt = &attestation.runtime_policy_receipt;
+    validate_cortana_optional_text(
+        Some(&receipt.resolved_provider_executable),
+        "receiptResolvedProviderExecutable",
+    )?;
     if attestation.session_identity_generation == 0
         || attestation.tmux_session_id != format!("th_{}", attestation.terminal_id)
         || attestation.authority_generation != expected_authority_generation
         || attestation.observed_provider != policy.provider
         || attestation.observed_harness != policy.harness
+        || receipt.observed_provider != attestation.observed_provider
+        || receipt.observed_harness != attestation.observed_harness
+        || receipt.observed_model != policy.model
+        || receipt.observed_reasoning_effort != policy.reasoning_effort
+        || receipt.observed_permission != policy.harness_permission
+        || receipt.process_pid == 0
+        || receipt.process_start_ticks == 0
+        || receipt.executable_inode == 0
+        || receipt.terminal.session_id == 0
+        || receipt.terminal.session_created == 0
+        || receipt.terminal.window_id == 0
+        || receipt.terminal.pane_id == 0
+        || receipt.terminal.pane_pid == 0
+        || !Path::new(&receipt.resolved_provider_executable).is_absolute()
+        || receipt.resolved_provider_executable
+            != attestation.installed_runtime.resolved_executable
         || attestation.attested_at == 0
         || attestation.attested_at > enclosing_updated_at
         || attestation.attested_at < attestation.installed_runtime.observed_at
@@ -1622,6 +1647,7 @@ fn validate_cortana_candidate(
         || candidate.authority_generation != expected_authority_generation
         || candidate.reserved_at == 0
         || candidate.reserved_at > enclosing_updated_at
+        || candidate.spawned_at.is_some() != candidate.spawn_generation.is_some()
         || candidate.spawned_at.is_some_and(|spawned_at| {
             spawned_at < candidate.reserved_at || spawned_at > enclosing_updated_at
         })
@@ -1644,6 +1670,8 @@ fn validate_cortana_candidate(
             || candidate
                 .spawned_at
                 .is_none_or(|spawned_at| attestation.attested_at < spawned_at)
+            || candidate.spawn_generation.as_ref()
+                != Some(&attestation.runtime_policy_receipt.terminal)
         {
             return Err("Cortana candidate attestation does not match its spawned identity".into());
         }
@@ -2467,6 +2495,61 @@ fn migrate_cortana_runtime_v2_document(document: &mut Value) -> Result<(), Strin
                 .ok_or("schema-18 Cortana candidate lacks spawnedAt")?;
             candidate.insert("reservedAt".to_string(), Value::from(spawned_at));
         }
+    }
+    Ok(())
+}
+
+/// Lift schema-19/runtime-3 only when no prior writer claimed observations that
+/// cannot be reconstructed as typed Harness receipts. Spawned or attested state
+/// is preserved byte-for-byte behind incompatible recovery instead of being
+/// promoted with invented process evidence.
+fn migrate_cortana_runtime_v3_document(document: &mut Value) -> Result<(), String> {
+    let captains = document
+        .get_mut("captains")
+        .and_then(Value::as_array_mut)
+        .ok_or("schema-19 captains registry is missing captains")?;
+    for captain in captains {
+        let Some(runtime) = captain
+            .get_mut("cortanaRuntime")
+            .filter(|runtime| !runtime.is_null())
+        else {
+            continue;
+        };
+        let runtime = runtime
+            .as_object_mut()
+            .ok_or("schema-19 Cortana runtime is not an object")?;
+        match runtime.get("schemaVersion").and_then(Value::as_u64) {
+            Some(3) => {}
+            Some(4) => continue,
+            _ => return Err("schema-19 Cortana runtime has an unsupported nested version".into()),
+        }
+        if runtime
+            .get("runtimeAttestation")
+            .is_some_and(|attestation| !attestation.is_null())
+        {
+            return Err("schema-19 Ready evidence lacks a typed Harness receipt".into());
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .filter(|intent| !intent.is_null())
+        {
+            let intent = intent
+                .as_object_mut()
+                .ok_or("schema-19 Cortana ensure intent is not an object")?;
+            if intent.get("schemaVersion").and_then(Value::as_u64) != Some(3) {
+                return Err("schema-19 Cortana ensure intent has an unsupported version".into());
+            }
+            if intent
+                .get("candidate")
+                .and_then(Value::as_object)
+                .and_then(|candidate| candidate.get("spawnedAt"))
+                .is_some_and(|spawned_at| !spawned_at.is_null())
+            {
+                return Err("schema-19 spawned evidence lacks a typed tmux generation".into());
+            }
+            intent.insert("schemaVersion".to_string(), Value::from(4));
+        }
+        runtime.insert("schemaVersion".to_string(), Value::from(4));
     }
     Ok(())
 }
@@ -4229,6 +4312,13 @@ impl CaptainsRegistry {
             .is_some_and(|releases| !releases.is_empty());
         if schema_version == 18 {
             migrate_cortana_runtime_v2_document(&mut document).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+        if matches!(schema_version, 18 | 19) {
+            migrate_cortana_runtime_v3_document(&mut document).map_err(|_| {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -6289,6 +6379,7 @@ impl CaptainsRegistry {
         }
         if intent.phase != CortanaEnsurePhase::Prepared
             || candidate.spawned_at.is_some()
+            || candidate.spawn_generation.is_some()
             || candidate.runtime_attestation.is_some()
         {
             return Err("Cortana ensure is not prepared for candidate reservation".into());
@@ -6311,6 +6402,7 @@ impl CaptainsRegistry {
         request_digest: &str,
         terminal_id: &str,
         spawned_at: u64,
+        spawn_generation: HarnessTerminalGenerationReceipt,
         observed_at: u64,
     ) -> Result<CaptainRecord, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
@@ -6340,7 +6432,9 @@ impl CaptainsRegistry {
             return Err("Cortana spawned terminal does not match its reservation".into());
         }
         if intent.phase == CortanaEnsurePhase::CandidateSpawned {
-            if candidate.spawned_at == Some(spawned_at) {
+            if candidate.spawned_at == Some(spawned_at)
+                && candidate.spawn_generation.as_ref() == Some(&spawn_generation)
+            {
                 return Ok(captain.clone());
             }
             return Err("Cortana ensure already recorded different spawn evidence".into());
@@ -6353,6 +6447,7 @@ impl CaptainsRegistry {
         }
         let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
         candidate.spawned_at = Some(spawned_at);
+        candidate.spawn_generation = Some(spawn_generation);
         intent.phase = CortanaEnsurePhase::CandidateSpawned;
         intent.updated_at = timestamp;
         runtime.updated_at = timestamp;

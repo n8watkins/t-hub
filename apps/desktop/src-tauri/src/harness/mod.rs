@@ -159,7 +159,39 @@ pub struct HarnessProcessEvidence {
     start_ticks: u64,
     executable_device: u64,
     executable_inode: u64,
+    resolved_process_executable: String,
     argv: Vec<String>,
+}
+
+/// Non-secret tmux generation proven by one bounded foreground-process read.
+/// Recovery journals this before it treats a reserved terminal as spawned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessTerminalGenerationReceipt {
+    pub session_id: u64,
+    pub session_created: u64,
+    pub window_id: u64,
+    pub pane_id: u64,
+    pub pane_pid: u32,
+}
+
+/// Adapter-produced receipt for the effective provider runtime. Callers cannot
+/// obtain this from desired policy alone: construction runs provider-native
+/// permission, model, reasoning, executable, and process-generation checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessRuntimePolicyReceipt {
+    pub terminal: HarnessTerminalGenerationReceipt,
+    pub process_pid: u32,
+    pub process_start_ticks: u64,
+    pub executable_device: u64,
+    pub executable_inode: u64,
+    pub resolved_provider_executable: String,
+    pub observed_provider: String,
+    pub observed_harness: String,
+    pub observed_model: String,
+    pub observed_reasoning_effort: String,
+    pub observed_permission: PermMode,
 }
 
 impl HarnessProcessEvidence {
@@ -227,6 +259,7 @@ impl HarnessProcessEvidence {
             start_ticks,
             executable_device,
             executable_inode,
+            resolved_process_executable: format!("/usr/bin/{}", executable_name(argv[0])),
             argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
         }
     }
@@ -245,6 +278,18 @@ impl HarnessProcessEvidence {
             && self.terminal.window_id == pane.window_id
             && self.terminal.pane_id == pane.pane_id
             && self.terminal.pane_pid == pane.pane_pid
+    }
+}
+
+pub fn terminal_generation_receipt(
+    evidence: &HarnessProcessEvidence,
+) -> HarnessTerminalGenerationReceipt {
+    HarnessTerminalGenerationReceipt {
+        session_id: evidence.terminal.session_id,
+        session_created: evidence.terminal.session_created,
+        window_id: evidence.terminal.window_id,
+        pane_id: evidence.terminal.pane_id,
+        pane_pid: evidence.terminal.pane_pid,
     }
 }
 
@@ -497,6 +542,9 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 case "$1:$2" in *[!0-9:]*) exit 24;; esac
 executable_device=$1
 executable_inode=$2
+resolved_process_executable=$(readlink -f "/proc/$foreground_pid/exe")
+case "$resolved_process_executable" in /*) ;; *) exit 26;; esac
+[ "${#resolved_process_executable}" -le 16384 ]
 ancestry=
 ancestry_count=0
 current_pid=$foreground_pid
@@ -537,9 +585,10 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 [ "$#" -eq 2 ]
 [ "$1" = "$executable_device" ]
 [ "$2" = "$executable_inode" ]
-printf 'THPA3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+printf 'THPA4\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
-    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" "$ancestry"
+    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" \
+    "$resolved_process_executable" "$ancestry"
 cat "$cmdline"
 "#;
 
@@ -581,8 +630,8 @@ cat "$cmdline"
 }
 
 fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
-    let mut fields = bytes.splitn(12, |byte| *byte == b'\n');
-    if fields.next() != Some(b"THPA3".as_slice()) {
+    let mut fields = bytes.splitn(13, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPA4".as_slice()) {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     let terminal = TerminalGeneration {
@@ -600,6 +649,20 @@ fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, Launch
     let start_ticks = parse_ascii_number(fields.next())?;
     let executable_device = parse_ascii_number(fields.next())?;
     let executable_inode = parse_ascii_number(fields.next())?;
+    let resolved_process_executable = std::str::from_utf8(
+        fields
+            .next()
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+    )
+    .ok()
+    .filter(|path| {
+        !path.is_empty()
+            && path.len() <= 16_384
+            && PathBuf::from(path).is_absolute()
+            && !path.chars().any(char::is_control)
+    })
+    .ok_or(LaunchAttestationError::UnreadableEvidence)?
+    .to_string();
     let ancestry = parse_process_ancestry(fields.next())?;
     let cmdline = fields
         .next()
@@ -631,6 +694,7 @@ fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, Launch
         start_ticks,
         executable_device,
         executable_inode,
+        resolved_process_executable,
         argv,
     })
 }
@@ -723,6 +787,31 @@ pub(crate) fn provider_executable_path(
         .ok_or(LaunchAttestationError::UnreadableEvidence)
 }
 
+/// Resolve the exact provider executable represented by foreground evidence.
+/// A native provider launched through PATH is bound to `/proc/<pid>/exe`; a
+/// script provider behind an accepted node-style runtime must name an absolute
+/// script path. Relative wrapper arguments fail closed.
+pub(crate) fn resolved_provider_executable_path(
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+) -> Result<PathBuf, LaunchAttestationError> {
+    let (provider, provider_index) =
+        process_provider(&evidence.argv).ok_or(LaunchAttestationError::WrapperObscured)?;
+    if provider != expected {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    if provider_index == 0 {
+        return Ok(PathBuf::from(&evidence.resolved_process_executable));
+    }
+    let provider_path = evidence
+        .argv
+        .get(provider_index)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(LaunchAttestationError::WrapperObscured)?;
+    std::fs::canonicalize(provider_path).map_err(|_| LaunchAttestationError::UnreadableEvidence)
+}
+
 /// Attest the exact model and reasoning selection from provider-native argv.
 /// Missing, repeated, malformed, or substituted options fail closed.
 pub(crate) fn attest_runtime_policy(
@@ -749,6 +838,44 @@ pub(crate) fn attest_runtime_policy(
         return Err(LaunchAttestationError::WrongReasoningEffort);
     }
     Ok(())
+}
+
+/// Produce one typed receipt only after every effective runtime-policy axis and
+/// the exact foreground process generation have been verified.
+pub(crate) fn attest_runtime_policy_receipt(
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+) -> Result<HarnessRuntimePolicyReceipt, LaunchAttestationError> {
+    expected
+        .adapter()
+        .attest_permissions(evidence, expected_permission)?;
+    attest_runtime_policy(
+        evidence,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+    )?;
+    let executable = resolved_provider_executable_path(evidence, expected)?;
+    let executable = executable
+        .to_str()
+        .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    Ok(HarnessRuntimePolicyReceipt {
+        terminal: terminal_generation_receipt(evidence),
+        process_pid: evidence.pid,
+        process_start_ticks: evidence.start_ticks,
+        executable_device: evidence.executable_device,
+        executable_inode: evidence.executable_inode,
+        resolved_provider_executable: executable.to_string(),
+        observed_provider: expected.as_provider().to_string(),
+        observed_harness: expected.as_provider().to_string(),
+        observed_model: expected_model.to_string(),
+        observed_reasoning_effort: expected_reasoning_effort.to_string(),
+        observed_permission: expected_permission,
+    })
 }
 
 fn unique_option_value<'a>(args: &'a [String], names: &[&str]) -> Result<Option<&'a str>, ()> {
@@ -1477,7 +1604,7 @@ mod tests {
     #[test]
     fn process_evidence_parser_is_bounded_and_strict() {
         let parsed = parse_process_evidence(
-            b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\ncodex\0--sandbox\0read-only\0",
+            b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex\0--sandbox\0read-only\0",
         )
         .unwrap();
         assert_eq!(parsed.identity(), (42, 900));
@@ -1486,13 +1613,13 @@ mod tests {
 
         assert_eq!(
             parse_process_evidence(
-                b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\ncodex",
+                b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex",
             ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
         assert_eq!(
             parse_process_evidence(
-                b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900,7:100\ncodex\0",
+                b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900,7:100\ncodex\0",
             ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
