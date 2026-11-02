@@ -34,7 +34,8 @@ use std::sync::Mutex;
 /// existing tier token (`T_HUB_CONTROL_TOKEN`). The in-session client presents it so
 /// the app can resolve the calling session's identity.
 pub const SESSION_TOKEN_ENV: &str = "T_HUB_SESSION_TOKEN";
-const IDENTITIES_SCHEMA_VERSION: u32 = 1;
+const IDENTITIES_SCHEMA_VERSION: u32 = 2;
+const LEGACY_IDENTITIES_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_GENERATION_WATERMARK_FORMAT: &str = "t-hub:identity-generation-watermark:v1";
 
@@ -101,6 +102,11 @@ pub struct SessionIdentity {
     /// registry regardless, this is the fast-path attribution copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ship_slug: Option<String>,
+    /// Non-secret idempotency key for a durable operation that owns this identity.
+    /// This lets restart adopt a mint or bind that completed before the operation's
+    /// cross-store journal transition was persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_key: Option<String>,
     /// Epoch-ms minted.
     pub minted_at: u64,
 }
@@ -116,6 +122,7 @@ impl std::fmt::Debug for SessionIdentity {
             .field("role", &self.role)
             .field("session_tile", &self.session_tile)
             .field("ship_slug", &self.ship_slug)
+            .field("allocation_key", &self.allocation_key)
             .field("minted_at", &self.minted_at)
             .finish()
     }
@@ -227,7 +234,8 @@ impl IdentityGenerationWatermark {
     fn validate(&self) -> Result<(), String> {
         if self.schema_version != IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION
             || self.format_identity != IDENTITY_GENERATION_WATERMARK_FORMAT
-            || self.identities_schema_version != IDENTITIES_SCHEMA_VERSION
+            || !(LEGACY_IDENTITIES_SCHEMA_VERSION..=IDENTITIES_SCHEMA_VERSION)
+                .contains(&self.identities_schema_version)
         {
             return Err("identity generation watermark is malformed or unsupported".into());
         }
@@ -273,6 +281,7 @@ fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), Str
         ));
     }
     let mut generations = HashSet::new();
+    let mut allocation_keys = HashSet::new();
     let mut maximum = 0;
     for (key, identity) in &snapshot.identities {
         if key != &identity.id {
@@ -286,6 +295,12 @@ fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), Str
                 "identity store contains a zero, duplicate, or out-of-range generation".into(),
             );
         }
+        if let Some(allocation_key) = identity.allocation_key.as_deref() {
+            validate_allocation_key(allocation_key)?;
+            if !allocation_keys.insert(allocation_key) {
+                return Err("identity store contains a duplicate operation allocation key".into());
+            }
+        }
         maximum = maximum.max(identity.generation);
     }
     if maximum > snapshot.generation
@@ -296,7 +311,56 @@ fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), Str
     Ok(())
 }
 
-fn read_identities_snapshot(path: &PathBuf) -> Result<(IdentitiesSnapshot, bool), String> {
+fn validate_allocation_key(allocation_key: &str) -> Result<(), String> {
+    if allocation_key.len() < 3
+        || allocation_key.len() > 160
+        || allocation_key.trim() != allocation_key
+        || allocation_key.chars().any(char::is_control)
+        || !allocation_key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b':' | b'-' | b'_')
+        })
+    {
+        return Err("identity operation allocation key is malformed".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySnapshotSource {
+    Current,
+    VersionedLegacy,
+    UnversionedLegacy,
+}
+
+fn reject_legacy_allocation_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+) -> Result<(), String> {
+    let identities = object
+        .get("identities")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "legacy identity store '{}' has no identities object",
+                path.display()
+            )
+        })?;
+    if identities.values().any(|identity| {
+        identity.as_object().is_some_and(|identity| {
+            identity.contains_key("allocationKey") || identity.contains_key("allocation_key")
+        })
+    }) {
+        return Err(format!(
+            "legacy identity store '{}' contains a post-v1 allocation field",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_identities_snapshot(
+    path: &PathBuf,
+) -> Result<(IdentitiesSnapshot, IdentitySnapshotSource), String> {
     let source = std::fs::read(path).map_err(|error| {
         format!(
             "identity store '{}' could not be read: {error}",
@@ -322,22 +386,35 @@ fn read_identities_snapshot(path: &PathBuf) -> Result<(IdentitiesSnapshot, bool)
                 path.display()
             )
         })?;
-        if version != IDENTITIES_SCHEMA_VERSION as u64 {
+        if !(LEGACY_IDENTITIES_SCHEMA_VERSION as u64..=IDENTITIES_SCHEMA_VERSION as u64)
+            .contains(&version)
+        {
             return Err(format!(
                 "identity store '{}' uses unsupported schemaVersion {version}",
                 path.display()
             ));
         }
-        let snapshot: IdentitiesSnapshot = serde_json::from_value(document).map_err(|error| {
-            format!(
-                "identity store '{}' has an invalid current-schema shape: {error}",
-                path.display()
-            )
-        })?;
+        if version < IDENTITIES_SCHEMA_VERSION as u64 {
+            reject_legacy_allocation_fields(object, path)?;
+        }
+        let mut snapshot: IdentitiesSnapshot =
+            serde_json::from_value(document).map_err(|error| {
+                format!(
+                    "identity store '{}' has an invalid current-schema shape: {error}",
+                    path.display()
+                )
+            })?;
+        let source = if version < IDENTITIES_SCHEMA_VERSION as u64 {
+            IdentitySnapshotSource::VersionedLegacy
+        } else {
+            IdentitySnapshotSource::Current
+        };
+        snapshot.schema_version = IDENTITIES_SCHEMA_VERSION;
         validate_identities_snapshot(&snapshot)?;
-        return Ok((snapshot, false));
+        return Ok((snapshot, source));
     }
 
+    reject_legacy_allocation_fields(object, path)?;
     let generation_counter_present = object.contains_key("generation");
     let identities = object
         .get("identities")
@@ -387,7 +464,7 @@ fn read_identities_snapshot(path: &PathBuf) -> Result<(IdentitiesSnapshot, bool)
         }
     }
     validate_identities_snapshot(&snapshot)?;
-    Ok((snapshot, true))
+    Ok((snapshot, IdentitySnapshotSource::UnversionedLegacy))
 }
 
 /// Identity-secret TTL in ms, from `T_HUB_IDENTITY_TTL_SECS` (seconds). `0` (the
@@ -457,7 +534,10 @@ impl IdentityStore {
                     ),
                     watermark,
                 ),
-                (Ok(Some((_snapshot, true))), Ok(Some(watermark))) => (
+                (
+                    Ok(Some((_snapshot, IdentitySnapshotSource::UnversionedLegacy))),
+                    Ok(Some(watermark)),
+                ) => (
                     IdentitiesSnapshot::default(),
                     false,
                     Some(
@@ -466,7 +546,7 @@ impl IdentityStore {
                     ),
                     watermark,
                 ),
-                (Ok(Some((snapshot, false))), Ok(Some(watermark)))
+                (Ok(Some((snapshot, _source))), Ok(Some(watermark)))
                     if snapshot.generation != watermark.generation_high_water =>
                 {
                     (
@@ -479,14 +559,35 @@ impl IdentityStore {
                         watermark,
                     )
                 }
-                (Ok(Some((snapshot, upgraded))), Ok(Some(watermark))) => {
-                    (snapshot, upgraded, None, watermark)
+                (
+                    Ok(Some((_snapshot, IdentitySnapshotSource::Current))),
+                    Ok(Some(watermark)),
+                )
+                    if watermark.identities_schema_version != IDENTITIES_SCHEMA_VERSION =>
+                {
+                    (
+                        IdentitiesSnapshot::default(),
+                        false,
+                        Some(
+                            "identity generation watermark schema does not match identities.json"
+                                .to_string(),
+                        ),
+                        watermark,
+                    )
                 }
-                (Ok(Some((snapshot, upgraded))), Ok(None)) => {
+                (Ok(Some((snapshot, source))), Ok(Some(watermark))) => {
+                    (
+                        snapshot,
+                        source != IdentitySnapshotSource::Current,
+                        None,
+                        watermark,
+                    )
+                }
+                (Ok(Some((snapshot, source))), Ok(None)) => {
                     let generation = snapshot.generation;
                     (
                         snapshot,
-                        upgraded,
+                        source != IdentitySnapshotSource::Current,
                         None,
                         IdentityGenerationWatermark::current(generation),
                     )
@@ -601,7 +702,10 @@ impl IdentityStore {
                     "identity store generation would regress below its durable watermark".into(),
                 );
             }
-            if snap.generation > watermark.generation_high_water || !watermark_path.exists() {
+            if snap.generation > watermark.generation_high_water
+                || watermark.identities_schema_version != IDENTITIES_SCHEMA_VERSION
+                || !watermark_path.exists()
+            {
                 let advanced = IdentityGenerationWatermark::current(snap.generation);
                 write_generation_watermark(watermark_path, &advanced).map_err(|error| {
                     format!(
@@ -645,7 +749,40 @@ impl IdentityStore {
     /// could be resolved at spawn (a crew inherits its spawner's ship), else `None`.
     /// Everything else matches [`mint`](Self::mint) - one seam, wider payload.
     pub fn mint_for(&self, role: Role, ship: Option<String>) -> Result<SessionIdentity, String> {
+        self.mint_for_allocation(role, ship, None)
+    }
+
+    /// Mint once for a durable operation. Replays with the exact role and ship
+    /// return the original identity, including after process restart.
+    pub fn mint_for_operation(
+        &self,
+        role: Role,
+        ship: Option<String>,
+        allocation_key: &str,
+    ) -> Result<SessionIdentity, String> {
+        validate_allocation_key(allocation_key)?;
+        self.mint_for_allocation(role, ship, Some(allocation_key.to_string()))
+    }
+
+    fn mint_for_allocation(
+        &self,
+        role: Role,
+        ship: Option<String>,
+        allocation_key: Option<String>,
+    ) -> Result<SessionIdentity, String> {
         let mut snap = self.lock();
+        if let Some(allocation_key) = allocation_key.as_deref() {
+            if let Some(existing) = snap
+                .identities
+                .values()
+                .find(|identity| identity.allocation_key.as_deref() == Some(allocation_key))
+            {
+                if existing.role != role || existing.ship_slug != ship {
+                    return Err("identity operation allocation replay changed role or ship".into());
+                }
+                return Ok(existing.clone());
+            }
+        }
         let durable_high_water = self
             .generation_watermark
             .lock()
@@ -668,6 +805,7 @@ impl IdentityStore {
             role,
             session_tile: None,
             ship_slug: ship,
+            allocation_key,
             minted_at: now_ms(),
         };
         let previous = snap.clone();
@@ -691,6 +829,32 @@ impl IdentityStore {
             .get_mut(id)
             .ok_or_else(|| format!("cannot bind unknown identity '{id}'"))?;
         ident.session_tile = Some(tile.to_string());
+        if let Err(error) = self.persist(&snap) {
+            *snap = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Bind an operation-owned identity exactly once. A replay of the same tile is
+    /// idempotent; a different tile fails closed without mutating persistence.
+    pub fn bind_tile_exact(&self, id: &str, tile: &str) -> Result<(), String> {
+        let mut snap = self.lock();
+        let previous = snap.clone();
+        let ident = snap
+            .identities
+            .get_mut(id)
+            .ok_or_else(|| format!("cannot bind unknown identity '{id}'"))?;
+        if ident.allocation_key.is_none() {
+            return Err("exact binding requires an operation-owned identity".into());
+        }
+        match ident.session_tile.as_deref() {
+            Some(existing) if existing == tile => return Ok(()),
+            Some(_) => {
+                return Err("operation-owned identity is already bound to another tile".into())
+            }
+            None => ident.session_tile = Some(tile.to_string()),
+        }
         if let Err(error) = self.persist(&snap) {
             *snap = previous;
             return Err(error);
@@ -757,11 +921,9 @@ impl IdentityStore {
         let mut snap = self.lock();
         let previous = snap.clone();
         let before = snap.identities.len();
-        snap.identities
-            .retain(|_, ident| match ident.session_tile.as_deref() {
-                Some(tile) => is_live(tile),
-                None => false,
-            });
+        snap.identities.retain(|_, ident| {
+            ident.allocation_key.is_some() || ident.session_tile.as_deref().is_some_and(&is_live)
+        });
         let removed = before - snap.identities.len();
         if removed > 0 {
             if let Err(error) = self.persist(&snap) {
@@ -1230,7 +1392,142 @@ mod tests {
     }
 
     #[test]
-    fn old_writer_round_trip_after_v1_is_detected_and_never_reuses_retired_generation() {
+    fn schema_v1_migrates_with_anchor_first_crash_recovery_and_no_invented_allocation() {
+        let v1 = serde_json::json!({
+            "schemaVersion": 1,
+            "generation": 4,
+            "identities": {
+                "identity-four": {
+                    "id": "identity-four",
+                    "generation": 4,
+                    "secret": "secret-four",
+                    "role": "cortana",
+                    "sessionTile": "cor-old",
+                    "shipSlug": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        for (label, anchor_schema) in [("normal", 1_u32), ("anchor-first-crash", 2_u32)] {
+            let path = temp_path();
+            let watermark_path = generation_watermark_path(&path);
+            std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+            let watermark = IdentityGenerationWatermark {
+                schema_version: IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+                format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.into(),
+                identities_schema_version: anchor_schema,
+                generation_high_water: 4,
+            };
+            std::fs::write(
+                &watermark_path,
+                serde_json::to_vec_pretty(&watermark).unwrap(),
+            )
+            .unwrap();
+
+            let store = IdentityStore::load(path.clone());
+            assert!(store.write_blocked.is_none(), "{label} was blocked");
+            let identity = store.get("identity-four").unwrap();
+            assert_eq!(identity.generation, 4);
+            assert!(identity.allocation_key.is_none());
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(persisted["schemaVersion"], IDENTITIES_SCHEMA_VERSION);
+            assert_eq!(
+                read_generation_watermark(&watermark_path)
+                    .unwrap()
+                    .identities_schema_version,
+                IDENTITIES_SCHEMA_VERSION
+            );
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(watermark_path);
+        }
+    }
+
+    #[test]
+    fn legacy_allocation_field_hybrids_fail_closed_and_preserve_source_bytes() {
+        for schema_version in [Some(1_u64), None] {
+            for field in ["allocationKey", "allocation_key"] {
+                let path = temp_path();
+                let mut hybrid = serde_json::json!({
+                    "generation": 4,
+                    "identities": {
+                        "identity-four": {
+                            "id": "identity-four",
+                            "generation": 4,
+                            "secret": "secret-four",
+                            "role": "cortana",
+                            "sessionTile": "cor-old",
+                            "shipSlug": "cortana",
+                            "mintedAt": 10
+                        }
+                    },
+                    "revoked": []
+                });
+                if let Some(schema_version) = schema_version {
+                    hybrid["schemaVersion"] = serde_json::Value::from(schema_version);
+                }
+                hybrid["identities"]["identity-four"][field] =
+                    serde_json::Value::from("cortana:ensure:hybrid");
+                let source = serde_json::to_vec_pretty(&hybrid).unwrap();
+                std::fs::write(&path, &source).unwrap();
+
+                let store = IdentityStore::load(path.clone());
+                assert!(store
+                    .write_blocked
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("post-v1 allocation field")));
+                assert!(store.mint(Role::Crew).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), source);
+                assert!(!generation_watermark_path(&path).exists());
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_operation_allocations_fail_closed_and_preserve_bytes() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let duplicate = serde_json::json!({
+            "schemaVersion": IDENTITIES_SCHEMA_VERSION,
+            "generation": 2,
+            "identities": {
+                "identity-one": {
+                    "id": "identity-one",
+                    "generation": 1,
+                    "secret": "secret-one",
+                    "role": "cortana",
+                    "allocationKey": "operation:duplicate",
+                    "mintedAt": 10
+                },
+                "identity-two": {
+                    "id": "identity-two",
+                    "generation": 2,
+                    "secret": "secret-two",
+                    "role": "cortana",
+                    "allocationKey": "operation:duplicate",
+                    "mintedAt": 20
+                }
+            },
+            "revoked": []
+        });
+        let source = serde_json::to_vec_pretty(&duplicate).unwrap();
+        let watermark =
+            serde_json::to_vec_pretty(&IdentityGenerationWatermark::current(2)).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        std::fs::write(&watermark_path, &watermark).unwrap();
+        let store = IdentityStore::load(path.clone());
+        assert!(store.write_blocked.is_some());
+        assert!(store.mint(Role::Crew).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn old_writer_round_trip_after_v2_is_detected_and_never_reuses_retired_generation() {
         let path = temp_path();
         let watermark_path = generation_watermark_path(&path);
         let (survivor, retired_high_water) = {
@@ -1644,6 +1941,66 @@ mod tests {
         assert_eq!(crew.stamp().ship_slug.as_deref(), Some("t-hub-app"));
         let plain = store.mint(Role::Crew).unwrap();
         assert!(plain.ship_slug.is_none());
+    }
+
+    #[test]
+    fn operation_allocation_replays_across_restart_and_binds_exactly_once() {
+        let path = temp_path();
+        let allocation_key =
+            "cortana:ensure:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let first = {
+            let store = IdentityStore::load(path.clone());
+            let identity = store
+                .mint_for_operation(Role::Cortana, Some("cortana".into()), allocation_key)
+                .unwrap();
+            assert_eq!(
+                store
+                    .mint_for_operation(Role::Cortana, Some("cortana".into()), allocation_key,)
+                    .unwrap()
+                    .id,
+                identity.id
+            );
+            identity
+        };
+        let store = IdentityStore::load(path.clone());
+        let replay = store
+            .mint_for_operation(Role::Cortana, Some("cortana".into()), allocation_key)
+            .unwrap();
+        assert_eq!(replay.id, first.id);
+        assert_eq!(replay.generation, first.generation);
+        assert_eq!(replay.secret, first.secret);
+        assert_eq!(store.len(), 1);
+        store.bind_tile_exact(&replay.id, "cor-aaaaaaaa").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        store.bind_tile_exact(&replay.id, "cor-aaaaaaaa").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(store.bind_tile_exact(&replay.id, "cor-bbbbbbbb").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(store
+            .mint_for_operation(Role::Crew, Some("cortana".into()), allocation_key)
+            .is_err());
+        let ordinary = store.mint(Role::Crew).unwrap();
+        assert!(store
+            .bind_tile_exact(&ordinary.id, "ordinary-tile")
+            .unwrap_err()
+            .contains("operation-owned"));
+        let _ = std::fs::remove_file(generation_watermark_path(&path));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn operation_owned_unbound_or_dead_identity_survives_generic_pruning_for_adoption() {
+        let store = IdentityStore::ephemeral();
+        let unbound = store
+            .mint_for_operation(Role::Cortana, Some("cortana".into()), "operation:unbound")
+            .unwrap();
+        let bound = store
+            .mint_for_operation(Role::Cortana, Some("cortana".into()), "operation:bound")
+            .unwrap();
+        store.bind_tile_exact(&bound.id, "dead-candidate").unwrap();
+        assert_eq!(store.prune_dead(|_| false).unwrap(), 0);
+        assert_eq!(store.get(&unbound.id).unwrap().id, unbound.id);
+        assert_eq!(store.get(&bound.id).unwrap().id, bound.id);
     }
 
     #[test]
