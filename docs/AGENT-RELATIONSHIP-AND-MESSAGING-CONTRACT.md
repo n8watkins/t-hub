@@ -355,7 +355,9 @@ The request names one stable `requestId`, `captainSessionId`, `shipSlug`, `proje
 T-Hub authenticates the exact active owning Captain and verifies every named ownership binding before enqueueing.
 Foreign, missing, stopped, or exited agent sessions are rejected without an inbox or Assignment mutation.
 The durable inbox recipient is the `agentSessionId`, while any terminal binding remains only a later delivery route.
-The inbox persists the request ID and immutable message signature so an identical retry after restart returns the original sequence and a changed retry is rejected.
+The inbox persists the request ID and a signature of the complete typed request semantics so an identical retry after restart returns the original sequence and a changed message, scope, identity, or Assignment is rejected.
+When a follow-up replaces Assignment metadata, T-Hub persists the inbox record as held, commits the Assignment replacement, and only then activates the message for delivery.
+A failure before activation must leave the instruction non-deliverable and allow the same authenticated request to converge on retry.
 The optional `replacementAssignment` field is the only follow-up field that replaces durable agent Assignment metadata.
 Omitting `replacementAssignment` means the follow-up is inside the existing scope and must leave Assignment metadata unchanged.
 This operation must not fall back to `send_text`, terminal typing, or a foreign Captain route.
