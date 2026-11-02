@@ -2611,6 +2611,29 @@ fn captain_control_continuity_process_merge_gate() {
     let followup_replay_data = tool_structured(&followup_replay);
     assert_eq!(followup_replay_data["messageSeq"], 0);
     assert_eq!(followup_replay_data["idempotentReplay"], true);
+    let changed_scope_replay = call_tool(
+        &captain,
+        263,
+        "agent_followup",
+        json!({
+            "requestId": "continuity-followup-1",
+            "captainSessionId": CONTINUITY_CAPTAIN,
+            "shipSlug": "continuity-ship",
+            "projectId": "continuity-project",
+            "agentSessionId": CONTINUITY_AGENT,
+            "message": "Continue the durable continuity proof.",
+            "replacementAssignment": "Changed replay must not mutate"
+        }),
+    );
+    assert!(tool_error_text(&changed_scope_replay).contains("different"));
+    let persisted_after_conflict: Value = serde_json::from_slice(
+        &fs::read(control.temp_dir.join("captains.json")).expect("read continuity registry"),
+    )
+    .expect("parse continuity registry");
+    assert_eq!(
+        persisted_after_conflict["agentSessions"][0]["assignment"],
+        "Original continuity Assignment"
+    );
     let admin_post_restart = call_tool(
         &ship_admin,
         261,
