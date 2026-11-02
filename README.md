@@ -1,5 +1,7 @@
 # T-Hub
 
+> **Archived 2026-11-01, not maintained.** See [ARCHIVE_NOTES.md](./ARCHIVE_NOTES.md) before using or deploying anything here.
+
 T-Hub is a **terminal-first command center for running and supervising many persistent Codex and Claude coding-agent sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
 ## Status - post-Powder agent-session candidate
