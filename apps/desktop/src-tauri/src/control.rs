@@ -1092,10 +1092,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 18;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 19;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 2;
-const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 17 && CORTANA_RUNTIME_SCHEMA_VERSION > 1);
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 3;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 18 && CORTANA_RUNTIME_SCHEMA_VERSION > 2);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -1225,7 +1225,9 @@ impl CortanaRuntimePolicy {
 #[serde(rename_all = "camelCase")]
 pub enum CortanaEnsurePhase {
     Prepared,
+    CandidateReserved,
     CandidateSpawned,
+    Attested,
     Committed,
     CleanupPending,
     Failed,
@@ -1276,7 +1278,9 @@ pub struct CortanaCandidateRuntimeEvidence {
     pub control_identity_id: String,
     pub session_identity_generation: u64,
     pub authority_generation: u64,
-    pub spawned_at: u64,
+    pub reserved_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_attestation: Option<CortanaRuntimeAttestation>,
 }
@@ -1616,8 +1620,13 @@ fn validate_cortana_candidate(
     if candidate.tmux_session_id != format!("th_{}", candidate.terminal_id)
         || candidate.session_identity_generation == 0
         || candidate.authority_generation != expected_authority_generation
-        || candidate.spawned_at == 0
-        || candidate.spawned_at > enclosing_updated_at
+        || candidate.reserved_at == 0
+        || candidate.reserved_at > enclosing_updated_at
+        || candidate
+            .spawned_at
+            .is_some_and(|spawned_at| {
+                spawned_at < candidate.reserved_at || spawned_at > enclosing_updated_at
+            })
     {
         return Err(
             "Cortana candidate evidence is not bound to its exact session authority".into(),
@@ -1634,7 +1643,9 @@ fn validate_cortana_candidate(
             || attestation.session_identity_generation != candidate.session_identity_generation
             || attestation.terminal_id != candidate.terminal_id
             || attestation.tmux_session_id != candidate.tmux_session_id
-            || attestation.attested_at < candidate.spawned_at
+            || candidate
+                .spawned_at
+                .is_none_or(|spawned_at| attestation.attested_at < spawned_at)
         {
             return Err("Cortana candidate attestation does not match its spawned identity".into());
         }
@@ -1889,7 +1900,7 @@ fn validate_cortana_runtime(
                 target_generation,
                 intent.updated_at,
             )?;
-            if candidate.spawned_at < intent.created_at {
+            if candidate.reserved_at < intent.created_at {
                 return Err("Cortana candidate evidence predates its immutable request".into());
             }
         }
@@ -1910,12 +1921,32 @@ fn validate_cortana_runtime(
                     );
                 }
             }
+            CortanaEnsurePhase::CandidateReserved => {
+                if intent.request.expected_generation != runtime.generation
+                    || intent.candidate.as_ref().is_none_or(|candidate| {
+                        candidate.spawned_at.is_some() || candidate.runtime_attestation.is_some()
+                    })
+                    || runtime.lifecycle
+                        != if runtime.generation == 0 {
+                            CortanaRuntimeLifecycle::Starting
+                        } else {
+                            CortanaRuntimeLifecycle::Restoring
+                        }
+                {
+                    return Err(
+                        "Cortana reserved candidate does not match its pre-spawn identity".into(),
+                    );
+                }
+            }
             CortanaEnsurePhase::CandidateSpawned => {
                 if intent.request.expected_generation != runtime.generation
                     || intent
                         .candidate
                         .as_ref()
-                        .is_none_or(|candidate| candidate.runtime_attestation.is_some())
+                        .is_none_or(|candidate| {
+                            candidate.spawned_at.is_none()
+                                || candidate.runtime_attestation.is_some()
+                        })
                     || runtime.lifecycle
                         != if runtime.generation == 0 {
                             CortanaRuntimeLifecycle::Starting
@@ -1925,6 +1956,24 @@ fn validate_cortana_runtime(
                 {
                     return Err(
                         "Cortana spawned candidate lacks distinct durable spawn evidence".into(),
+                    );
+                }
+            }
+            CortanaEnsurePhase::Attested => {
+                if intent.request.expected_generation != runtime.generation
+                    || intent.candidate.as_ref().is_none_or(|candidate| {
+                        candidate.spawned_at.is_none()
+                            || candidate.runtime_attestation.is_none()
+                    })
+                    || runtime.lifecycle
+                        != if runtime.generation == 0 {
+                            CortanaRuntimeLifecycle::Starting
+                        } else {
+                            CortanaRuntimeLifecycle::Restoring
+                        }
+                {
+                    return Err(
+                        "Cortana attested candidate does not match its pre-commit identity".into(),
                     );
                 }
             }
@@ -2369,6 +2418,64 @@ fn releases_contain_unknown_fields(snapshot: &Value) -> bool {
                 })
             })
         })
+}
+
+/// Deterministically lift the exact schema-18/runtime-2 Cortana journal into
+/// runtime schema 3 before typed deserialization. The enclosing schema remains
+/// 18 in-memory so load deliberately validates and persists the full schema-19
+/// snapshot as one migration. Any partial or unexpected nested version fails
+/// closed as incompatible recovery and leaves source bytes untouched.
+fn migrate_cortana_runtime_v2_document(document: &mut Value) -> Result<(), String> {
+    let captains = document
+        .get_mut("captains")
+        .and_then(Value::as_array_mut)
+        .ok_or("schema-18 captains registry is missing captains")?;
+    for captain in captains {
+        let Some(runtime) = captain
+            .get_mut("cortanaRuntime")
+            .filter(|runtime| !runtime.is_null())
+        else {
+            continue;
+        };
+        let runtime = runtime
+            .as_object_mut()
+            .ok_or("schema-18 Cortana runtime is not an object")?;
+        match runtime.get("schemaVersion").and_then(Value::as_u64) {
+            Some(2) => {
+                runtime.insert("schemaVersion".to_string(), Value::from(3));
+            }
+            Some(3) => continue,
+            _ => return Err("schema-18 Cortana runtime has an unsupported nested version".into()),
+        }
+        let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .filter(|intent| !intent.is_null())
+        else {
+            continue;
+        };
+        let intent = intent
+            .as_object_mut()
+            .ok_or("schema-18 Cortana ensure intent is not an object")?;
+        if intent.get("schemaVersion").and_then(Value::as_u64) != Some(2) {
+            return Err("schema-18 Cortana ensure intent has an unsupported version".into());
+        }
+        intent.insert("schemaVersion".to_string(), Value::from(3));
+        if let Some(candidate) = intent
+            .get_mut("candidate")
+            .filter(|candidate| !candidate.is_null())
+        {
+            let candidate = candidate
+                .as_object_mut()
+                .ok_or("schema-18 Cortana candidate is not an object")?;
+            let spawned_at = candidate
+                .get("spawnedAt")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .ok_or("schema-18 Cortana candidate lacks spawnedAt")?;
+            candidate.insert("reservedAt".to_string(), Value::from(spawned_at));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4110,7 +4217,7 @@ impl CaptainsRegistry {
         let body = std::fs::read_to_string(path).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' could not be read: {error}", path.display()))
         })?;
-        let document: Value = serde_json::from_str(&body).map_err(|error| {
+        let mut document: Value = serde_json::from_str(&body).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
         })?;
         let schema_version = document
@@ -4127,7 +4234,14 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
-        let has_legacy_cortana_runtime = schema_version < CAPTAINS_SCHEMA_VERSION as u64
+        if schema_version == 18 {
+            migrate_cortana_runtime_v2_document(&mut document).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+        let has_legacy_cortana_runtime = schema_version < 18
             && document
                 .get("captains")
                 .and_then(Value::as_array)
@@ -4144,7 +4258,7 @@ impl CaptainsRegistry {
             });
         }
         if has_release_recovery
-            && (schema_version < CAPTAINS_SCHEMA_VERSION as u64
+            && (schema_version < 18
                 || releases_contain_unknown_fields(&document))
         {
             return Err(SnapshotReadError::IncompatibleRecovery {
@@ -4569,7 +4683,7 @@ impl CaptainsRegistry {
                 }
             }
         }
-        if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION
+        if snapshot.schema_version < 18
             && !snapshot.pending_dispatch_releases.is_empty()
         {
             return Err(
@@ -6150,10 +6264,8 @@ impl CaptainsRegistry {
         Ok((result, CortanaEnsureMutation::Prepared))
     }
 
-    /// Persist the exact candidate that was actually minted, bound, and spawned.
-    /// This transition records no runtime attestation and publishes no current
-    /// Fleet identity.
-    pub fn record_cortana_candidate(
+    /// Persist the exact identity and terminal reservation before tmux spawn.
+    pub fn reserve_cortana_candidate(
         &self,
         operation_id: &str,
         request_digest: &str,
@@ -6179,17 +6291,20 @@ impl CaptainsRegistry {
         if intent.operation_id != operation_id || intent.request_digest != request_digest {
             return Err("Cortana candidate does not match the immutable ensure request".into());
         }
-        if intent.phase == CortanaEnsurePhase::CandidateSpawned {
+        if intent.phase == CortanaEnsurePhase::CandidateReserved {
             if intent.candidate.as_ref() == Some(&candidate) {
                 return Ok(captain.clone());
             }
-            return Err("Cortana ensure already recorded a different candidate".into());
+            return Err("Cortana ensure already reserved a different candidate".into());
         }
-        if intent.phase != CortanaEnsurePhase::Prepared || candidate.runtime_attestation.is_some() {
-            return Err("Cortana ensure is not prepared for candidate evidence".into());
+        if intent.phase != CortanaEnsurePhase::Prepared
+            || candidate.spawned_at.is_some()
+            || candidate.runtime_attestation.is_some()
+        {
+            return Err("Cortana ensure is not prepared for candidate reservation".into());
         }
         let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
-        intent.phase = CortanaEnsurePhase::CandidateSpawned;
+        intent.phase = CortanaEnsurePhase::CandidateReserved;
         intent.candidate = Some(candidate);
         intent.updated_at = timestamp;
         runtime.updated_at = timestamp;
@@ -6199,10 +6314,67 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
-    /// Commit a fully probed candidate as the sole current Cortana runtime.
-    /// The caller supplies the freshly resolved IdentityStore record and current
-    /// authority generation, which are validated again inside this CAS mutation.
-    pub fn commit_cortana_candidate(
+    /// Record that the reserved candidate actually materialized in tmux.
+    pub fn record_cortana_candidate_spawn(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        terminal_id: &str,
+        spawned_at: u64,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        let intent = runtime
+            .ensure_intent
+            .as_mut()
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id || intent.request_digest != request_digest {
+            return Err("Cortana spawn does not match the immutable ensure request".into());
+        }
+        let candidate = intent
+            .candidate
+            .as_mut()
+            .ok_or("Cortana ensure has no reserved candidate")?;
+        if candidate.terminal_id != terminal_id {
+            return Err("Cortana spawned terminal does not match its reservation".into());
+        }
+        if intent.phase == CortanaEnsurePhase::CandidateSpawned {
+            if candidate.spawned_at == Some(spawned_at) {
+                return Ok(captain.clone());
+            }
+            return Err("Cortana ensure already recorded different spawn evidence".into());
+        }
+        if intent.phase != CortanaEnsurePhase::CandidateReserved
+            || spawned_at < candidate.reserved_at
+            || spawned_at > observed_at
+        {
+            return Err("Cortana ensure is not reserved for exact spawn evidence".into());
+        }
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        candidate.spawned_at = Some(spawned_at);
+        intent.phase = CortanaEnsurePhase::CandidateSpawned;
+        intent.updated_at = timestamp;
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    /// Persist fresh runtime attestation after validating the real IdentityStore
+    /// record and exact authority generation.
+    pub fn attest_cortana_candidate(
         &self,
         operation_id: &str,
         request_digest: &str,
@@ -6228,9 +6400,9 @@ impl CaptainsRegistry {
             .as_mut()
             .ok_or("Cortana ensure intent is missing")?;
         if intent.operation_id != operation_id || intent.request_digest != request_digest {
-            return Err("Cortana commit does not match the immutable ensure request".into());
+            return Err("Cortana attestation does not match the immutable request".into());
         }
-        if intent.phase == CortanaEnsurePhase::Committed {
+        if intent.phase == CortanaEnsurePhase::Attested {
             if intent
                 .candidate
                 .as_ref()
@@ -6239,13 +6411,13 @@ impl CaptainsRegistry {
             {
                 return Ok(captain.clone());
             }
-            return Err("Cortana ensure already committed different runtime evidence".into());
+            return Err("Cortana ensure already recorded different attestation".into());
         }
         let candidate = intent
             .candidate
             .as_mut()
             .filter(|_| intent.phase == CortanaEnsurePhase::CandidateSpawned)
-            .ok_or("Cortana ensure has no spawned candidate to commit")?;
+            .ok_or("Cortana ensure has no spawned candidate to attest")?;
         if candidate.terminal_id != attestation.terminal_id
             || candidate.tmux_session_id != attestation.tmux_session_id
             || candidate.control_identity_id != attestation.control_identity_id
@@ -6264,7 +6436,7 @@ impl CaptainsRegistry {
         )?;
         let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
         if attestation.attested_at > timestamp {
-            return Err("Cortana attestation is newer than its durable commit".into());
+            return Err("Cortana attestation is newer than its durable transition".into());
         }
         let policy = intent.request.desired_runtime.clone();
         let generation = intent
@@ -6274,6 +6446,72 @@ impl CaptainsRegistry {
             .ok_or("Cortana runtime generation is exhausted")?;
         validate_cortana_attestation(&attestation, &policy, generation, timestamp)?;
         candidate.runtime_attestation = Some(attestation.clone());
+        intent.phase = CortanaEnsurePhase::Attested;
+        intent.updated_at = timestamp;
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    /// Commit a fully attested candidate as the sole current Cortana runtime.
+    /// Identity and authority are revalidated at the final CAS boundary.
+    pub fn commit_cortana_candidate(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        identity: &crate::identity::SessionIdentity,
+        observed_authority_generation: u64,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        let intent = runtime
+            .ensure_intent
+            .as_mut()
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id || intent.request_digest != request_digest {
+            return Err("Cortana commit does not match the immutable ensure request".into());
+        }
+        if intent.phase == CortanaEnsurePhase::Committed {
+            return Ok(captain.clone());
+        }
+        let candidate = intent
+            .candidate
+            .as_ref()
+            .filter(|_| intent.phase == CortanaEnsurePhase::Attested)
+            .ok_or("Cortana ensure has no attested candidate to commit")?;
+        let attestation = candidate
+            .runtime_attestation
+            .clone()
+            .ok_or("Cortana attested phase lost runtime evidence")?;
+        validate_cortana_session_identity(
+            &candidate.control_identity_id,
+            candidate.session_identity_generation,
+            candidate.authority_generation,
+            observed_authority_generation,
+            &candidate.terminal_id,
+            identity,
+        )?;
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        let policy = intent.request.desired_runtime.clone();
+        let generation = intent
+            .request
+            .expected_generation
+            .checked_add(1)
+            .ok_or("Cortana runtime generation is exhausted")?;
+        validate_cortana_attestation(&attestation, &policy, generation, timestamp)?;
         intent.phase = CortanaEnsurePhase::Committed;
         intent.updated_at = timestamp;
         captain.state = ClaimState::Active;
@@ -6424,7 +6662,10 @@ impl CaptainsRegistry {
         }
         if !matches!(
             intent.phase,
-            CortanaEnsurePhase::CandidateSpawned | CortanaEnsurePhase::CleanupPending
+            CortanaEnsurePhase::CandidateReserved
+                | CortanaEnsurePhase::CandidateSpawned
+                | CortanaEnsurePhase::Attested
+                | CortanaEnsurePhase::CleanupPending
         ) {
             return Err("Cortana ensure has no candidate failure to record".into());
         }
