@@ -1463,6 +1463,17 @@ fn validate_cortana_control_identity_id(value: &str, field: &str) -> Result<(), 
     Ok(())
 }
 
+fn validate_cortana_sha256(value: &str, field: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!("Cortana {field} is not a canonical SHA-256 digest"));
+    }
+    Ok(())
+}
+
 fn validate_cortana_policy(policy: &CortanaRuntimePolicy) -> Result<(), String> {
     validate_cortana_canonical_id(
         &policy.work_profile,
@@ -1740,6 +1751,16 @@ pub fn validate_cortana_session_identity(
         );
     }
     Ok(())
+}
+
+fn cortana_candidate_terminal_id(request_digest: &str) -> Result<String, String> {
+    validate_cortana_sha256(request_digest, "requestDigest")?;
+    Ok(format!("cor-{}", &request_digest[..20]))
+}
+
+fn cortana_identity_allocation_key(request_digest: &str) -> Result<String, String> {
+    validate_cortana_sha256(request_digest, "requestDigest")?;
+    Ok(format!("cortana:ensure:{request_digest}"))
 }
 
 fn validate_cortana_runtime(
@@ -6430,6 +6451,72 @@ impl CaptainsRegistry {
         Ok((result, CortanaEnsureMutation::Prepared))
     }
 
+    /// Allocate and bind the candidate identity idempotently from the already
+    /// durable Prepared request, then CAS-persist its exact reservation. Identity
+    /// persistence deliberately happens outside the registry lock. If the final
+    /// registry write fails, restart adopts the same operation-owned identity.
+    pub(crate) fn reserve_cortana_candidate_identity(
+        &self,
+        identities: &crate::identity::IdentityStore,
+        operation_id: &str,
+        request_digest: &str,
+        authority_generation: u64,
+        observed_at: u64,
+    ) -> Result<(CaptainRecord, crate::identity::SessionIdentity), String> {
+        if authority_generation == 0 || observed_at == 0 {
+            return Err("Cortana candidate reservation lacks durable authority time".into());
+        }
+        let snapshot = self.snapshot();
+        let intent = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .and_then(|captain| captain.cortana_runtime.as_ref())
+            .and_then(|runtime| runtime.ensure_intent.as_ref())
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id
+            || intent.request_digest != request_digest
+            || cortana_ensure_request_digest(intent)? != request_digest
+            || !matches!(
+                intent.phase,
+                CortanaEnsurePhase::Prepared | CortanaEnsurePhase::CandidateReserved
+            )
+        {
+            return Err("Cortana identity allocation does not match a Prepared request".into());
+        }
+        let terminal_id = cortana_candidate_terminal_id(request_digest)?;
+        let tmux_session_id = format!("th_{terminal_id}");
+        let allocation_key = cortana_identity_allocation_key(request_digest)?;
+        let identity = identities.mint_for_operation(
+            crate::identity::Role::Cortana,
+            Some(CORTANA_SLUG.to_string()),
+            &allocation_key,
+        )?;
+        identities.bind_tile_exact(&identity.id, &terminal_id)?;
+        let identity = identities
+            .get(&identity.id)
+            .ok_or("Cortana operation-owned identity disappeared after binding")?;
+        let reserved_at = intent
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.reserved_at)
+            .unwrap_or(observed_at);
+        let candidate = CortanaCandidateRuntimeEvidence {
+            terminal_id,
+            tmux_session_id,
+            control_identity_id: identity.id.clone(),
+            session_identity_generation: identity.generation,
+            authority_generation,
+            reserved_at,
+            spawned_at: None,
+            spawn_generation: None,
+            runtime_attestation: None,
+        };
+        let captain =
+            self.reserve_cortana_candidate(operation_id, request_digest, candidate, observed_at)?;
+        Ok((captain, identity))
+    }
+
     /// Persist the exact identity and terminal reservation before tmux spawn.
     pub fn reserve_cortana_candidate(
         &self,
@@ -6458,7 +6545,12 @@ impl CaptainsRegistry {
             return Err("Cortana candidate does not match the immutable ensure request".into());
         }
         if intent.phase == CortanaEnsurePhase::CandidateReserved {
-            if intent.candidate.as_ref() == Some(&candidate) {
+            let replay = intent.candidate.as_ref().is_some_and(|existing| {
+                let mut normalized = candidate.clone();
+                normalized.reserved_at = existing.reserved_at;
+                existing == &normalized
+            });
+            if replay {
                 return Ok(captain.clone());
             }
             return Err("Cortana ensure already reserved a different candidate".into());
@@ -22367,6 +22459,165 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replayed, committed);
+    }
+
+    #[test]
+    fn cortana_candidate_identity_adopts_after_mint_bind_and_reservation_crashes() {
+        let temp = tempfile::tempdir().unwrap();
+        for stage in ["after-mint", "after-bind", "reservation-persist-failure"] {
+            let captains_path = temp.path().join(format!("captains-{stage}.json"));
+            let identities_path = temp.path().join(format!("identities-{stage}.json"));
+            let registry = CaptainsRegistry::load(captains_path.clone());
+            let (prepared, _) = registry
+                .prepare_cortana_ensure(
+                    &format!("ensure-{stage}"),
+                    cortana_ensure_request(None),
+                    100,
+                )
+                .unwrap();
+            let intent = prepared
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .clone();
+            let terminal_id = cortana_candidate_terminal_id(&intent.request_digest).unwrap();
+            let allocation_key = cortana_identity_allocation_key(&intent.request_digest).unwrap();
+            let first_identity = {
+                let identities = crate::identity::IdentityStore::load(identities_path.clone());
+                let identity = identities
+                    .mint_for_operation(
+                        crate::identity::Role::Cortana,
+                        Some(CORTANA_SLUG.into()),
+                        &allocation_key,
+                    )
+                    .unwrap();
+                if stage != "after-mint" {
+                    identities
+                        .bind_tile_exact(&identity.id, &terminal_id)
+                        .unwrap();
+                }
+                if stage == "reservation-persist-failure" {
+                    let before = serde_json::to_value(registry.snapshot()).unwrap();
+                    let bytes = std::fs::read(&captains_path).unwrap();
+                    registry.fail_next_persist("candidate reservation persist failure");
+                    assert!(registry
+                        .reserve_cortana_candidate_identity(
+                            &identities,
+                            &intent.operation_id,
+                            &intent.request_digest,
+                            1,
+                            101,
+                        )
+                        .is_err());
+                    assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+                    assert_eq!(std::fs::read(&captains_path).unwrap(), bytes);
+                }
+                identity
+            };
+
+            let restarted_registry = CaptainsRegistry::load(captains_path.clone());
+            let restarted_identities =
+                crate::identity::IdentityStore::load(identities_path.clone());
+            assert_eq!(restarted_identities.prune_dead(|_| false).unwrap(), 0);
+            let (reserved, adopted) = restarted_registry
+                .reserve_cortana_candidate_identity(
+                    &restarted_identities,
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    1,
+                    102,
+                )
+                .unwrap();
+            assert_eq!(adopted.id, first_identity.id, "{stage} minted a duplicate");
+            assert_eq!(adopted.generation, first_identity.generation);
+            assert_eq!(restarted_identities.len(), 1);
+            assert_eq!(adopted.session_tile.as_deref(), Some(terminal_id.as_str()));
+            let candidate = reserved
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap();
+            assert_eq!(candidate.control_identity_id, adopted.id);
+            assert_eq!(candidate.session_identity_generation, adopted.generation);
+            assert_eq!(candidate.terminal_id, terminal_id);
+            let (replayed, replayed_identity) = restarted_registry
+                .reserve_cortana_candidate_identity(
+                    &restarted_identities,
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    1,
+                    999,
+                )
+                .unwrap();
+            assert_eq!(replayed, reserved);
+            assert_eq!(replayed_identity.id, adopted.id);
+        }
+    }
+
+    #[test]
+    fn simultaneous_cortana_candidate_identity_reservations_converge_once() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-simultaneous-reservation",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for observed_at in [101_u64, 102_u64] {
+            let registry = registry.clone();
+            let identities = identities.clone();
+            let barrier = barrier.clone();
+            let operation_id = intent.operation_id.clone();
+            let request_digest = intent.request_digest.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                registry.reserve_cortana_candidate_identity(
+                    &identities,
+                    &operation_id,
+                    &request_digest,
+                    1,
+                    observed_at,
+                )
+            }));
+        }
+        barrier.wait();
+        let first = workers.remove(0).join().unwrap().unwrap();
+        let second = workers.remove(0).join().unwrap().unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1.id, second.1.id);
+        assert_eq!(first.1.generation, second.1.generation);
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::CandidateReserved
+        );
     }
 
     #[test]
