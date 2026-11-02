@@ -335,6 +335,13 @@ else
   fail "deployed Claude provisioner is missing or not executable"
 fi
 
+# The busy-executable cases need a real binary that keeps running under the
+# name t-hub-mcp. A copy of /bin/sleep no longer works: Ubuntu 26.04 ships
+# uutils coreutils, whose multicall binary dispatches on argv[0] and runs a copy
+# named t-hub-mcp as `cp` (it matches the "cp" suffix). Perl ignores argv[0] and
+# is Essential on Debian and Ubuntu, so a copy of it stays alive on both GNU and
+# uutils hosts.
+BUSY_SLEEPER_SOURCE="$(command -v perl)"
 BUSY_EXEC_WORK="$WORK/busy-executable"
 BUSY_EXEC_HOME="$BUSY_EXEC_WORK/home"
 BUSY_EXEC_CODEX="$BUSY_EXEC_WORK/codex"
@@ -343,8 +350,8 @@ BUSY_EXEC_BIN="$BUSY_EXEC_WORK/install/bin"
 BUSY_EXEC_CAPTAIN="$BUSY_EXEC_WORK/install/captain"
 mkdir -p "$BUSY_EXEC_HOME" "$BUSY_EXEC_CODEX" "$BUSY_EXEC_CLAUDE" \
   "$BUSY_EXEC_BIN" "$BUSY_EXEC_CAPTAIN"
-cp -p /bin/sleep "$BUSY_EXEC_BIN/t-hub-mcp"
-"$BUSY_EXEC_BIN/t-hub-mcp" 120 &
+cp -p "$BUSY_SLEEPER_SOURCE" "$BUSY_EXEC_BIN/t-hub-mcp"
+"$BUSY_EXEC_BIN/t-hub-mcp" -e 'sleep 120' &
 busy_exec_pid=$!
 if HOME="$BUSY_EXEC_HOME" CODEX_HOME="$BUSY_EXEC_CODEX" CLAUDE_HOME="$BUSY_EXEC_CLAUDE" \
   T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_EXEC_BIN" \
@@ -366,8 +373,8 @@ BUSY_CRASH_BIN="$BUSY_CRASH_WORK/install/bin"
 BUSY_CRASH_CAPTAIN="$BUSY_CRASH_WORK/install/captain"
 mkdir -p "$BUSY_CRASH_HOME" "$BUSY_CRASH_CODEX" "$BUSY_CRASH_CLAUDE" \
   "$BUSY_CRASH_BIN" "$BUSY_CRASH_CAPTAIN"
-cp -p /bin/sleep "$BUSY_CRASH_BIN/t-hub-mcp"
-"$BUSY_CRASH_BIN/t-hub-mcp" 120 &
+cp -p "$BUSY_SLEEPER_SOURCE" "$BUSY_CRASH_BIN/t-hub-mcp"
+"$BUSY_CRASH_BIN/t-hub-mcp" -e 'sleep 120' &
 busy_crash_pid=$!
 HOME="$BUSY_CRASH_HOME" CODEX_HOME="$BUSY_CRASH_CODEX" CLAUDE_HOME="$BUSY_CRASH_CLAUDE" \
   T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_CRASH_BIN" \
@@ -396,9 +403,9 @@ BUSY_ATOMIC_BIN="$BUSY_ATOMIC_WORK/install/bin"
 BUSY_ATOMIC_CAPTAIN="$BUSY_ATOMIC_WORK/install/captain"
 mkdir -p "$BUSY_ATOMIC_HOME" "$BUSY_ATOMIC_CODEX" "$BUSY_ATOMIC_CLAUDE" \
   "$BUSY_ATOMIC_BIN" "$BUSY_ATOMIC_CAPTAIN"
-cp -p /bin/sleep "$BUSY_ATOMIC_BIN/t-hub-mcp"
+cp -p "$BUSY_SLEEPER_SOURCE" "$BUSY_ATOMIC_BIN/t-hub-mcp"
 busy_atomic_before="$(sha256sum "$BUSY_ATOMIC_BIN/t-hub-mcp" | awk '{print $1}')"
-"$BUSY_ATOMIC_BIN/t-hub-mcp" 120 &
+"$BUSY_ATOMIC_BIN/t-hub-mcp" -e 'sleep 120' &
 busy_atomic_pid=$!
 if HOME="$BUSY_ATOMIC_HOME" CODEX_HOME="$BUSY_ATOMIC_CODEX" CLAUDE_HOME="$BUSY_ATOMIC_CLAUDE" \
   T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_ATOMIC_BIN" \

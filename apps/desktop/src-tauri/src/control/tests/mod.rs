@@ -149,9 +149,7 @@ fn test_harness_command(harness: &str) -> (std::path::PathBuf, String) {
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let executable = bin_dir.join(harness);
-    std::fs::copy("/bin/sleep", &executable).unwrap();
-    let command = format!("{} 60", executable.display());
+    let command = crate::test_support::install_named_sleeper(&bin_dir.join(harness), 60);
     (bin_dir, command)
 }
 

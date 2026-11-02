@@ -3133,9 +3133,7 @@ th_bad_ts notanumber";
         let name = format!("th_harness-live-{}", uuid::Uuid::new_v4().simple());
         let bin_dir = std::env::temp_dir().join(format!("{name}-bin"));
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let executable = bin_dir.join("codex");
-        std::fs::copy("/bin/sleep", &executable).unwrap();
-        let command = format!("{} 60", executable.display());
+        let command = crate::test_support::install_named_sleeper(&bin_dir.join("codex"), 60);
         new_session_with_env(&name, "/tmp", Some(&command), &[]).unwrap();
 
         assert_eq!(harness_liveness(&name, "codex"), SessionLiveness::Alive);

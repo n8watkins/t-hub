@@ -53,6 +53,8 @@ mod cortana_reconcile; // pure fail-closed planning for the durable Cortana sing
 mod engine_supervisor; // managed Kokoro lifecycle: spawn/health-watch/auto-restart + auto-fallback to Piper (default-off flag; proposal /tmp/flap-probe/LIFECYCLE-PROPOSAL.md)
 mod scribe; // Scribe voice-gate: v1 status endpoint via ~/.scribe/control.json, status.json fallback ("is the general dictating?")
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
+#[cfg(test)]
+mod test_support; // shared unit-test fixtures (named long-running harness stand-ins)
 mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
 mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)

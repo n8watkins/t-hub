@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -15,6 +16,11 @@ import unittest
 
 
 HELPER = pathlib.Path(__file__).with_name("atomic-config.py")
+# A long-running executable for the busy-inode cases. A copy of /bin/sleep no
+# longer works: Ubuntu 26.04 ships uutils coreutils, whose multicall binary
+# dispatches on argv[0] and rejects a copy named "running". Perl ignores argv[0]
+# and is Essential on Debian and Ubuntu.
+SLEEPER_SOURCE = pathlib.Path(shutil.which("perl") or "/usr/bin/perl")
 
 
 def load_helper():
@@ -301,9 +307,9 @@ class AtomicConfigTest(unittest.TestCase):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:
             executable = pathlib.Path(directory) / "running"
-            executable.write_bytes(pathlib.Path("/bin/sleep").read_bytes())
+            executable.write_bytes(SLEEPER_SOURCE.read_bytes())
             executable.chmod(0o700)
-            process = subprocess.Popen([str(executable), "120"])
+            process = subprocess.Popen([str(executable), "-e", "sleep 120"])
             try:
                 metadata = executable.stat()
                 expected_digest = helper.state_digest(str(executable))
@@ -324,9 +330,9 @@ class AtomicConfigTest(unittest.TestCase):
             root = pathlib.Path(directory)
             executable = root / "running"
             journal = root / "journal"
-            executable.write_bytes(pathlib.Path("/bin/sleep").read_bytes())
+            executable.write_bytes(SLEEPER_SOURCE.read_bytes())
             executable.chmod(0o700)
-            process = subprocess.Popen([str(executable), "120"])
+            process = subprocess.Popen([str(executable), "-e", "sleep 120"])
             try:
                 expected_digest = helper.state_digest(str(executable))
                 environment = os.environ.copy()
@@ -627,9 +633,9 @@ class AtomicConfigTest(unittest.TestCase):
             root = pathlib.Path(directory)
             target = root / "running"
             journal = root / "journal"
-            target.write_bytes(pathlib.Path("/bin/sleep").read_bytes())
+            target.write_bytes(SLEEPER_SOURCE.read_bytes())
             target.chmod(0o700)
-            process = subprocess.Popen([str(target), "120"])
+            process = subprocess.Popen([str(target), "-e", "sleep 120"])
             try:
                 result = subprocess.run(
                     [sys.executable, str(HELPER), "delete", "--target", str(target),
