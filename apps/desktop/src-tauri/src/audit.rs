@@ -13,7 +13,7 @@
 //!   in-place edit breaks the chain and is detectable by a verifier that recomputes
 //!   forward. The chain is re-seeded from the last line on restart / day-rollover
 //!   so it stays continuous.
-//! - **Redaction**: `send_text` content is never written — only its length and a
+//! - **Redaction**: `send_text` content is never written - only its length and a
 //!   SHA-256 prefix — so the log cannot become a secret-harvesting oracle. `send_keys`
 //!   key names ARE logged (they are exactly the kill-pattern signal we want).
 //! - **Buffered + fsync-flushed** behind a mutex, written after the dispatch
@@ -137,7 +137,7 @@ impl AuditLog {
         }
         if let Some(err) = meta.error {
             record["outcome"] = json!("error");
-            record["error"] = json!(err);
+            record["error"] = redact_error(command, err);
         } else if decision == "allowed" {
             record["outcome"] = json!("ok");
         }
@@ -156,6 +156,20 @@ impl AuditLog {
         guard.prev_hash = hash;
         Ok(())
     }
+}
+
+fn redact_error(command: &str, error: &str) -> Value {
+    if matches!(
+        command,
+        "append_crew_powder_work_log" | "complete_crew_powder"
+    ) {
+        return json!({
+            "redacted": true,
+            "len": error.len(),
+            "sha256": &hex(&Sha256::digest(error.as_bytes()))[..16],
+        });
+    }
+    json!(error)
 }
 
 /// Caller context + dispatch outcome attached to an audit record. Kept separate
@@ -177,8 +191,9 @@ pub struct AuditMeta<'a> {
 /// Redact an args object for the audit log. `send_text` content is replaced by a
 /// length + SHA-256 prefix (never the literal text); `send_keys` names are kept;
 /// `spawn_terminal` logs only the presence of a `startupCommand` (arbitrary shell
-/// text, same secret risk as `send_text`). Other commands' args are small
-/// identifiers (tab/session ids) and pass through as-is.
+/// text, same secret risk as `send_text`). Powder work-log bodies and completion
+/// proof URLs receive the same length-and-digest treatment. Other commands' args
+/// are small identifiers (tab/session ids) and pass through as-is.
 fn redact_args(command: &str, args: &Value) -> Value {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str());
     match command {
@@ -200,6 +215,41 @@ fn redact_args(command: &str, args: &Value) -> Value {
             "spawnedBy": s("spawnedBy").or_else(|| s("spawned_by")),
             "hasStartupCommand": args.get("startupCommand").or_else(|| args.get("startup_command")).is_some(),
         }),
+        "append_crew_powder_work_log" => {
+            let message = s("message").unwrap_or("");
+            json!({
+                "messageLen": message.len(),
+                "messageSha256": &hex(&Sha256::digest(message.as_bytes()))[..16],
+            })
+        }
+        "complete_crew_powder" => {
+            let proof = s("proof").unwrap_or("");
+            let criterion_proofs = args
+                .get("criterionProofs")
+                .or_else(|| args.get("criterion_proofs"))
+                .and_then(Value::as_array)
+                .map(|proofs| {
+                    proofs
+                        .iter()
+                        .map(|item| {
+                            let criterion = item.get("criterion").and_then(Value::as_u64);
+                            let url = item.get("url").and_then(Value::as_str).unwrap_or("");
+                            json!({
+                                "criterion": criterion,
+                                "urlLen": url.len(),
+                                "urlSha256": &hex(&Sha256::digest(url.as_bytes()))[..16],
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            json!({
+                "crewSessionId": s("crewSessionId").or_else(|| s("crew_session_id")),
+                "proofLen": proof.len(),
+                "proofSha256": &hex(&Sha256::digest(proof.as_bytes()))[..16],
+                "criterionProofs": criterion_proofs,
+            })
+        }
         // send_keys, close_terminal, and the Organization commands carry only
         // non-sensitive identifiers / key names — log them verbatim.
         _ => args.clone(),
@@ -310,6 +360,66 @@ mod tests {
         );
         let lines = read_lines(&dir);
         assert_eq!(lines[0]["args"]["keys"][0], "C-c");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn powder_work_log_and_completion_proofs_are_redacted() {
+        let dir = temp_dir("powder-redact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = AuditLog::new(dir.clone());
+        log.record(
+            "append_crew_powder_work_log",
+            "organization",
+            "allowed",
+            &json!({
+                "message": "SECRET work log body",
+            }),
+            AuditMeta {
+                peer: "loopback",
+                token_tier: "read",
+                session: Some("crew-1"),
+                spawned_by: None,
+                error: None,
+            },
+        );
+        log.record(
+            "complete_crew_powder",
+            "organization",
+            "allowed",
+            &json!({
+                "crewSessionId": "crew-1",
+                "proof": "https://secret.example.test/overall-proof",
+                "criterionProofs": [{
+                    "criterion": 0,
+                    "url": "https://secret.example.test/criterion-proof",
+                }],
+            }),
+            AuditMeta {
+                peer: "loopback",
+                token_tier: "control",
+                session: Some("captain-1"),
+                spawned_by: None,
+                error: Some("proof rejected at https://secret.example.test/criterion-proof"),
+            },
+        );
+
+        let lines = read_lines(&dir);
+        assert_eq!(lines.len(), 2);
+        let serialized = serde_json::to_string(&lines).unwrap();
+        assert!(!serialized.contains("SECRET work log body"));
+        assert!(!serialized.contains("secret.example.test"));
+        assert_eq!(lines[0]["args"]["messageLen"], 20);
+        assert_eq!(lines[1]["args"]["criterionProofs"][0]["criterion"], 0);
+        assert_eq!(lines[1]["error"]["redacted"], true);
+        assert_eq!(lines[1]["args"]["proofSha256"].as_str().unwrap().len(), 16);
+        assert_eq!(
+            lines[1]["args"]["criterionProofs"][0]["urlSha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            16
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

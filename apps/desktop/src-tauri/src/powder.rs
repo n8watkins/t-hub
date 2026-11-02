@@ -4,6 +4,7 @@
 //! credential material lives in `~/.t-hub/powder-profiles.json` or process env.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -15,6 +16,20 @@ use crate::bounded_exec;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_EVIDENCE_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_MUTATION_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 4096;
+const MAX_EVIDENCE_ITEMS: usize = 20;
+const MAX_CRITERIA: usize = 100;
+const MAX_CRITERION_PROOFS: usize = 20;
+const MAX_EVIDENCE_TOTAL: usize = 1_000_000;
+const MAX_ID_BYTES: usize = 256;
+const MAX_SHORT_TEXT_BYTES: usize = 512;
+const MAX_EVIDENCE_TEXT_BYTES: usize = 4096;
+pub const MAX_WORK_LOG_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_COMPLETION_PROOF_BYTES: usize = 4096;
+pub const MAX_COMPLETION_CRITERION_PROOFS: usize = 100;
+pub const MAX_PROOF_URL_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +59,145 @@ pub struct Claim {
     pub run_id: String,
     pub agent: String,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceClaim {
+    pub run_id: String,
+    pub agent: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkLogAttribution {
+    pub agent: String,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub harness: Option<String>,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkLogEntry {
+    pub card_id: String,
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub body: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionProof {
+    pub proof: String,
+    pub criterion_proofs: Vec<CriterionProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CriterionProof {
+    pub criterion: usize,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceProofLink {
+    pub url: String,
+    pub actor: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CriterionEvidence {
+    pub criterion: usize,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    pub proof_links: Vec<EvidenceProofLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub run_id: String,
+    pub card_id: String,
+    pub state: String,
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceActivity {
+    pub activity_type: String,
+    pub payload: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceLink {
+    pub label: String,
+    pub url: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardEvidence {
+    pub card_id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<EvidenceClaim>,
+    pub criteria: Vec<CriterionEvidence>,
+    pub runs: Vec<RunSummary>,
+    pub runs_total: usize,
+    pub work_log: Vec<WorkLogEntry>,
+    pub work_log_total: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEvidence {
+    pub run: RunSummary,
+    pub card_title: String,
+    pub card_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub criteria: Vec<CriterionEvidence>,
+    pub activities: Vec<EvidenceActivity>,
+    pub activities_total: usize,
+    pub links: Vec<EvidenceLink>,
+    pub links_total: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionReceipt {
+    pub card_id: String,
+    pub status: String,
+    pub updated_at: i64,
+    pub criteria: Vec<CriterionEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -446,6 +600,97 @@ impl Client {
         parse_claim(value)
     }
 
+    /// Append one Crew-attributed entry to Powder's work log.
+    ///
+    /// T-Hub supplies the exact Crew and run identity from its durable binding.
+    /// Input is rejected before any request when it would exceed the bounded
+    /// control contract, and the response must echo the authoritative binding.
+    pub fn append_work_log(
+        &self,
+        card_id: &str,
+        attribution: &WorkLogAttribution,
+        body: &str,
+    ) -> Result<WorkLogEntry, PowderError> {
+        validate_id("card id", card_id)?;
+        validate_short_text("work-log agent", &attribution.agent)?;
+        validate_optional_short_text("work-log model", attribution.model.as_deref())?;
+        validate_optional_short_text("work-log reasoning", attribution.reasoning.as_deref())?;
+        validate_optional_short_text("work-log harness", attribution.harness.as_deref())?;
+        validate_id("work-log run id", &attribution.run_id)?;
+        validate_required_bounded_text("work-log body", body, MAX_WORK_LOG_BODY_BYTES)?;
+
+        let value = self.request_typed_with_limit(
+            "POST",
+            &format!("/api/v1/cards/{}/work-log", encode_path(card_id)),
+            Some(json!({
+                "agent": attribution.agent,
+                "model": attribution.model,
+                "reasoning": attribution.reasoning,
+                "harness": attribution.harness,
+                "run_id": attribution.run_id,
+                "body": body,
+            })),
+            MAX_MUTATION_RESPONSE_BYTES,
+        )?;
+        parse_work_log_entry(value, card_id, Some(attribution))
+    }
+
+    /// Read only the concise, server-bounded evidence needed to supervise one card.
+    pub fn card_evidence(&self, card_id: &str) -> Result<CardEvidence, PowderError> {
+        validate_id("card id", card_id)?;
+        let value = self.request_typed_with_limit(
+            "GET",
+            &format!("/api/v1/cards/{}", encode_path(card_id)),
+            None,
+            MAX_EVIDENCE_RESPONSE_BYTES,
+        )?;
+        parse_card_evidence(value, card_id)
+    }
+
+    /// Read only the concise, server-bounded evidence for one authoritative run.
+    pub fn run_evidence(&self, run_id: &str) -> Result<RunEvidence, PowderError> {
+        validate_id("run id", run_id)?;
+        let value = self.request_typed_with_limit(
+            "GET",
+            &format!("/api/v1/runs/{}", encode_path(run_id)),
+            None,
+            MAX_EVIDENCE_RESPONSE_BYTES,
+        )?;
+        parse_run_evidence(value, run_id)
+    }
+
+    /// Complete a card with a required bounded proof and optional criterion links.
+    pub fn complete_with_proof(
+        &self,
+        card_id: &str,
+        completion: &CompletionProof,
+    ) -> Result<CompletionReceipt, PowderError> {
+        validate_id("card id", card_id)?;
+        validate_required_bounded_text(
+            "completion proof",
+            &completion.proof,
+            MAX_COMPLETION_PROOF_BYTES,
+        )?;
+        if completion.criterion_proofs.len() > MAX_COMPLETION_CRITERION_PROOFS {
+            return Err(invalid_request(format!(
+                "completion criterion proof count exceeds {MAX_COMPLETION_CRITERION_PROOFS}"
+            )));
+        }
+        for proof in &completion.criterion_proofs {
+            validate_required_bounded_text("criterion proof URL", &proof.url, MAX_PROOF_URL_BYTES)?;
+        }
+        let value = self.request_typed_with_limit(
+            "POST",
+            &format!("/api/v1/cards/{}/complete", encode_path(card_id)),
+            Some(json!({
+                "proof": completion.proof,
+                "criterion_proofs": completion.criterion_proofs,
+            })),
+            MAX_MUTATION_RESPONSE_BYTES,
+        )?;
+        parse_completion_receipt(value, card_id)
+    }
+
     pub fn tail_events(&self, after: i64, limit: usize) -> Result<Vec<CardEvent>, String> {
         let limit = limit.clamp(1, 1000);
         let body = self.request_text(&format!(
@@ -480,7 +725,7 @@ impl Client {
             Ok(response) => response
                 .into_string()
                 .map_err(|error| format!("Powder returned unreadable text: {error}")),
-            Err(error) => Err(response_error(error)),
+            Err(error) => Err(response_error(error, self.api_key.as_deref())),
         }
     }
 
@@ -495,6 +740,30 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, PowderError> {
+        self.send_json_request(method, path, body)?
+            .into_json()
+            .map_err(|error| PowderError {
+                kind: PowderErrorKind::InvalidResponse,
+                message: format!("Powder returned invalid JSON: {error}"),
+            })
+    }
+
+    fn request_typed_with_limit(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        response_limit: usize,
+    ) -> Result<Value, PowderError> {
+        parse_bounded_json_response(self.send_json_request(method, path, body)?, response_limit)
+    }
+
+    fn send_json_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<ureq::Response, PowderError> {
         let url = format!("{}{path}", self.base_url);
         let mut request = match method {
             "GET" => self.agent.get(&url),
@@ -513,13 +782,490 @@ impl Client {
             Some(body) => request.send_json(body),
             None => request.call(),
         };
-        match response {
-            Ok(response) => response.into_json().map_err(|error| PowderError {
-                kind: PowderErrorKind::InvalidResponse,
-                message: format!("Powder returned invalid JSON: {error}"),
-            }),
-            Err(error) => Err(typed_response_error(error)),
+        response.map_err(|error| typed_response_error(error, self.api_key.as_deref()))
+    }
+}
+
+fn parse_bounded_json_response(
+    response: ureq::Response,
+    response_limit: usize,
+) -> Result<Value, PowderError> {
+    if response
+        .header("Content-Length")
+        .and_then(|length| length.parse::<usize>().ok())
+        .is_some_and(|length| length > response_limit)
+    {
+        return Err(invalid_response(format!(
+            "response exceeds the {response_limit}-byte limit"
+        )));
+    }
+    let mut body = Vec::with_capacity(response_limit.min(64 * 1024));
+    response
+        .into_reader()
+        .take((response_limit + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| invalid_response("response body could not be read"))?;
+    if body.len() > response_limit {
+        return Err(invalid_response(format!(
+            "response exceeds the {response_limit}-byte limit"
+        )));
+    }
+    serde_json::from_slice(&body).map_err(|_| invalid_response("response body is not valid JSON"))
+}
+
+fn parse_work_log_entry(
+    value: Value,
+    expected_card_id: &str,
+    expected_attribution: Option<&WorkLogAttribution>,
+) -> Result<WorkLogEntry, PowderError> {
+    let card_id = bounded_string(&value, "card_id", "work-log card id", MAX_ID_BYTES)?;
+    if card_id != expected_card_id {
+        return Err(invalid_response(
+            "work-log entry returned a different card id",
+        ));
+    }
+    let entry = WorkLogEntry {
+        card_id,
+        agent: bounded_string(&value, "agent", "work-log agent", MAX_SHORT_TEXT_BYTES)?,
+        model: optional_bounded_string(&value, "model", "work-log model", MAX_SHORT_TEXT_BYTES)?,
+        reasoning: optional_bounded_string(
+            &value,
+            "reasoning",
+            "work-log reasoning",
+            MAX_SHORT_TEXT_BYTES,
+        )?,
+        harness: optional_bounded_string(
+            &value,
+            "harness",
+            "work-log harness",
+            MAX_SHORT_TEXT_BYTES,
+        )?,
+        run_id: optional_bounded_string(&value, "run_id", "work-log run id", MAX_ID_BYTES)?,
+        body: bounded_string(&value, "body", "work-log body", MAX_WORK_LOG_BODY_BYTES)?,
+        created_at: required_i64(&value, "created_at", "work-log created_at")?,
+    };
+    if let Some(expected) = expected_attribution {
+        if entry.agent != expected.agent
+            || entry.model != expected.model
+            || entry.reasoning != expected.reasoning
+            || entry.harness != expected.harness
+            || entry.run_id.as_deref() != Some(expected.run_id.as_str())
+        {
+            return Err(invalid_response(
+                "work-log entry attribution does not match the request",
+            ));
         }
+    }
+    Ok(entry)
+}
+
+fn parse_card_evidence(value: Value, expected_card_id: &str) -> Result<CardEvidence, PowderError> {
+    let card = required_object(&value, "card", "card evidence envelope")?;
+    let card_id = bounded_string(card, "id", "card id", MAX_ID_BYTES)?;
+    if card_id != expected_card_id {
+        return Err(invalid_response(
+            "card evidence returned a different card id",
+        ));
+    }
+    let runs = bounded_array(&value, "runs", MAX_EVIDENCE_ITEMS, "card runs")?
+        .iter()
+        .map(|run| parse_run_summary(run, None, Some(expected_card_id)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let work_log = bounded_array(&value, "work_log", MAX_EVIDENCE_ITEMS, "card work log")?
+        .iter()
+        .cloned()
+        .map(|entry| parse_work_log_entry(entry, expected_card_id, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    let runs_total = bounded_total(&value, "runs_total", runs.len(), "card runs")?;
+    let work_log_total = bounded_total(&value, "work_log_total", work_log.len(), "card work log")?;
+    Ok(CardEvidence {
+        card_id,
+        title: bounded_string(card, "title", "card title", MAX_EVIDENCE_TEXT_BYTES)?,
+        status: card_status(card)?,
+        repository: optional_bounded_string(card, "repo", "card repository", MAX_ID_BYTES)?,
+        claim: parse_evidence_claim(card.get("claim"))?,
+        criteria: parse_criteria(card)?,
+        runs,
+        runs_total,
+        work_log,
+        work_log_total,
+        truncated: runs_total > 0 && runs_total > value_array_len(&value, "runs")
+            || work_log_total > 0 && work_log_total > value_array_len(&value, "work_log"),
+    })
+}
+
+fn parse_run_evidence(value: Value, expected_run_id: &str) -> Result<RunEvidence, PowderError> {
+    let run_value = required_object(&value, "run", "run evidence envelope")?;
+    let run = parse_run_summary(run_value, Some(expected_run_id), None)?;
+    let card = required_object(&value, "card", "run evidence card")?;
+    let card_id = bounded_string(card, "id", "card id", MAX_ID_BYTES)?;
+    if card_id != run.card_id {
+        return Err(invalid_response(
+            "run evidence card does not match the requested run",
+        ));
+    }
+    let activities = bounded_array(&value, "activities", MAX_EVIDENCE_ITEMS, "run activities")?
+        .iter()
+        .map(|activity| parse_activity(activity, expected_run_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let links = bounded_array(&value, "links", MAX_EVIDENCE_ITEMS, "run links")?
+        .iter()
+        .map(|link| parse_evidence_link(link, &card_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let activities_total = bounded_total(
+        &value,
+        "activities_total",
+        activities.len(),
+        "run activities",
+    )?;
+    let links_total = bounded_total(&value, "links_total", links.len(), "run links")?;
+    Ok(RunEvidence {
+        run,
+        card_title: bounded_string(card, "title", "card title", MAX_EVIDENCE_TEXT_BYTES)?,
+        card_status: card_status(card)?,
+        repository: optional_bounded_string(card, "repo", "card repository", MAX_ID_BYTES)?,
+        criteria: parse_criteria(card)?,
+        activities,
+        activities_total,
+        links,
+        links_total,
+        truncated: activities_total > value_array_len(&value, "activities")
+            || links_total > value_array_len(&value, "links"),
+    })
+}
+
+fn parse_completion_receipt(
+    value: Value,
+    expected_card_id: &str,
+) -> Result<CompletionReceipt, PowderError> {
+    let card_id = bounded_string(&value, "id", "completed card id", MAX_ID_BYTES)?;
+    if card_id != expected_card_id {
+        return Err(invalid_response(
+            "completion response returned a different card id",
+        ));
+    }
+    let status = card_status(&value)?;
+    if status != "done" {
+        return Err(invalid_response(
+            "completion response did not confirm done status",
+        ));
+    }
+    if value.get("claim").is_some_and(|claim| !claim.is_null()) {
+        return Err(invalid_response(
+            "completion response retained an active claim",
+        ));
+    }
+    Ok(CompletionReceipt {
+        card_id,
+        status,
+        updated_at: required_i64(&value, "updated_at", "completed card updated_at")?,
+        criteria: parse_criteria(&value)?,
+    })
+}
+
+fn parse_run_summary(
+    value: &Value,
+    expected_run_id: Option<&str>,
+    expected_card_id: Option<&str>,
+) -> Result<RunSummary, PowderError> {
+    let run_id = bounded_string(value, "id", "run id", MAX_ID_BYTES)?;
+    if expected_run_id.is_some_and(|expected| expected != run_id) {
+        return Err(invalid_response("run evidence returned a different run id"));
+    }
+    let card_id = bounded_string(value, "card_id", "run card id", MAX_ID_BYTES)?;
+    if expected_card_id.is_some_and(|expected| expected != card_id) {
+        return Err(invalid_response(
+            "card evidence contains a run for another card",
+        ));
+    }
+    let state = bounded_string(value, "state", "run state", MAX_SHORT_TEXT_BYTES)?;
+    if !matches!(
+        state.as_str(),
+        "active" | "awaiting_input" | "released" | "error" | "complete" | "stale"
+    ) {
+        return Err(invalid_response("run evidence contains an unknown state"));
+    }
+    required_i64(value, "claim_expires_at", "run claim_expires_at")?;
+    Ok(RunSummary {
+        run_id,
+        card_id,
+        state,
+        agent: bounded_string(value, "agent", "run agent", MAX_SHORT_TEXT_BYTES)?,
+        proof: optional_bounded_string(value, "proof", "run proof", MAX_COMPLETION_PROOF_BYTES)?,
+        created_at: required_i64(value, "created_at", "run created_at")?,
+        updated_at: required_i64(value, "updated_at", "run updated_at")?,
+    })
+}
+
+fn parse_criteria(card: &Value) -> Result<Vec<CriterionEvidence>, PowderError> {
+    bounded_array(card, "criteria", MAX_CRITERIA, "card criteria")?
+        .iter()
+        .enumerate()
+        .map(|(criterion, value)| {
+            let proof_links = bounded_array(
+                value,
+                "proof_links",
+                MAX_CRITERION_PROOFS,
+                "criterion proof links",
+            )?
+            .iter()
+            .map(|proof| {
+                Ok(EvidenceProofLink {
+                    url: bounded_string(proof, "url", "criterion proof URL", MAX_PROOF_URL_BYTES)?,
+                    actor: bounded_string(
+                        proof,
+                        "actor",
+                        "criterion proof actor",
+                        MAX_SHORT_TEXT_BYTES,
+                    )?,
+                    created_at: required_i64(proof, "created_at", "criterion proof created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, PowderError>>()?;
+            Ok(CriterionEvidence {
+                criterion,
+                text: bounded_string(value, "text", "criterion text", MAX_EVIDENCE_TEXT_BYTES)?,
+                checked_by: optional_bounded_string(
+                    value,
+                    "checked_by",
+                    "criterion checked_by",
+                    MAX_SHORT_TEXT_BYTES,
+                )?,
+                checked_at: optional_i64(value, "checked_at", "criterion checked_at")?,
+                proof_links,
+            })
+        })
+        .collect()
+}
+
+fn parse_evidence_claim(value: Option<&Value>) -> Result<Option<EvidenceClaim>, PowderError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(invalid_response("card claim is not an object"));
+    }
+    Ok(Some(EvidenceClaim {
+        run_id: bounded_string(value, "run_id", "claim run id", MAX_ID_BYTES)?,
+        agent: bounded_string(value, "agent", "claim agent", MAX_SHORT_TEXT_BYTES)?,
+        expires_at: required_i64(value, "expires_at", "claim expires_at")?,
+    }))
+}
+
+fn parse_activity(value: &Value, expected_run_id: &str) -> Result<EvidenceActivity, PowderError> {
+    let run_id = bounded_string(value, "run_id", "activity run id", MAX_ID_BYTES)?;
+    if run_id != expected_run_id {
+        return Err(invalid_response(
+            "run evidence contains an activity for another run",
+        ));
+    }
+    let activity_type = bounded_string(
+        value,
+        "activity_type",
+        "activity type",
+        MAX_SHORT_TEXT_BYTES,
+    )?;
+    if !matches!(
+        activity_type.as_str(),
+        "thought" | "action" | "response" | "elicitation" | "error" | "prompt"
+    ) {
+        return Err(invalid_response(
+            "run evidence contains an unknown activity type",
+        ));
+    }
+    Ok(EvidenceActivity {
+        activity_type,
+        payload: bounded_string(
+            value,
+            "payload",
+            "activity payload",
+            MAX_EVIDENCE_TEXT_BYTES,
+        )?,
+        created_at: required_i64(value, "created_at", "activity created_at")?,
+    })
+}
+
+fn parse_evidence_link(value: &Value, expected_card_id: &str) -> Result<EvidenceLink, PowderError> {
+    let card_id = bounded_string(value, "card_id", "link card id", MAX_ID_BYTES)?;
+    if card_id != expected_card_id {
+        return Err(invalid_response(
+            "run evidence contains a link for another card",
+        ));
+    }
+    Ok(EvidenceLink {
+        label: bounded_string(value, "label", "link label", MAX_SHORT_TEXT_BYTES)?,
+        url: bounded_string(value, "url", "link URL", MAX_PROOF_URL_BYTES)?,
+        created_at: required_i64(value, "created_at", "link created_at")?,
+    })
+}
+
+fn card_status(value: &Value) -> Result<String, PowderError> {
+    let status = bounded_string(value, "status", "card status", MAX_SHORT_TEXT_BYTES)?;
+    if !matches!(
+        status.as_str(),
+        "backlog"
+            | "ready"
+            | "claimed"
+            | "running"
+            | "awaiting_input"
+            | "blocked"
+            | "done"
+            | "shipped"
+            | "abandoned"
+    ) {
+        return Err(invalid_response("card evidence contains an unknown status"));
+    }
+    Ok(status)
+}
+
+fn required_object<'a>(value: &'a Value, key: &str, label: &str) -> Result<&'a Value, PowderError> {
+    value
+        .get(key)
+        .filter(|field| field.is_object())
+        .ok_or_else(|| invalid_response(format!("{label} is missing {key}")))
+}
+
+fn bounded_array<'a>(
+    value: &'a Value,
+    key: &str,
+    limit: usize,
+    label: &str,
+) -> Result<&'a [Value], PowderError> {
+    let Some(field) = value.get(key) else {
+        return Ok(&[]);
+    };
+    let array = field
+        .as_array()
+        .ok_or_else(|| invalid_response(format!("{label} is not an array")))?;
+    if array.len() > limit {
+        return Err(invalid_response(format!(
+            "{label} exceeds the {limit}-item limit"
+        )));
+    }
+    Ok(array)
+}
+
+fn value_array_len(value: &Value, key: &str) -> usize {
+    value.get(key).and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+fn bounded_total(
+    value: &Value,
+    key: &str,
+    displayed: usize,
+    label: &str,
+) -> Result<usize, PowderError> {
+    let total = match value.get(key) {
+        None => displayed,
+        Some(total) => total
+            .as_u64()
+            .and_then(|total| usize::try_from(total).ok())
+            .ok_or_else(|| invalid_response(format!("{label} total is invalid")))?,
+    };
+    if total < displayed || total > MAX_EVIDENCE_TOTAL {
+        return Err(invalid_response(format!("{label} total is out of bounds")));
+    }
+    Ok(total)
+}
+
+fn bounded_string(
+    value: &Value,
+    key: &str,
+    label: &str,
+    limit: usize,
+) -> Result<String, PowderError> {
+    let text = value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_response(format!("{label} is missing")))?;
+    validate_response_text(label, text, limit)?;
+    Ok(text.to_string())
+}
+
+fn optional_bounded_string(
+    value: &Value,
+    key: &str,
+    label: &str,
+    limit: usize,
+) -> Result<Option<String>, PowderError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            validate_response_text(label, text, limit)?;
+            Ok(Some(text.clone()))
+        }
+        Some(_) => Err(invalid_response(format!("{label} is not a string"))),
+    }
+}
+
+fn required_i64(value: &Value, key: &str, label: &str) -> Result<i64, PowderError> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| invalid_response(format!("{label} is missing")))
+}
+
+fn optional_i64(value: &Value, key: &str, label: &str) -> Result<Option<i64>, PowderError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| invalid_response(format!("{label} is not an integer"))),
+    }
+}
+
+fn validate_id(label: &str, value: &str) -> Result<(), PowderError> {
+    validate_required_bounded_text(label, value, MAX_ID_BYTES)
+}
+
+fn validate_short_text(label: &str, value: &str) -> Result<(), PowderError> {
+    validate_required_bounded_text(label, value, MAX_SHORT_TEXT_BYTES)
+}
+
+fn validate_optional_short_text(label: &str, value: Option<&str>) -> Result<(), PowderError> {
+    value.map_or(Ok(()), |value| validate_short_text(label, value))
+}
+
+fn validate_required_bounded_text(
+    label: &str,
+    value: &str,
+    limit: usize,
+) -> Result<(), PowderError> {
+    if value.trim().is_empty() {
+        return Err(invalid_request(format!("{label} must not be empty")));
+    }
+    if value.len() > limit {
+        return Err(invalid_request(format!(
+            "{label} exceeds the {limit}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_response_text(label: &str, value: &str, limit: usize) -> Result<(), PowderError> {
+    if value.trim().is_empty() {
+        return Err(invalid_response(format!("{label} is empty")));
+    }
+    if value.len() > limit {
+        return Err(invalid_response(format!(
+            "{label} exceeds the {limit}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_request(message: impl Into<String>) -> PowderError {
+    PowderError {
+        kind: PowderErrorKind::InvalidResponse,
+        message: format!("Powder request is invalid: {}", message.into()),
+    }
+}
+
+fn invalid_response(message: impl Into<String>) -> PowderError {
+    PowderError {
+        kind: PowderErrorKind::InvalidResponse,
+        message: format!("Powder evidence response is invalid: {}", message.into()),
     }
 }
 
@@ -675,9 +1421,14 @@ fn board_tier_rank(tier: &str) -> u8 {
 }
 
 fn validate_base_url(base_url: &str) -> Result<(), String> {
-    if let Some(authority) = base_url.strip_prefix("https://") {
-        if authority.is_empty() {
-            return Err("Powder baseUrl must include a host".into());
+    if let Some(rest) = base_url.strip_prefix("https://") {
+        let authority = rest
+            .split(['/', '?', '#'])
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or("Powder baseUrl must include a host")?;
+        if authority.contains('@') {
+            return Err("Powder baseUrl must not contain embedded credentials".into());
         }
         return Ok(());
     }
@@ -709,18 +1460,15 @@ fn validate_base_url(base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn response_error(error: ureq::Error) -> String {
-    typed_response_error(error).to_string()
+fn response_error(error: ureq::Error, credential: Option<&str>) -> String {
+    typed_response_error(error, credential).to_string()
 }
 
-fn typed_response_error(error: ureq::Error) -> PowderError {
+fn typed_response_error(error: ureq::Error, credential: Option<&str>) -> PowderError {
     match error {
         ureq::Error::Status(status, response) => {
-            let detail = response
-                .into_json::<Value>()
-                .ok()
-                .and_then(|body| body["error"].as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("HTTP {status}"));
+            let detail = bounded_error_detail(response).unwrap_or_else(|| format!("HTTP {status}"));
+            let detail = safe_error_detail(&detail, credential);
             PowderError {
                 kind: match status {
                     401 | 403 => PowderErrorKind::Unauthorized,
@@ -735,6 +1483,49 @@ fn typed_response_error(error: ureq::Error) -> PowderError {
             message: format!("Powder is unreachable: {error}"),
         },
     }
+}
+
+fn bounded_error_detail(response: ureq::Response) -> Option<String> {
+    if response
+        .header("Content-Length")
+        .and_then(|length| length.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_ERROR_RESPONSE_BYTES)
+    {
+        return None;
+    }
+    let mut body = Vec::with_capacity(MAX_ERROR_RESPONSE_BYTES);
+    response
+        .into_reader()
+        .take((MAX_ERROR_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .ok()?;
+    if body.len() > MAX_ERROR_RESPONSE_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn safe_error_detail(detail: &str, credential: Option<&str>) -> String {
+    let mut safe = credential
+        .filter(|credential| !credential.is_empty())
+        .map_or_else(
+            || detail.to_string(),
+            |credential| detail.replace(credential, "[REDACTED]"),
+        );
+    safe.retain(|character| !character.is_control() || character == ' ');
+    if safe.len() > MAX_SHORT_TEXT_BYTES {
+        let mut end = MAX_SHORT_TEXT_BYTES;
+        while !safe.is_char_boundary(end) {
+            end -= 1;
+        }
+        safe.truncate(end);
+        safe.push_str("...");
+    }
+    safe
 }
 
 fn resolve_key_command(command: &str) -> Result<String, String> {
@@ -898,6 +1689,66 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    fn test_client(addr: std::net::SocketAddr) -> Client {
+        Client::new(ProfileConfig {
+            base_url: format!("http://{addr}"),
+            agent_name: "t-hub".into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap()
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    request.extend_from_slice(&buffer[..count]);
+                    let text = String::from_utf8_lossy(&request);
+                    let header_end = text.find("\r\n\r\n");
+                    let content_length = text
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| line.strip_prefix("content-length: "))
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if header_end.is_some_and(|end| request.len() >= end + 4 + content_length) {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("request read failed: {error}"),
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn write_json_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    }
+
     #[test]
     fn profile_file_resolves_a_command_backed_key() {
         let path = std::env::temp_dir().join(format!(
@@ -975,6 +1826,385 @@ mod tests {
         assert_eq!(claim.agent, "terminal-1");
         assert_eq!(claim.expires_at, 123);
         assert!(parse_claim(json!({ "card_id": "card-1" })).is_err());
+    }
+
+    #[test]
+    fn evidence_client_round_trips_bounded_paths_payloads_and_attribution() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected_path in [
+                "/api/v1/cards/card%2Fone",
+                "/api/v1/runs/run%2Fone",
+                "/api/v1/cards/card%2Fone/work-log",
+                "/api/v1/cards/card%2Fone/complete",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(
+                    request.lines().next().unwrap().contains(expected_path),
+                    "request: {request}"
+                );
+                assert!(request.contains("Authorization: Bearer test-key"));
+                let body = if expected_path.ends_with("work-log") {
+                    let request_body: Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    assert_eq!(request_body["agent"], "crew-87ea2ca1");
+                    assert_eq!(request_body["model"], "gpt-5");
+                    assert_eq!(request_body["reasoning"], "high");
+                    assert_eq!(request_body["harness"], "codex");
+                    assert_eq!(request_body["run_id"], "run/one");
+                    assert_eq!(request_body["body"], "focused tests are passing");
+                    json!({
+                        "card_id": "card/one",
+                        "agent": "crew-87ea2ca1",
+                        "model": "gpt-5",
+                        "reasoning": "high",
+                        "harness": "codex",
+                        "run_id": "run/one",
+                        "body": "focused tests are passing",
+                        "created_at": 15
+                    })
+                } else if expected_path.ends_with("complete") {
+                    let request_body: Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    assert_eq!(request_body["proof"], "commit abc; tests passed");
+                    assert_eq!(request_body["criterion_proofs"][0]["criterion"], 0);
+                    assert_eq!(
+                        request_body["criterion_proofs"][0]["url"],
+                        "https://example.test/proof"
+                    );
+                    json!({
+                        "id": "card/one",
+                        "status": "done",
+                        "claim": null,
+                        "updated_at": 20,
+                        "criteria": [{
+                            "text": "tests pass",
+                            "proof_links": [{
+                                "url": "https://example.test/proof",
+                                "actor": "t-hub",
+                                "created_at": 20
+                            }]
+                        }]
+                    })
+                } else if expected_path.contains("/runs/") {
+                    json!({
+                        "run": {
+                            "id": "run/one",
+                            "card_id": "card/one",
+                            "state": "complete",
+                            "agent": "t-hub",
+                            "claim_expires_at": 99,
+                            "proof": "commit abc; tests passed",
+                            "created_at": 10,
+                            "updated_at": 20
+                        },
+                        "card": {
+                            "id": "card/one",
+                            "title": "Client evidence",
+                            "status": "done",
+                            "repo": "t-hub",
+                            "criteria": [{
+                                "text": "tests pass",
+                                "checked_by": "crew-87ea2ca1",
+                                "checked_at": 20,
+                                "proof_links": []
+                            }]
+                        },
+                        "activities": [{
+                            "id": "activity-1",
+                            "run_id": "run/one",
+                            "activity_type": "response",
+                            "payload": "commit abc; tests passed",
+                            "created_at": 20
+                        }],
+                        "activities_total": 2,
+                        "links": [{
+                            "id": "link-1",
+                            "card_id": "card/one",
+                            "label": "proof",
+                            "url": "https://example.test/proof",
+                            "created_at": 20
+                        }],
+                        "links_total": 1
+                    })
+                } else {
+                    json!({
+                        "card": {
+                            "id": "card/one",
+                            "title": "Client evidence",
+                            "status": "running",
+                            "repo": "t-hub",
+                            "claim": {
+                                "agent": "t-hub",
+                                "run_id": "run/one",
+                                "expires_at": 99
+                            },
+                            "criteria": [{"text": "tests pass", "proof_links": []}]
+                        },
+                        "runs": [{
+                            "id": "run/one",
+                            "card_id": "card/one",
+                            "state": "active",
+                            "agent": "t-hub",
+                            "claim_expires_at": 99,
+                            "created_at": 10,
+                            "updated_at": 11
+                        }],
+                        "runs_total": 2,
+                        "work_log": [{
+                            "card_id": "card/one",
+                            "agent": "crew-87ea2ca1",
+                            "run_id": "run/one",
+                            "body": "started",
+                            "created_at": 12
+                        }],
+                        "work_log_total": 3
+                    })
+                };
+                write_json_response(&mut stream, "200 OK", &body.to_string());
+            }
+        });
+
+        let client = test_client(addr);
+        let card = client.card_evidence("card/one").unwrap();
+        assert_eq!(card.card_id, "card/one");
+        assert_eq!(card.repository.as_deref(), Some("t-hub"));
+        assert_eq!(card.claim.unwrap().run_id, "run/one");
+        assert_eq!(card.runs_total, 2);
+        assert_eq!(card.work_log_total, 3);
+        assert!(card.truncated);
+
+        let run = client.run_evidence("run/one").unwrap();
+        assert_eq!(run.run.run_id, "run/one");
+        assert_eq!(run.run.proof.as_deref(), Some("commit abc; tests passed"));
+        assert_eq!(run.activities_total, 2);
+        assert!(run.truncated);
+
+        let attribution = WorkLogAttribution {
+            agent: "crew-87ea2ca1".into(),
+            model: Some("gpt-5".into()),
+            reasoning: Some("high".into()),
+            harness: Some("codex".into()),
+            run_id: "run/one".into(),
+        };
+        let entry = client
+            .append_work_log("card/one", &attribution, "focused tests are passing")
+            .unwrap();
+        assert_eq!(entry.agent, "crew-87ea2ca1");
+        assert_eq!(entry.run_id.as_deref(), Some("run/one"));
+
+        let receipt = client
+            .complete_with_proof(
+                "card/one",
+                &CompletionProof {
+                    proof: "commit abc; tests passed".into(),
+                    criterion_proofs: vec![CriterionProof {
+                        criterion: 0,
+                        url: "https://example.test/proof".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(receipt.status, "done");
+        assert_eq!(receipt.criteria[0].proof_links.len(), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn evidence_client_rejects_oversized_inputs_before_network_io() {
+        let client = Client::new(ProfileConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            agent_name: "t-hub".into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+        let attribution = WorkLogAttribution {
+            agent: "crew".into(),
+            model: None,
+            reasoning: None,
+            harness: Some("codex".into()),
+            run_id: "run-1".into(),
+        };
+        let error = client
+            .append_work_log(
+                "card-1",
+                &attribution,
+                &"x".repeat(MAX_WORK_LOG_BODY_BYTES + 1),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, PowderErrorKind::InvalidResponse);
+        assert!(error.message.contains("16384-byte limit"));
+
+        let error = client
+            .complete_with_proof(
+                "card-1",
+                &CompletionProof {
+                    proof: "proof".into(),
+                    criterion_proofs: (0..=MAX_COMPLETION_CRITERION_PROOFS)
+                        .map(|criterion| CriterionProof {
+                            criterion,
+                            url: "https://example.test/proof".into(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.message.contains("proof count exceeds 100"));
+        assert!(client
+            .card_evidence(" ")
+            .unwrap_err()
+            .message
+            .contains("must not be empty"));
+    }
+
+    #[test]
+    fn evidence_client_fails_closed_on_malformed_unbounded_and_server_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected_path in [
+                "/api/v1/cards/card-1/work-log",
+                "/api/v1/cards/card-1",
+                "/api/v1/runs/run-1",
+                "/api/v1/cards/card-1/complete",
+                "/api/v1/cards/oversized",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request.lines().next().unwrap().contains(expected_path));
+                if expected_path.ends_with("work-log") {
+                    write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "card_id": "card-1",
+                            "agent": "different-crew",
+                            "run_id": "run-1",
+                            "body": "entry",
+                            "created_at": 1
+                        })
+                        .to_string(),
+                    );
+                } else if expected_path == "/api/v1/cards/card-1" {
+                    let entries = (0..=MAX_EVIDENCE_ITEMS)
+                        .map(|index| {
+                            json!({
+                                "card_id": "card-1",
+                                "agent": "crew",
+                                "run_id": "run-1",
+                                "body": format!("entry-{index}"),
+                                "created_at": index
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "card": {
+                                "id": "card-1",
+                                "title": "card",
+                                "status": "running"
+                            },
+                            "work_log": entries,
+                            "work_log_total": entries.len()
+                        })
+                        .to_string(),
+                    );
+                } else if expected_path.contains("/runs/") {
+                    write_json_response(&mut stream, "200 OK", "{not-json");
+                } else if expected_path.ends_with("complete") {
+                    write_json_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        r#"{"error":"test-key must never escape\ninternal detail"}"#,
+                    );
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{}}",
+                        MAX_EVIDENCE_RESPONSE_BYTES + 1
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        let client = test_client(addr);
+        let attribution = WorkLogAttribution {
+            agent: "crew".into(),
+            model: None,
+            reasoning: None,
+            harness: Some("codex".into()),
+            run_id: "run-1".into(),
+        };
+        assert!(client
+            .append_work_log("card-1", &attribution, "entry")
+            .unwrap_err()
+            .message
+            .contains("attribution does not match"));
+        assert!(client
+            .card_evidence("card-1")
+            .unwrap_err()
+            .message
+            .contains("20-item limit"));
+        assert!(client
+            .run_evidence("run-1")
+            .unwrap_err()
+            .message
+            .contains("not valid JSON"));
+        let error = client
+            .complete_with_proof(
+                "card-1",
+                &CompletionProof {
+                    proof: "proof".into(),
+                    criterion_proofs: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, PowderErrorKind::Upstream);
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(!error.message.contains("test-key"));
+        assert!(!error.message.contains('\n'));
+        assert!(client
+            .card_evidence("oversized")
+            .unwrap_err()
+            .message
+            .contains("524288-byte limit"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn completion_receipt_requires_matching_done_card_and_criterion_evidence() {
+        let wrong_card = parse_completion_receipt(
+            json!({"id": "card-2", "status": "done", "updated_at": 1}),
+            "card-1",
+        )
+        .unwrap_err();
+        assert!(wrong_card.message.contains("different card id"));
+
+        let not_done = parse_completion_receipt(
+            json!({"id": "card-1", "status": "running", "updated_at": 1}),
+            "card-1",
+        )
+        .unwrap_err();
+        assert!(not_done.message.contains("did not confirm done"));
+
+        let active_claim = parse_completion_receipt(
+            json!({
+                "id": "card-1",
+                "status": "done",
+                "updated_at": 1,
+                "claim": {"run_id": "run-1"}
+            }),
+            "card-1",
+        )
+        .unwrap_err();
+        assert!(active_claim.message.contains("retained an active claim"));
     }
 
     #[test]
@@ -1089,6 +2319,7 @@ mod tests {
             "http://powder.example.test",
             "http://10.0.0.2:8080",
             "http://localhost.example.test",
+            "https://user:secret@powder.example.test",
         ] {
             let error = Client::new(ProfileConfig {
                 base_url: base_url.into(),
@@ -1099,7 +2330,10 @@ mod tests {
             })
             .err()
             .unwrap();
-            assert!(error.contains("must use HTTPS"), "{base_url}: {error}");
+            assert!(
+                error.contains("must use HTTPS") || error.contains("embedded credentials"),
+                "{base_url}: {error}"
+            );
         }
 
         for base_url in [
