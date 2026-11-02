@@ -74,14 +74,16 @@ pub struct ObservedPeer {
     pub executable_inode: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProtectedClient {
     pub uid: u32,
     pub executable_device: u64,
     pub executable_inode: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProtectedPolicy {
     pub key: RuntimePolicyKey,
     pub executable_device: u64,
@@ -89,7 +91,8 @@ pub struct ProtectedPolicy {
     pub executable_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProtectedBrokerPolicy {
     pub client: ProtectedClient,
     pub runtimes: Vec<ProtectedPolicy>,

@@ -4,6 +4,8 @@ use t_hub_cortana_broker_protocol::{
 };
 
 pub mod store;
+#[cfg(target_os = "linux")]
+pub mod transport;
 
 /// Kernel placement authority for one Cortana candidate.
 ///
