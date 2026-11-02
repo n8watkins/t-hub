@@ -1,0 +1,7 @@
+interface:
+  display_name: "Shipmate (Legacy)"
+  short_description: "Compatibility alias for Captain workflows"
+  default_prompt: "Use $shipmate to load the canonical Captain protocol."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,73 @@
+[projects."/home/natkins/projects/tools/t-hub/t-hub-app"]
+trust_level = "trusted"
+
+[projects."/home/natkins/.t-hub/orchestrator"]
+trust_level = "trusted"
+
+[mcp_servers.t-hub]
+command = "/home/natkins/.t-hub/bin/t-hub-mcp"
+env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]
+
+[mcp_servers.t-hub.tools.my_capability]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_terminals]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_captains]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.send_text]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_projects]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.project_board_snapshot]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.read_terminal]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.get_status]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_powder_boards]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.powder_status]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.supervision_tree]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.release_captain]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.close_terminal]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.captain_checkpoint]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_tabs]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.new_tab]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.spawn_terminal]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.claim_captain]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.send_keys]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_admin_grants]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.history_list]
+approval_mode = "approve"
+

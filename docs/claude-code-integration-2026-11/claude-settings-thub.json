@@ -1,0 +1,193 @@
+{
+  "hooks": {
+    "CwdChanged": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook CwdChanged # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "Elicitation": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook Elicitation # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook Notification # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook PermissionRequest # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.claude/hooks/check-worktree-empty.sh",
+            "if": "Bash(git worktree remove:*)"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook SessionEnd # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook SessionStart # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook Stop # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook StopFailure # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook SubagentStart # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook SubagentStop # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook TaskCompleted # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "TaskCreated": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook TaskCreated # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook UserPromptSubmit # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook WorktreeCreate # __t_hub_managed__"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --hook WorktreeRemove # __t_hub_managed__"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/home/natkins/.local/lib/t-hub/agents/2a7ea6d8a6b54f41fc76b7529b56ea4ab970136ed71bf7ee88480df0a77c67d1/t-hub-agent --statusline # __t_hub_managed__",
+    "padding": 0,
+    "refreshInterval": 5
+  },
+  "permissions": {
+    "allow": [
+      "mcp__t-hub__close_terminal",
+      "mcp__t-hub__close_tab"
+    ]
+  }
+}
